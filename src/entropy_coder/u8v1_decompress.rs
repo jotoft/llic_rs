@@ -1,136 +1,146 @@
-use crate::Result;
+use crate::{Result, LlicError};
+use super::tables::DECOMPRESS_TABLE;
 
-mod decompress_table;
-use decompress_table::U8V1_DECOMPRESS_TABLE_2X;
+/// Decompresses data encoded with the u8v1 entropy coder
+pub fn decompress(
+    src_data: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst_image: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(LlicError::InvalidArgument);
+    }
+    
+    let mut decoder = Decoder::new(src_data);
+    
+    // Decompress first row (horizontal delta only)
+    let mut prev = 0u8;
+    for x in 0..width {
+        let delta = decoder.decode_symbol()?;
+        prev = prev.wrapping_add(delta);
+        dst_image[x as usize] = prev;
+    }
+    
+    // Decompress remaining rows (combined predictor)
+    for y in 1..height {
+        let row_offset = (y * bytes_per_line) as usize;
+        let prev_row_offset = ((y - 1) * bytes_per_line) as usize;
+        
+        // First pixel of row
+        let left = 0u8;
+        let top = dst_image[prev_row_offset];
+        let avg = ((left as u16 + top as u16) / 2) as u8;
+        let delta = decoder.decode_symbol()?;
+        dst_image[row_offset] = avg.wrapping_add(delta);
+        
+        // Rest of row
+        for x in 1..width {
+            let left = dst_image[row_offset + x as usize - 1];
+            let top = dst_image[prev_row_offset + x as usize];
+            let avg = ((left as u16 + top as u16) / 2) as u8;
+            let delta = decoder.decode_symbol()?;
+            dst_image[row_offset + x as usize] = avg.wrapping_add(delta);
+        }
+    }
+    
+    Ok(())
+}
 
-#[derive(Debug)]
-struct DecompressStream<'a> {
-    src_ptr: &'a [u8],
+struct Decoder<'a> {
+    data: &'a [u8],
     pos: usize,
     bit_container: u32,
-    num_bits: u32,
+    bits_available: u32,
 }
 
-impl<'a> DecompressStream<'a> {
+impl<'a> Decoder<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self {
-            src_ptr: data,
+        let mut decoder = Self {
+            data,
             pos: 0,
             bit_container: 0,
-            num_bits: 0,
+            bits_available: 0,
+        };
+        // Pre-fill the bit container
+        decoder.refill();
+        decoder
+    }
+    
+    fn refill(&mut self) {
+        while self.bits_available <= 24 && self.pos < self.data.len() {
+            self.bit_container |= (self.data[self.pos] as u32) << (24 - self.bits_available);
+            self.bits_available += 8;
+            self.pos += 1;
         }
     }
-
-    #[inline]
-    fn get_more_bytes_if_possible(&mut self) {
-        if self.num_bits < 16 && self.pos + 1 < self.src_ptr.len() {
-            // Read 16 bits (2 bytes) as little-endian
-            let tmp = u16::from_le_bytes([
-                self.src_ptr[self.pos],
-                self.src_ptr[self.pos + 1],
-            ]) as u32;
-            self.pos += 2;
-
-            self.bit_container |= tmp << (16 - self.num_bits);
-            self.num_bits += 16;
-        }
+    
+    fn consume_bits(&mut self, bits: u32) {
+        self.bit_container <<= bits;
+        self.bits_available -= bits;
+        self.refill();
     }
-
-    #[inline]
-    fn decompress_sequence(&mut self, out: &mut [u8]) -> usize {
-        self.get_more_bytes_if_possible();
-        let p = self.bit_container;
-
-        // It is very likely that we have a symbol with <= 9 bits.
-        if p < 0xF800_0000 {
-            let t = &U8V1_DECOMPRESS_TABLE_2X[(p >> 20) as usize];
-
-            self.bit_container = p << t.bits;
-            self.num_bits -= t.bits as u32;
-            out[0] = t.symbol[0];
-            out[1] = t.symbol[1]; // Always written, even if num_symbols == 1.
-
-            return t.num_symbols as usize;
-        }
-
-        // This is the case with 13-bit codes: The actual symbol is given by the least significant 8 bits of the code.
-        self.bit_container = p << 13;
-        self.num_bits -= 13;
-        out[0] = ((p >> 19) & 0xFF) as u8;
-        1
-    }
-
-    #[inline]
-    fn decompress_row(&mut self, buf: &mut [u8], num_elems: usize, width: usize) -> usize {
-        let mut elem = num_elems;
+    
+    fn decode_symbol(&mut self) -> Result<u8> {
+        // Get top 12 bits for table lookup
+        let index = (self.bit_container >> 20) as usize;
         
-        // We are quite likely to have decoded more elements than the previous row.
-        if elem > width {
-            // Copy the last elements to the beginning of the buffer.
-            buf.copy_within((width..elem), 0);
+        // Special case: 13-bit codes
+        if index >= 0xF80 {
+            let symbol = ((self.bit_container >> 19) & 0xFF) as u8;
+            self.consume_bits(13);
+            return Ok(symbol);
         }
-        elem = elem.saturating_sub(width);
-
-        while elem < width {
-            let count = self.decompress_sequence(&mut buf[elem..]);
-            elem += count;
+        
+        // Normal case: use lookup table
+        if index >= DECOMPRESS_TABLE.len() {
+            return Err(LlicError::InvalidData);
         }
-
-        elem
+        
+        let entry = DECOMPRESS_TABLE[index];
+        self.consume_bits(entry.bits as u32);
+        
+        // For single symbol decoding, return the first symbol
+        Ok(entry.symbols[0])
+    }
+    
+    fn decode_symbols(&mut self, symbols: &mut [u8]) -> Result<usize> {
+        // Get top 12 bits for table lookup
+        let index = (self.bit_container >> 20) as usize;
+        
+        // Special case: 13-bit codes
+        if index >= 0xF80 {
+            symbols[0] = ((self.bit_container >> 19) & 0xFF) as u8;
+            self.consume_bits(13);
+            return Ok(1);
+        }
+        
+        // Normal case: use lookup table
+        if index >= DECOMPRESS_TABLE.len() {
+            return Err(LlicError::InvalidData);
+        }
+        
+        let entry = DECOMPRESS_TABLE[index];
+        self.consume_bits(entry.bits as u32);
+        
+        // Copy decoded symbols
+        let num_symbols = entry.num_symbols as usize;
+        symbols[..num_symbols].copy_from_slice(&entry.symbols[..num_symbols]);
+        
+        Ok(num_symbols)
     }
 }
 
-/// Decompresses u8v1 entropy-coded data
-/// 
-/// # Arguments
-/// * `compressed_data` - The compressed input data
-/// * `width` - Image width
-/// * `height` - Image height  
-/// * `bytes_per_line` - Number of bytes per line in the output image
-/// * `row_buffer` - Working buffer, must be at least width + 256 bytes
-/// * `out_image` - Output image buffer
-///
-/// # Returns
-/// Ok(()) on success, or an error
-pub fn decompress(
-    compressed_data: &[u8],
-    width: usize,
-    height: usize,
-    bytes_per_line: usize,
-    row_buffer: &mut [u8],
-    out_image: &mut [u8],
-) -> Result<()> {
-    // Nothing to do? This is a valid case, and protects against invalid memory access later.
-    if width == 0 || height == 0 {
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_decoder_creation() {
+        let data = vec![0xFF, 0xAA, 0x55, 0x00];
+        let decoder = Decoder::new(&data);
+        assert_eq!(decoder.pos, 4);
+        assert_eq!(decoder.bits_available, 32);
     }
-
-    let mut stream = DecompressStream::new(compressed_data);
-
-    // "Fake" that we have used the correct number of symbols.
-    let mut num_filled_elements = width;
-    num_filled_elements = stream.decompress_row(row_buffer, num_filled_elements, width);
-
-    // First row: Horizontal delta only.
-    out_image[0] = row_buffer[0];
-    for x in 1..width {
-        out_image[x] = row_buffer[x].wrapping_add(out_image[x - 1]);
-    }
-
-    // Rows 2 to N: Horizontal + vertical delta.
-    for y in 1..height {
-        num_filled_elements = stream.decompress_row(row_buffer, num_filled_elements, width);
-
-        let p0_start = (y - 1) * bytes_per_line;
-        let p1_start = y * bytes_per_line;
-
-        out_image[p1_start] = row_buffer[0].wrapping_add(out_image[p0_start]);
-        
-        for x in 1..width {
-            let pred = (out_image[p1_start + x - 1] as i32 + out_image[p0_start + x] as i32) / 2;
-            out_image[p1_start + x] = row_buffer[x].wrapping_add(pred as u8);
-        }
-    }
-
-    Ok(())
 }

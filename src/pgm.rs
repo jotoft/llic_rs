@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use crate::{LlicError, Result};
@@ -62,7 +62,6 @@ impl Pgm {
         let mut data = vec![0u8; (width * height) as usize];
         
         if binary {
-            use std::io::Read;
             reader.read_exact(&mut data)?;
         } else {
             let mut values = String::new();

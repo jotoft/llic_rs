@@ -68,10 +68,69 @@ impl LlicContext {
     }
     
     pub fn decompress_gray8(&self, src_data: &[u8], dst_graymap: &mut [u8]) -> Result<(Quality, Mode)> {
-        todo!("Decompression not yet implemented")
+        if src_data.len() < 3 {
+            return Err(LlicError::InvalidData);
+        }
+        
+        // Parse header
+        let version = src_data[0];
+        let num_blocks = src_data[1];
+        let quality_mode = src_data[2];
+        
+        if version != 3 {
+            return Err(LlicError::UnsupportedFormat);
+        }
+        
+        // Determine quality and mode from header
+        let (quality, mode) = match quality_mode {
+            0 => (Quality::Lossless, Mode::Default),
+            2 => (Quality::VeryHigh, Mode::Default),
+            4 => (Quality::High, Mode::Default),
+            8 => (Quality::Medium, Mode::Default),
+            16 => (Quality::Low, Mode::Default),
+            _ => return Err(LlicError::InvalidData),
+        };
+        
+        // Read block size table
+        let mut pos = 3;
+        let mut block_sizes = Vec::with_capacity(num_blocks as usize);
+        for _ in 0..num_blocks {
+            if pos + 4 > src_data.len() {
+                return Err(LlicError::InvalidData);
+            }
+            let size = u32::from_le_bytes([
+                src_data[pos],
+                src_data[pos + 1],
+                src_data[pos + 2],
+                src_data[pos + 3],
+            ]);
+            block_sizes.push(size);
+            pos += 4;
+        }
+        
+        // For now, only handle single-threaded lossless decompression
+        if num_blocks != 1 {
+            return Err(LlicError::UnsupportedFormat);
+        }
+        
+        if quality != Quality::Lossless {
+            return Err(LlicError::UnsupportedFormat);
+        }
+        
+        // Decompress the single block
+        let block_data = &src_data[pos..pos + block_sizes[0] as usize];
+        entropy_coder::decompress(
+            block_data,
+            self.width,
+            self.height,
+            self.bytes_per_line,
+            dst_graymap,
+        )?;
+        
+        Ok((quality, mode))
     }
     
-    pub fn compress_gray8(&self, src_graymap: &[u8], quality: Quality, mode: Mode, dst_data: &mut [u8]) -> Result<usize> {
+    pub fn compress_gray8(&self, _src_graymap: &[u8], _quality: Quality, _mode: Mode, _dst_data: &mut [u8]) -> Result<usize> {
         todo!("Compression not yet implemented")
     }
 }

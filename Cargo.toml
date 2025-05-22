@@ -8,7 +8,7 @@ thiserror = "1.0"
 num_cpus = "1.16"
 rayon = "1.10"
 
-[lib]1
+[lib]
 name = "llic"
 path = "src/lib.rs"
 
