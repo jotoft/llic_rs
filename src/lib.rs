@@ -108,24 +108,46 @@ impl LlicContext {
             pos += 4;
         }
         
-        // For now, only handle single-threaded lossless decompression
-        if num_blocks != 1 {
-            return Err(LlicError::UnsupportedFormat);
-        }
-        
         if quality != Quality::Lossless {
             return Err(LlicError::UnsupportedFormat);
         }
         
-        // Decompress the single block
-        let block_data = &src_data[pos..pos + block_sizes[0] as usize];
-        entropy_coder::decompress(
-            block_data,
-            self.width,
-            self.height,
-            self.bytes_per_line,
-            dst_graymap,
-        )?;
+        // Calculate rows per block
+        let rows_per_block = (self.height as usize + num_blocks as usize - 1) / num_blocks as usize;
+        
+        // Decompress each block
+        for block_idx in 0..num_blocks as usize {
+            let block_start_row = block_idx * rows_per_block;
+            let block_end_row = ((block_idx + 1) * rows_per_block).min(self.height as usize);
+            let block_height = block_end_row - block_start_row;
+            
+            if block_height == 0 {
+                continue;
+            }
+            
+            let block_data = &src_data[pos..pos + block_sizes[block_idx] as usize];
+            pos += block_sizes[block_idx] as usize;
+            
+            // Create a temporary buffer for this block
+            let mut block_buffer = vec![0u8; self.width as usize * block_height];
+            
+            // Decompress the block
+            entropy_coder::decompress(
+                block_data,
+                self.width,
+                block_height as u32,
+                self.width,
+                &mut block_buffer,
+            )?;
+            
+            // Copy the decompressed block to the output image
+            for y in 0..block_height {
+                let src_offset = y * self.width as usize;
+                let dst_offset = (block_start_row + y) * self.bytes_per_line as usize;
+                dst_graymap[dst_offset..dst_offset + self.width as usize]
+                    .copy_from_slice(&block_buffer[src_offset..src_offset + self.width as usize]);
+            }
+        }
         
         Ok((quality, mode))
     }

@@ -28,10 +28,9 @@ pub fn decompress(
         let row_offset = (y * bytes_per_line) as usize;
         let prev_row_offset = ((y - 1) * bytes_per_line) as usize;
         
-        // First pixel of row
-        let left = 0u8;
+        // First pixel of row - use top pixel only (left is implicitly 0 at start of row)
         let top = dst_image[prev_row_offset];
-        let avg = ((left as u16 + top as u16) / 2) as u8;
+        let avg = top / 2;  // (0 + top) / 2
         let delta = decoder.decode_symbol()?;
         dst_image[row_offset] = avg.wrapping_add(delta);
         
