@@ -14,13 +14,17 @@ pub fn decompress(
     }
     
     let mut decoder = Decoder::new(src_data);
+    let mut row_buffer = vec![0u8; width as usize + 256];
     
     // Decompress first row (horizontal delta only)
-    let mut prev = 0u8;
     for x in 0..width {
-        let delta = decoder.decode_symbol()?;
-        prev = prev.wrapping_add(delta);
-        dst_image[x as usize] = prev;
+        row_buffer[x as usize] = decoder.decode_symbol()?;
+    }
+    
+    // Apply horizontal delta decoding to first row
+    dst_image[0] = row_buffer[0];
+    for x in 1..width {
+        dst_image[x as usize] = row_buffer[x as usize].wrapping_add(dst_image[x as usize - 1]);
     }
     
     // Decompress remaining rows (combined predictor)
@@ -28,19 +32,20 @@ pub fn decompress(
         let row_offset = (y * bytes_per_line) as usize;
         let prev_row_offset = ((y - 1) * bytes_per_line) as usize;
         
-        // First pixel of row - use top pixel only (left is implicitly 0 at start of row)
-        let top = dst_image[prev_row_offset];
-        let avg = top / 2;  // (0 + top) / 2
-        let delta = decoder.decode_symbol()?;
-        dst_image[row_offset] = avg.wrapping_add(delta);
+        // Decode symbols for this row
+        for x in 0..width {
+            row_buffer[x as usize] = decoder.decode_symbol()?;
+        }
         
-        // Rest of row
+        // First pixel of row - just add to pixel above
+        dst_image[row_offset] = row_buffer[0].wrapping_add(dst_image[prev_row_offset]);
+        
+        // Rest of row - use average of left and top
         for x in 1..width {
             let left = dst_image[row_offset + x as usize - 1];
             let top = dst_image[prev_row_offset + x as usize];
-            let avg = ((left as u16 + top as u16) / 2) as u8;
-            let delta = decoder.decode_symbol()?;
-            dst_image[row_offset + x as usize] = avg.wrapping_add(delta);
+            let avg = ((left as i32 + top as i32) / 2) as u8;
+            dst_image[row_offset + x as usize] = row_buffer[x as usize].wrapping_add(avg);
         }
     }
     
@@ -68,10 +73,13 @@ impl<'a> Decoder<'a> {
     }
     
     fn refill(&mut self) {
-        while self.bits_available <= 24 && self.pos < self.data.len() {
-            self.bit_container |= (self.data[self.pos] as u32) << (24 - self.bits_available);
-            self.bits_available += 8;
-            self.pos += 1;
+        // The C++ version reads 16-bit values
+        while self.bits_available < 16 && self.pos + 1 < self.data.len() {
+            // Read 16 bits in little-endian order
+            let word = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+            self.bit_container |= (word as u32) << (16 - self.bits_available);
+            self.bits_available += 16;
+            self.pos += 2;
         }
     }
     
