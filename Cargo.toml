@@ -1,0 +1,17 @@
+[package]
+name = "llic_rs2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1.0"
+num_cpus = "1.16"
+rayon = "1.10"
+
+[lib]1
+name = "llic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llic_compress"
+path = "src/bin/llic_compress.rs"
