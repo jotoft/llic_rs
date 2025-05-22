@@ -73,6 +73,31 @@ Used when quality=LOSSLESS and mode=DEFAULT.
 - Variable-length encoding using pre-computed Huffman-like tables
 - Processes pairs of symbols for efficiency
 
+**Two-Symbol Decoding:**
+
+The u8v1 decoder uses an optimized two-symbol decoding approach:
+
+1. **Pair-based decoding**: Each table lookup can yield 1 or 2 symbols
+   - Common symbol pairs are encoded together for efficiency
+   - Less common symbols are encoded individually
+   - Reduces number of bit stream reads and table lookups
+
+2. **Carryover buffer system**: Maintains extra decoded symbols between rows
+   - When decoding produces 2 symbols but only 1 is needed for current row
+   - Extra symbol is saved in a carryover buffer
+   - Next row starts by using carryover symbols before decoding more
+
+3. **Row processing algorithm**:
+   ```
+   For each row:
+   1. Copy any carryover symbols from previous row
+   2. Decode symbol pairs until row is filled (width + 1 extra for next row's predictor)
+   3. Save excess symbols as carryover for next row
+   4. Apply inverse delta/prediction to reconstruct pixels
+   ```
+
+This approach minimizes table lookups and improves cache efficiency by processing multiple symbols per operation.
+
 ### 2. Tile-Based Compression (4x4 blocks)
 
 Used for all other quality/mode combinations.

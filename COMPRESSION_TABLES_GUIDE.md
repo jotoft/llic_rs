@@ -118,7 +118,32 @@ consume_bits(entry.bits);
 return entry.num_symbols;
 ```
 
-### 2. Symbol Reconstruction
+### 2. Carryover Buffer System
+The decoder maintains a carryover buffer for efficient row processing:
+
+```c
+// Row processing with carryover
+elem = carryover_count;  // Start with symbols from previous row
+
+while (elem < width + 1) {  // Need 1 extra for next row's predictor
+    num_decoded = decode_sequence(&buffer[elem]);
+    elem += num_decoded;
+}
+
+// Save excess symbols for next row
+if (elem > width) {
+    carryover_count = elem - width;
+    // Buffer already contains the carryover symbols at positions [width..elem)
+}
+```
+
+This system is crucial because:
+- Table lookups may decode 2 symbols when only 1 is needed
+- Extra symbols are preserved for the next row
+- Avoids redundant decoding and bit stream reads
+- Maintains proper alignment for predictor calculations
+
+### 3. Symbol Reconstruction
 After decompression, reconstruct the original values:
 - **First row**: `pixel[x] = delta[x] + pixel[x-1]`
 - **Other rows**: `pixel[x] = delta[x] + average(pixel[x-1], pixel_above[x])`
