@@ -25,16 +25,25 @@ pub fn decompress_with_debug(
     }
     
     let mut decoder = Decoder::new(src_data);
+    decoder.debug = debug;
     let mut row_buffer = vec![0u8; width as usize + 256];
     
-    // Initialize with the correct number of symbols
-    let mut num_filled_elements = width as usize;
-    
-    // Decompress first row
-    num_filled_elements = decoder.decompress_row(&mut row_buffer, num_filled_elements, width as usize)?;
+    // CRITICAL: Start with 0 elements, not width!
+    // The C++ code initializes numFilledElements to inWidth, but that's for the first call
+    // We need to decode the first row from scratch
+    let mut num_filled_elements = 0;
     
     if debug {
-        println!("First row raw symbols: {:?}", &row_buffer[0..width as usize]);
+        println!("\n=== Starting decompression ===");
+        println!("Width: {}, Height: {}, Bytes per line: {}", width, height, bytes_per_line);
+    }
+    
+    // Decompress first row
+    num_filled_elements = decoder.decompress_row_with_debug(&mut row_buffer, num_filled_elements, width as usize, debug, 0)?;
+    
+    if debug {
+        println!("\nRow 0 raw symbols: {:?}", &row_buffer[0..width as usize]);
+        println!("After row 0: {} elements in buffer", num_filled_elements);
     }
     
     // First row: Horizontal delta only
@@ -44,7 +53,8 @@ pub fn decompress_with_debug(
     }
     
     if debug {
-        println!("First row after delta: {:?}", &dst_image[0..width as usize]);
+        println!("Row 0 after delta: {:?}", &dst_image[0..width as usize]);
+        println!("Row 0 final bytes: {:02X?}", &dst_image[0..width.min(20) as usize]);
     }
     
     // Decompress remaining rows (combined predictor)
@@ -52,26 +62,57 @@ pub fn decompress_with_debug(
         let row_offset = (y * bytes_per_line) as usize;
         let prev_row_offset = ((y - 1) * bytes_per_line) as usize;
         
-        // Decompress row with carryover
-        num_filled_elements = decoder.decompress_row(&mut row_buffer, num_filled_elements, width as usize)?;
+        if debug && (y >= 2 && y <= 5) {
+            println!("\n--- Processing row {} ---", y);
+            println!("Carryover buffer state before decode: {} elements", num_filled_elements);
+            if num_filled_elements > width as usize {
+                println!("Carryover symbols: {:?}", &row_buffer[width as usize..num_filled_elements]);
+            }
+        }
         
-        if debug {
-            println!("Row {} raw symbols: {:?}", y, &row_buffer[0..width as usize]);
+        // Decompress row with carryover
+        num_filled_elements = decoder.decompress_row_with_debug(&mut row_buffer, num_filled_elements, width as usize, debug && (y >= 2 && y <= 5), y)?;
+        
+        if debug && (y >= 2 && y <= 5) {
+            println!("Row {} raw symbols: {:?}", y, &row_buffer[0..width.min(20) as usize]);
+            println!("After row {}: {} elements in buffer", y, num_filled_elements);
         }
         
         // Apply prediction and reconstruction
         dst_image[row_offset] = row_buffer[0].wrapping_add(dst_image[prev_row_offset]);
         
+        if debug && (y >= 2 && y <= 5) {
+            println!("First pixel: delta={}, top={}, result={}", 
+                row_buffer[0], dst_image[prev_row_offset], dst_image[row_offset]);
+        }
+        
         for x in 1..width {
             let left = dst_image[row_offset + x as usize - 1];
             let top = dst_image[prev_row_offset + x as usize];
             let avg = ((left as i32 + top as i32) / 2) as u8;
-            dst_image[row_offset + x as usize] = row_buffer[x as usize].wrapping_add(avg);
+            let delta = row_buffer[x as usize];
+            dst_image[row_offset + x as usize] = delta.wrapping_add(avg);
+            
+            if debug && (y >= 2 && y <= 5) && x < 20 {
+                println!("  Pixel[{},{}]: left={}, top={}, avg={}, delta={}, result={}", 
+                    y, x, left, top, avg, delta, dst_image[row_offset + x as usize]);
+            }
         }
         
-        if debug {
-            println!("Row {} after reconstruction: {:?}", y, 
-                &dst_image[row_offset..row_offset + width as usize]);
+        if debug && (y >= 2 && y <= 5) {
+            println!("Row {} reconstructed: {:02X?}", y, 
+                &dst_image[row_offset..row_offset + width.min(20) as usize]);
+            
+            // Check for corruption at byte 271 (row 4, column 15)
+            if y == 4 {
+                let byte_pos = row_offset + 15;
+                println!("\nByte 271 check (row 4, col 15):");
+                println!("  Absolute position: {}", byte_pos);
+                println!("  Value: 0x{:02X}", dst_image[byte_pos]);
+                if byte_pos > 0 {
+                    println!("  Previous byte (270): 0x{:02X}", dst_image[byte_pos - 1]);
+                }
+            }
         }
     }
     
@@ -83,6 +124,7 @@ struct Decoder<'a> {
     pos: usize,
     bit_container: u32,
     bits_available: u32,
+    debug: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -92,6 +134,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             bit_container: 0,
             bits_available: 0,
+            debug: false,
         };
         // Pre-fill the bit container
         decoder.refill();
@@ -106,6 +149,15 @@ impl<'a> Decoder<'a> {
             self.bit_container |= (word as u32) << (16 - self.bits_available);
             self.bits_available += 16;
             self.pos += 2;
+            
+            if self.debug {
+                println!("        refill: read word 0x{:04X} at pos {}, bit_container=0x{:08X}, bits_available={}", 
+                    word, self.pos - 2, self.bit_container, self.bits_available);
+            }
+        }
+        
+        if self.debug && self.pos + 1 >= self.data.len() {
+            println!("        refill: reached end of data at pos {}, data.len()={}", self.pos, self.data.len());
         }
     }
     
@@ -118,12 +170,26 @@ impl<'a> Decoder<'a> {
     fn decode_sequence(&mut self, out: &mut [u8]) -> Result<usize> {
         self.refill();
         
+        // Debug: show bit container state
+        if self.debug {
+            println!("      decode_sequence: bit_container=0x{:08X}, bits_available={}", 
+                self.bit_container, self.bits_available);
+        }
+        
         // Get top 12 bits for table lookup
         let index = (self.bit_container >> 20) as usize;
         
+        if self.debug {
+            println!("      Table lookup index: 0x{:03X} ({})", index, index);
+        }
+        
         // Special case: 13-bit codes
         if index >= 0xF80 {
-            out[0] = ((self.bit_container >> 19) & 0xFF) as u8;
+            let symbol = ((self.bit_container >> 19) & 0xFF) as u8;
+            if self.debug {
+                println!("      13-bit code: symbol={}", symbol);
+            }
+            out[0] = symbol;
             self.consume_bits(13);
             return Ok(1);
         }
@@ -134,6 +200,12 @@ impl<'a> Decoder<'a> {
         }
         
         let entry = DECOMPRESS_TABLE[index];
+        
+        if self.debug {
+            println!("      Table entry: bits={}, num_symbols={}, symbols=[{}, {}]",
+                entry.bits, entry.num_symbols, entry.symbols[0], entry.symbols[1]);
+        }
+        
         self.consume_bits(entry.bits as u32);
         
         // Copy decoded symbols (always write both, even if num_symbols == 1)
@@ -144,19 +216,47 @@ impl<'a> Decoder<'a> {
     }
     
     fn decompress_row(&mut self, buf: &mut [u8], num_elems: usize, width: usize) -> Result<usize> {
+        self.decompress_row_with_debug(buf, num_elems, width, false, 0)
+    }
+    
+    fn decompress_row_with_debug(&mut self, buf: &mut [u8], num_elems: usize, width: usize, debug: bool, row_num: u32) -> Result<usize> {
         let mut elem = num_elems;
+        
+        if debug {
+            println!("  decompress_row: start with {} elements, width={}", num_elems, width);
+        }
         
         // Handle carryover from previous row
         if elem > width {
             // Copy the extra elements to the beginning of the buffer
+            if debug {
+                println!("  Copying {} carryover elements from position {} to 0", elem - width, width);
+                println!("  Carryover data: {:?}", &buf[width..elem]);
+            }
             buf.copy_within(width..elem, 0);
         }
         elem = elem.saturating_sub(width);
         
+        if debug {
+            println!("  After carryover handling: elem={}", elem);
+        }
+        
         // Decode symbols until we have enough for this row
+        let mut decode_count = 0;
         while elem < width {
+            if debug {
+                println!("  Decoding at position {}, need {} more symbols", elem, width - elem);
+            }
             let symbols = self.decode_sequence(&mut buf[elem..])?;
+            if debug {
+                println!("    Decoded {} symbols: {:?}", symbols, &buf[elem..elem+symbols]);
+            }
             elem += symbols;
+            decode_count += 1;
+        }
+        
+        if debug {
+            println!("  Total decode operations: {}, final elem count: {}", decode_count, elem);
         }
         
         Ok(elem)
@@ -233,6 +333,121 @@ mod tests {
             // Check if we get the expected gradient
             let expected: Vec<u8> = (0..16).collect();
             assert_eq!(output, expected, "Gradient decompression should produce 0..16");
+        }
+    }
+    
+    #[test]
+    fn test_patterns_decompression_debug() {
+        use crate::pgm::Pgm;
+        use crate::LlicContext;
+        
+        // Test specifically for the patterns_64x64.pgm file
+        let compressed_path = "test_data/patterns_64x64_q0.llic";
+        let original_path = "test_data/patterns_64x64.pgm";
+        
+        if std::path::Path::new(compressed_path).exists() && std::path::Path::new(original_path).exists() {
+            println!("\n=== Testing patterns_64x64.pgm decompression ===");
+            
+            // Load original for comparison
+            let original = Pgm::open(original_path).unwrap();
+            
+            // Load compressed file
+            let file_content = std::fs::read(compressed_path).unwrap();
+            
+            // Skip the text header
+            let header_end = file_content.windows(1)
+                .enumerate()
+                .filter(|(_, w)| w[0] == b'\n')
+                .nth(1)
+                .map(|(i, _)| i + 1)
+                .unwrap();
+            
+            let compressed_data = &file_content[header_end..];
+            
+            // Use the proper decompression function that handles multi-block files
+            let context = LlicContext::new(64, 64, 64, None).unwrap();
+            let mut output = vec![0u8; 64 * 64];
+            
+            println!("Using LlicContext to decompress (handles multi-block properly)");
+            let result = context.decompress_gray8(compressed_data, &mut output);
+            
+            assert!(result.is_ok(), "Decompression should succeed");
+            
+            // Check specific byte at position 271 (row 4, column 15)
+            println!("\n=== Checking corruption point ===");
+            println!("Byte 270: original=0x{:02X}, decompressed=0x{:02X}", 
+                original.data()[270], output[270]);
+            println!("Byte 271: original=0x{:02X}, decompressed=0x{:02X}", 
+                original.data()[271], output[271]);
+            println!("Byte 272: original=0x{:02X}, decompressed=0x{:02X}", 
+                original.data()[272], output[272]);
+            
+            // Check first few rows
+            let mut first_diff = None;
+            for (i, (orig, dec)) in original.data().iter().zip(output.iter()).enumerate() {
+                if orig != dec && first_diff.is_none() {
+                    first_diff = Some(i);
+                    println!("\nFirst difference at byte {}: original=0x{:02X}, decompressed=0x{:02X}", 
+                        i, orig, dec);
+                    println!("Row: {}, Column: {}", i / 64, i % 64);
+                }
+            }
+            
+            if let Some(pos) = first_diff {
+                // Let's also test with debug mode on a single block to understand the issue
+                println!("\n=== Debug mode: Testing individual blocks ===");
+                
+                // Parse LLIC header
+                let num_blocks = compressed_data[1];
+                let header_size = 3 + (num_blocks as usize * 4);
+                
+                println!("Number of blocks: {}", num_blocks);
+                println!("Header size: {}", header_size);
+                
+                // Print all block sizes
+                let mut block_sizes = Vec::new();
+                for i in 0..num_blocks as usize {
+                    let size_offset = 3 + i * 4;
+                    let block_size = u32::from_le_bytes([
+                        compressed_data[size_offset],
+                        compressed_data[size_offset + 1],
+                        compressed_data[size_offset + 2],
+                        compressed_data[size_offset + 3],
+                    ]);
+                    block_sizes.push(block_size);
+                    println!("Block {} size in header: {}", i, block_size);
+                }
+                
+                // Find the last non-zero block (which should contain the full image)
+                let mut last_nonzero_block = None;
+                let mut block_start = header_size;
+                for (i, &block_size) in block_sizes.iter().enumerate() {
+                    if block_size > 0 {
+                        last_nonzero_block = Some((i, block_start, block_size));
+                    }
+                    block_start += block_size as usize;
+                }
+                
+                if let Some((block_idx, offset, size)) = last_nonzero_block {
+                    println!("\nLast non-zero block is {} at offset {} with size {}", block_idx, offset, size);
+                    let entropy_data = &compressed_data[offset..offset + size as usize];
+                    
+                    let mut debug_output = vec![0u8; 64 * 64];
+                    let result = decompress_with_debug(entropy_data, 64, 64, 64, &mut debug_output, true);
+                    
+                    if result.is_ok() {
+                        println!("\nLast block decompression succeeded!");
+                    } else {
+                        println!("\nLast block decompression failed: {:?}", result);
+                    }
+                }
+                
+                panic!("Decompression mismatch starting at byte {}", pos);
+            } else {
+                println!("\nDecompression successful - all bytes match!");
+            }
+        } else {
+            println!("Skipping patterns test - files not found");
         }
     }
 }
