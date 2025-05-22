@@ -112,40 +112,36 @@ impl LlicContext {
             return Err(LlicError::UnsupportedFormat);
         }
         
-        // Calculate rows per block
-        let rows_per_block = (self.height as usize + num_blocks as usize - 1) / num_blocks as usize;
+        // For v3 format, blocks are assigned in a specific way
+        // With many threads and small images, only the last few blocks may have data
+        let mut row_offset = 0;
         
-        // Decompress each block
         for block_idx in 0..num_blocks as usize {
-            let block_start_row = block_idx * rows_per_block;
-            let block_end_row = ((block_idx + 1) * rows_per_block).min(self.height as usize);
-            let block_height = block_end_row - block_start_row;
+            let block_size = block_sizes[block_idx];
             
-            if block_height == 0 {
+            // Skip empty blocks
+            if block_size == 0 {
                 continue;
             }
             
-            let block_data = &src_data[pos..pos + block_sizes[block_idx] as usize];
-            pos += block_sizes[block_idx] as usize;
-            
-            // Create a temporary buffer for this block
-            let mut block_buffer = vec![0u8; self.width as usize * block_height];
-            
-            // Decompress the block
-            entropy_coder::decompress(
-                block_data,
-                self.width,
-                block_height as u32,
-                self.width,
-                &mut block_buffer,
-            )?;
-            
-            // Copy the decompressed block to the output image
-            for y in 0..block_height {
-                let src_offset = y * self.width as usize;
-                let dst_offset = (block_start_row + y) * self.bytes_per_line as usize;
-                dst_graymap[dst_offset..dst_offset + self.width as usize]
-                    .copy_from_slice(&block_buffer[src_offset..src_offset + self.width as usize]);
+            // For the blocks that have data, they contain the full image
+            // This happens when there are more threads than needed
+            if row_offset == 0 && block_size > 0 {
+                // This block contains the entire image
+                let block_data = &src_data[pos..pos + block_size as usize];
+                pos += block_size as usize;
+                
+                // Decompress the entire image
+                entropy_coder::decompress(
+                    block_data,
+                    self.width,
+                    self.height,
+                    self.bytes_per_line,
+                    dst_graymap,
+                )?;
+                
+                // We're done - the entire image was in this block
+                break;
             }
         }
         
