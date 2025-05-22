@@ -124,3 +124,10 @@ impl Pgm {
         &mut self.data
     }
 }
+
+// Convenience functions
+pub fn write<P: AsRef<Path>>(path: P, width: u32, height: u32, data: &[u8]) -> Result<()> {
+    let mut pgm = Pgm::new(width, height);
+    pgm.data_mut().copy_from_slice(data);
+    pgm.save(path, true)
+}

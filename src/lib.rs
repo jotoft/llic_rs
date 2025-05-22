@@ -32,6 +32,8 @@ pub enum LlicError {
     Io(#[from] std::io::Error),
     #[error("Invalid compressed data")]
     InvalidData,
+    #[error("File I/O error")]
+    FileIO,
 }
 
 pub type Result<T> = std::result::Result<T, LlicError>;
@@ -155,6 +157,78 @@ impl LlicContext {
 
 pub mod pgm;
 pub mod entropy_coder;
+
+// Export aliases for convenience
+pub use Quality as CompressionQuality;
+pub use Mode as CompressionMode;
+
+// File I/O convenience functions
+pub fn decode_file(input_path: &str, output_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::Read;
+    
+    // Read the LLIC file
+    let mut file = File::open(input_path).map_err(|_| LlicError::FileIO)?;
+    let mut llic_data = Vec::new();
+    file.read_to_end(&mut llic_data).map_err(|_| LlicError::FileIO)?;
+    
+    // Parse the simple container format to extract dimensions and compressed data
+    let (width, height, compressed_data) = parse_llic_container(&llic_data)?;
+    
+    // Create context and decompress
+    let context = LlicContext::new(width, height, width, None)?;
+    let mut image_data = vec![0u8; (width * height) as usize];
+    context.decompress_gray8(&compressed_data, &mut image_data)?;
+    
+    // Save as PGM
+    pgm::write(output_path, width, height, &image_data)?;
+    
+    Ok(())
+}
+
+pub fn encode_file(_input_path: &str, _output_path: &str, _quality: CompressionQuality, _mode: CompressionMode) -> Result<()> {
+    todo!("Encoding not yet implemented")
+}
+
+fn parse_llic_container(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    use std::str;
+    
+    // Find first newline
+    let first_newline = data.iter().position(|&b| b == b'\n')
+        .ok_or(LlicError::UnsupportedFormat)?;
+    
+    let header_line = str::from_utf8(&data[..first_newline])
+        .map_err(|_| LlicError::UnsupportedFormat)?;
+    
+    let parts: Vec<&str> = header_line.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(LlicError::UnsupportedFormat);
+    }
+    
+    let width: u32 = parts[0].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+    let height: u32 = parts[1].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+    
+    // Find second newline
+    let second_start = first_newline + 1;
+    let second_newline = data[second_start..].iter().position(|&b| b == b'\n')
+        .ok_or(LlicError::UnsupportedFormat)? + second_start;
+    
+    let size_line = str::from_utf8(&data[second_start..second_newline])
+        .map_err(|_| LlicError::UnsupportedFormat)?;
+    
+    let compressed_size: usize = size_line.trim().parse()
+        .map_err(|_| LlicError::UnsupportedFormat)?;
+    
+    // Extract compressed data
+    let data_start = second_newline + 1;
+    if data_start + compressed_size > data.len() {
+        return Err(LlicError::UnsupportedFormat);
+    }
+    
+    let compressed_data = data[data_start..data_start + compressed_size].to_vec();
+    
+    Ok((width, height, compressed_data))
+}
 
 #[cfg(test)]
 mod tests {
