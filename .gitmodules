@@ -1,0 +1,3 @@
+[submodule "llic"]
+	path = llic
+	url = https://gitlab.com/llic/llic.git
