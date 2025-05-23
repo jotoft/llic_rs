@@ -1,5 +1,7 @@
 # LLIC Compressed Image Format Specification
 
+**Note**: This specification has been reverse-engineered from the original C++ implementation by Peter Rundberg. It is not an official specification but rather aims to document the format as implemented in the reference code. The format and this documentation should be considered experimental.
+
 ## Overview
 
 LLIC (Lossy and Lossless Image Compression) is a fast grayscale image compression format that supports

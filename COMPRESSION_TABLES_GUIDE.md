@@ -1,5 +1,7 @@
 # LLIC Compression Tables Guide
 
+**Note**: This guide has been reverse-engineered from the original C++ implementation by Peter Rundberg. It documents the compression table format and behavior as observed in the reference implementation, not from an official specification. The exact algorithm for generating these tables is not documented in the source code.
+
 This guide explains the structure and usage of the LLIC compression and decompression tables for implementing the Rust
 version.
 
