@@ -78,14 +78,14 @@ Used when quality=LOSSLESS and mode=DEFAULT.
 The u8v1 decoder uses an optimized two-symbol decoding approach:
 
 1. **Pair-based decoding**: Each table lookup can yield 1 or 2 symbols
-   - Common symbol pairs are encoded together for efficiency
-   - Less common symbols are encoded individually
-   - Reduces number of bit stream reads and table lookups
+    - Common symbol pairs are encoded together for efficiency
+    - Less common symbols are encoded individually
+    - Reduces number of bit stream reads and table lookups
 
 2. **Carryover buffer system**: Maintains extra decoded symbols between rows
-   - When decoding produces 2 symbols but only 1 is needed for current row
-   - Extra symbol is saved in a carryover buffer
-   - Next row starts by using carryover symbols before decoding more
+    - When decoding produces 2 symbols but only 1 is needed for current row
+    - Extra symbol is saved in a carryover buffer
+    - Next row starts by using carryover symbols before decoding more
 
 3. **Row processing algorithm**:
    ```
