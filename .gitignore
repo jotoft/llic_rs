@@ -1,2 +1,28 @@
+# Rust
 /target
+Cargo.lock
+
+# IDE
 /.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Build directories
+/llic/build/
+/llic/cmake-build-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test_data/out/
+*.pgm.tmp
+*.llic.tmp
+
+# Debug files
+*.log
+core
+*.core
