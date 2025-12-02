@@ -1,3 +1,6 @@
+[env]
+RUSTFLAGS = "-C target-cpu=native"
+
 [tasks.bench]
 description = "Run all benchmarks"
 run = "cargo bench"
@@ -9,10 +12,6 @@ run = "cargo bench -- '256x256'"
 [tasks."bench:rust"]
 description = "Run Rust-only benchmarks"
 run = "cargo bench -- 'rust'"
-
-[tasks."bench:native"]
-description = "Run benchmarks with native CPU optimizations"
-run = "RUSTFLAGS='-C target-cpu=native' cargo bench"
 
 [tasks.profile]
 description = "Generate flamegraph + perf.data for Rust 256x256 decompression"
