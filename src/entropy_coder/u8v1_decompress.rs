@@ -119,6 +119,9 @@ impl<'a> FastDecoder<'a> {
 
     #[inline(always)]
     fn decompress_row(&mut self, buf: &mut [u8], num_elems: usize, width: usize) -> usize {
+        // Assert buffer is large enough - helps optimizer
+        debug_assert!(buf.len() >= width + 4);
+
         let mut elem = num_elems;
 
         // Handle carryover from previous row
@@ -127,7 +130,61 @@ impl<'a> FastDecoder<'a> {
         }
         elem = elem.saturating_sub(width);
 
-        // Main decode loop - use get_unchecked for table and buffer access
+        // Unrolled loop: decode 2 sequences when we have enough bits
+        while elem + 4 <= width && self.num_bits >= 32 {
+            // First decode
+            let p1 = (self.bit_container >> 32) as u32;
+            if p1 < 0xF800_0000 {
+                let index = (p1 >> 20) as usize;
+                debug_assert!(index < 4096);
+                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
+                let bits = entry.bits as u32;
+                self.bit_container <<= bits;
+                self.num_bits -= bits;
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = entry.symbols[0];
+                    *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
+                }
+                elem += entry.num_symbols as usize;
+            } else {
+                self.bit_container <<= 13;
+                self.num_bits -= 13;
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = ((p1 >> 19) & 0xFF) as u8;
+                }
+                elem += 1;
+            }
+
+            // Second decode
+            let p2 = (self.bit_container >> 32) as u32;
+            if p2 < 0xF800_0000 {
+                let index = (p2 >> 20) as usize;
+                debug_assert!(index < 4096);
+                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
+                let bits = entry.bits as u32;
+                self.bit_container <<= bits;
+                self.num_bits -= bits;
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = entry.symbols[0];
+                    *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
+                }
+                elem += entry.num_symbols as usize;
+            } else {
+                self.bit_container <<= 13;
+                self.num_bits -= 13;
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = ((p2 >> 19) & 0xFF) as u8;
+                }
+                elem += 1;
+            }
+
+            // Refill after both decodes
+            if self.num_bits <= 32 {
+                self.refill();
+            }
+        }
+
+        // Handle remaining symbols
         while elem < width {
             if self.num_bits < 16 {
                 self.refill();
@@ -139,11 +196,8 @@ impl<'a> FastDecoder<'a> {
                 let index = (p >> 20) as usize;
                 let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
                 let bits = entry.bits as u32;
-
                 self.bit_container <<= bits;
                 self.num_bits -= bits;
-
-                // Safety: buf is width + 256 bytes, elem < width, so elem + 1 < width + 256
                 unsafe {
                     *buf.get_unchecked_mut(elem) = entry.symbols[0];
                     *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
