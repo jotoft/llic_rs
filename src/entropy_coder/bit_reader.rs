@@ -265,6 +265,44 @@ pub type BitReader32<'a> = BitReader<'a, u32>;
 /// Type alias for 64-bit bit reader (fewer refills than 32-bit)
 pub type BitReader64<'a> = BitReader<'a, u64>;
 
+/// Specialized implementation for 64-bit reader with bulk loading
+impl<'a> BitReader<'a, u64> {
+    /// Bulk refill: load 64 bits at once when container is nearly empty.
+    /// Falls back to 16-bit loads when not enough data available.
+    #[inline(always)]
+    pub fn refill_bulk(&mut self) {
+        // Only do bulk load when we have room for 64 bits and enough data
+        if self.count == 0 && self.pos + 8 <= self.src.len() {
+            // Load 8 bytes at once
+            let bytes: [u8; 8] = unsafe {
+                *self.src.get_unchecked(self.pos..self.pos + 8).as_ptr().cast()
+            };
+
+            // Transform from LE memory layout to MSB-first bit container
+            // Memory: [b0, b1, b2, b3, b4, b5, b6, b7]
+            // LE u64: 0x_b7_b6_b5_b4_b3_b2_b1_b0
+            // Want:   0x_b1_b0_b3_b2_b5_b4_b7_b6 (LE words in MSB-first order)
+            let v = u64::from_ne_bytes(bytes).swap_bytes();
+            // Swap adjacent bytes within each 16-bit pair
+            let v = ((v & 0xFF00FF00FF00FF00) >> 8) | ((v & 0x00FF00FF00FF00FF) << 8);
+
+            self.bits = v;
+            self.count = 64;
+            self.pos += 8;
+        } else if self.count <= 48 && self.pos + 2 <= self.src.len() {
+            // Fall back to regular refill for partial loads
+            self.refill();
+        }
+    }
+
+    /// Refill (bulk) and return the top 32 bits for decoding.
+    #[inline(always)]
+    pub fn peek_refilled_bulk(&mut self) -> u32 {
+        self.refill_bulk();
+        self.bits.top32()
+    }
+}
+
 /// Type alias for 128-bit bit reader (even fewer refills)
 pub type BitReader128<'a> = BitReader<'a, u128>;
 

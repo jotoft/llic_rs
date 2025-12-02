@@ -95,7 +95,7 @@ impl<'a> FastDecoder<'a> {
     /// Decode one symbol (1 or 2 bytes) from the bit stream
     #[inline(always)]
     fn decode_one(&mut self, buf: &mut [u8], elem: usize) -> usize {
-        let p = self.reader.peek_refilled();
+        let p = self.reader.peek_refilled_bulk();
 
         if p < 0xF800_0000 {
             // Table lookup path (common case)
@@ -132,7 +132,7 @@ impl<'a> FastDecoder<'a> {
         // Unrolled loop: decode 2 symbols at a time when possible
         while elem + 4 <= width {
             // First decode
-            let p1 = self.reader.peek_refilled();
+            let p1 = self.reader.peek_refilled_bulk();
             if p1 < 0xF800_0000 {
                 let index = (p1 >> 20) as usize;
                 let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
@@ -151,7 +151,7 @@ impl<'a> FastDecoder<'a> {
             }
 
             // Second decode
-            let p2 = self.reader.peek_refilled();
+            let p2 = self.reader.peek_refilled_bulk();
             if p2 < 0xF800_0000 {
                 let index = (p2 >> 20) as usize;
                 let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
