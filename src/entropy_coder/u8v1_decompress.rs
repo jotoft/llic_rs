@@ -1,5 +1,5 @@
 use crate::{Result, LlicError};
-use super::bit_reader::BitReader32;
+use super::bit_reader::BitReader64;
 use super::tables::DECOMPRESS_TABLE;
 
 /// Decompresses data encoded with the u8v1 entropy coder (optimized path)
@@ -82,13 +82,13 @@ fn decompress_fast(
 
 /// Entropy decoder using BitReader for bit consumption
 struct FastDecoder<'a> {
-    reader: BitReader32<'a>,
+    reader: BitReader64<'a>,
 }
 
 impl<'a> FastDecoder<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
-            reader: BitReader32::new(data),
+            reader: BitReader64::new(data),
         }
     }
 
