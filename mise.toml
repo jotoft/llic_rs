@@ -42,3 +42,18 @@ run = "cargo test"
 [tasks.clean]
 description = "Clean build artifacts and profiling data"
 run = "cargo clean && rm -f flamegraph.svg perf.data perf.data.old"
+
+[tasks."bench:pgo"]
+description = "Run benchmarks with Profile-Guided Optimization"
+run = """
+echo "Step 1: Building with instrumentation..."
+rm -rf /tmp/pgo-data && mkdir -p /tmp/pgo-data
+RUSTFLAGS="-C target-cpu=native -Cprofile-generate=/tmp/pgo-data" cargo bench -- 'rust/256x256' 2>&1 | tail -10
+
+echo "Step 2: Merging profile data..."
+llvm-profdata merge -o /tmp/pgo-data/merged.profdata /tmp/pgo-data/*.profraw
+
+echo "Step 3: Rebuilding with PGO..."
+cargo clean -p llic_rs2
+RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/pgo-data/merged.profdata" cargo bench -- 'rust/256x256'
+"""
