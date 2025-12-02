@@ -1,7 +1,7 @@
 use crate::{Result, LlicError};
 use super::tables::DECOMPRESS_TABLE;
 
-/// Decompresses data encoded with the u8v1 entropy coder
+/// Decompresses data encoded with the u8v1 entropy coder (optimized path)
 pub fn decompress(
     src_data: &[u8],
     width: u32,
@@ -9,7 +9,140 @@ pub fn decompress(
     bytes_per_line: u32,
     dst_image: &mut [u8],
 ) -> Result<()> {
-    decompress_with_debug(src_data, width, height, bytes_per_line, dst_image, false)
+    // Use the fast path for normal operation
+    decompress_fast(src_data, width, height, bytes_per_line, dst_image)
+}
+
+/// Fast decompression without any debug overhead
+#[inline(never)] // Prevent inlining to help with profiling
+fn decompress_fast(
+    src_data: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst_image: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(LlicError::InvalidArgument);
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let bytes_per_line = bytes_per_line as usize;
+
+    let mut decoder = FastDecoder::new(src_data);
+    let mut row_buffer = vec![0u8; width + 256];
+
+    // Decompress first row
+    let mut num_filled = decoder.decompress_row(&mut row_buffer, 0, width);
+
+    // First row: Horizontal delta only
+    dst_image[0] = row_buffer[0];
+    for x in 1..width {
+        dst_image[x] = row_buffer[x].wrapping_add(dst_image[x - 1]);
+    }
+
+    // Remaining rows: Combined predictor
+    for y in 1..height {
+        let row_offset = y * bytes_per_line;
+        let prev_row_offset = (y - 1) * bytes_per_line;
+
+        num_filled = decoder.decompress_row(&mut row_buffer, num_filled, width);
+
+        // First pixel uses only top predictor
+        dst_image[row_offset] = row_buffer[0].wrapping_add(dst_image[prev_row_offset]);
+
+        // Remaining pixels use average of left and top
+        for x in 1..width {
+            let left = dst_image[row_offset + x - 1];
+            let top = dst_image[prev_row_offset + x];
+            // Use wrapping arithmetic to match C++ behavior: (left + top) / 2
+            let avg = ((left as u16 + top as u16) / 2) as u8;
+            dst_image[row_offset + x] = row_buffer[x].wrapping_add(avg);
+        }
+    }
+
+    Ok(())
+}
+
+/// Optimized decoder matching C++ implementation closely
+struct FastDecoder<'a> {
+    src_ptr: *const u16,
+    end_ptr: *const u16,
+    bit_container: u32,
+    num_bits: u32,
+    _phantom: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> FastDecoder<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let src_ptr = data.as_ptr() as *const u16;
+        let end_ptr = unsafe { src_ptr.add(data.len() / 2) };
+
+        Self {
+            src_ptr,
+            end_ptr,
+            bit_container: 0,
+            num_bits: 0,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        // Single conditional refill - matches C++ exactly
+        if self.num_bits < 16 && self.src_ptr != self.end_ptr {
+            let word = unsafe { self.src_ptr.read_unaligned() };
+            self.src_ptr = unsafe { self.src_ptr.add(1) };
+            self.bit_container |= (word as u32) << (16 - self.num_bits);
+            self.num_bits += 16;
+        }
+    }
+
+    #[inline(always)]
+    fn decode_sequence(&mut self, out: &mut [u8]) -> usize {
+        self.refill();
+        let p = self.bit_container;
+
+        // Fast path: symbols with <= 12 bits (most common case)
+        // Use the same threshold as C++: 0xF8000000
+        if p < 0xF800_0000 {
+            let index = (p >> 20) as usize;
+            let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
+
+            self.bit_container = p << entry.bits;
+            self.num_bits -= entry.bits as u32;
+
+            out[0] = entry.symbols[0];
+            out[1] = entry.symbols[1]; // Always written, even if num_symbols == 1
+
+            entry.num_symbols as usize
+        } else {
+            // 13-bit escape code: symbol is in bits 19-26
+            self.bit_container = p << 13;
+            self.num_bits -= 13;
+            out[0] = ((p >> 19) & 0xFF) as u8;
+            1
+        }
+    }
+
+    #[inline(always)]
+    fn decompress_row(&mut self, buf: &mut [u8], num_elems: usize, width: usize) -> usize {
+        let mut elem = num_elems;
+
+        // Handle carryover from previous row
+        if elem > width {
+            buf.copy_within(width..elem, 0);
+        }
+        elem = elem.saturating_sub(width);
+
+        // Decode until we have enough symbols
+        while elem < width {
+            elem += self.decode_sequence(&mut buf[elem..]);
+        }
+
+        elem
+    }
 }
 
 pub fn decompress_with_debug(

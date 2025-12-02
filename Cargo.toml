@@ -36,3 +36,6 @@ codegen-units = 1
 
 [profile.release]
 lto = "thin"
+
+[profile.bench]
+debug = true
