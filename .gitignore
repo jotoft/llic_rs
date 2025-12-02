@@ -26,3 +26,5 @@ test_data/out/
 *.log
 core
 *.core
+*.svg
+perf.data*

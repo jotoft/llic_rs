@@ -30,6 +30,10 @@ fn decompress_fast(
     let height = height as usize;
     let bytes_per_line = bytes_per_line as usize;
 
+    // Assert bounds upfront so compiler can elide checks in loops
+    assert!(dst_image.len() >= height * bytes_per_line);
+    assert!(bytes_per_line >= width);
+
     let mut decoder = FastDecoder::new(src_data);
     let mut row_buffer = vec![0u8; width + 256];
 
@@ -37,9 +41,13 @@ fn decompress_fast(
     let mut num_filled = decoder.decompress_row(&mut row_buffer, 0, width);
 
     // First row: Horizontal delta only
-    dst_image[0] = row_buffer[0];
-    for x in 1..width {
-        dst_image[x] = row_buffer[x].wrapping_add(dst_image[x - 1]);
+    {
+        let dst = &mut dst_image[..width];
+        let buf = &row_buffer[..width];
+        dst[0] = buf[0];
+        for x in 1..width {
+            dst[x] = buf[x].wrapping_add(dst[x - 1]);
+        }
     }
 
     // Remaining rows: Combined predictor
@@ -49,16 +57,23 @@ fn decompress_fast(
 
         num_filled = decoder.decompress_row(&mut row_buffer, num_filled, width);
 
+        // Get slices for current and previous row
+        let buf = &row_buffer[..width];
+
+        // Use split_at_mut to get non-overlapping mutable access
+        let (prev_rows, curr_row_and_rest) = dst_image.split_at_mut(row_offset);
+        let p0 = &prev_rows[prev_row_offset..prev_row_offset + width];
+        let p1 = &mut curr_row_and_rest[..width];
+
         // First pixel uses only top predictor
-        dst_image[row_offset] = row_buffer[0].wrapping_add(dst_image[prev_row_offset]);
+        p1[0] = buf[0].wrapping_add(p0[0]);
 
         // Remaining pixels use average of left and top
         for x in 1..width {
-            let left = dst_image[row_offset + x - 1];
-            let top = dst_image[prev_row_offset + x];
-            // Use wrapping arithmetic to match C++ behavior: (left + top) / 2
-            let avg = ((left as u16 + top as u16) / 2) as u8;
-            dst_image[row_offset + x] = row_buffer[x].wrapping_add(avg);
+            let left = p1[x - 1];
+            let top = p0[x];
+            let avg = ((left as u16 + top as u16) >> 1) as u8;
+            p1[x] = buf[x].wrapping_add(avg);
         }
     }
 

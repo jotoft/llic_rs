@@ -1,0 +1,45 @@
+[tasks.bench]
+description = "Run all benchmarks"
+run = "cargo bench"
+
+[tasks."bench:256"]
+description = "Run 256x256 benchmarks only"
+run = "cargo bench -- '256x256'"
+
+[tasks."bench:rust"]
+description = "Run Rust-only benchmarks"
+run = "cargo bench -- 'rust'"
+
+[tasks."bench:native"]
+description = "Run benchmarks with native CPU optimizations"
+run = "RUSTFLAGS='-C target-cpu=native' cargo bench"
+
+[tasks.profile]
+description = "Generate flamegraph + perf.data for Rust 256x256 decompression"
+run = "cargo flamegraph --bench llic_benchmark -- --bench 'rust/256x256'"
+
+[tasks."profile:report"]
+description = "Show perf report from existing perf.data (run 'profile' first)"
+run = "perf report --stdio -g none --percent-limit 1 2>/dev/null | head -60"
+
+[tasks."profile:open"]
+description = "Open flamegraph.svg in browser (run 'profile' first)"
+run = "xdg-open flamegraph.svg 2>/dev/null || open flamegraph.svg"
+
+[tasks."profile:all"]
+description = "Profile, show report, and open flamegraph"
+depends = ["profile"]
+run = """
+perf report --stdio -g none --percent-limit 1 2>/dev/null | head -40
+echo ""
+echo "Opening flamegraph.svg..."
+xdg-open flamegraph.svg 2>/dev/null || open flamegraph.svg
+"""
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+[tasks.clean]
+description = "Clean build artifacts and profiling data"
+run = "cargo clean && rm -f flamegraph.svg perf.data perf.data.old"
