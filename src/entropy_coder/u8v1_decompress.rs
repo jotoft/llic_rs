@@ -80,77 +80,41 @@ fn decompress_fast(
     Ok(())
 }
 
-/// Optimized decoder using 64-bit container for fewer refills
+/// Optimized decoder using slices for better optimizer information
 struct FastDecoder<'a> {
-    src_ptr: *const u8,
-    end_ptr: *const u8,
+    src: &'a [u8],
+    pos: usize,
     bit_container: u64,
     num_bits: u32,
-    _phantom: std::marker::PhantomData<&'a [u8]>,
 }
 
 impl<'a> FastDecoder<'a> {
     fn new(data: &'a [u8]) -> Self {
         let mut decoder = Self {
-            src_ptr: data.as_ptr(),
-            end_ptr: unsafe { data.as_ptr().add(data.len()) },
+            src: data,
+            pos: 0,
             bit_container: 0,
             num_bits: 0,
-            _phantom: std::marker::PhantomData,
         };
-        decoder.refill(); // Pre-fill the bit container
+        decoder.refill();
         decoder
     }
 
     #[inline(always)]
     fn refill(&mut self) {
-        // Refill when we have room for at least 32 bits
-        // Read 16 bits at a time for efficiency
-        while self.num_bits <= 32 {
-            let bytes_available = self.end_ptr as usize - self.src_ptr as usize;
-            if bytes_available < 2 {
-                break;
-            }
-
-            let word = unsafe { (self.src_ptr as *const u16).read_unaligned() };
+        // Refill while we have room and data available
+        // Use get_unchecked for the hot path since we check bounds
+        while self.num_bits <= 32 && self.pos + 2 <= self.src.len() {
+            let word = unsafe {
+                u16::from_le_bytes([
+                    *self.src.get_unchecked(self.pos),
+                    *self.src.get_unchecked(self.pos + 1),
+                ])
+            };
             self.bit_container |= (word as u64) << (48 - self.num_bits);
             self.num_bits += 16;
-            self.src_ptr = unsafe { self.src_ptr.add(2) };
+            self.pos += 2;
         }
-    }
-
-    #[inline(always)]
-    fn decode_sequence(&mut self, out: &mut [u8]) -> usize {
-        // Get top 32 bits for checking threshold
-        let p = (self.bit_container >> 32) as u32;
-
-        // Fast path: symbols with <= 12 bits (most common case)
-        let result = if p < 0xF800_0000 {
-            let index = (p >> 20) as usize;
-            let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-            let bits = entry.bits as u32;
-
-            self.bit_container <<= bits;
-            self.num_bits -= bits;
-
-            out[0] = entry.symbols[0];
-            out[1] = entry.symbols[1];
-
-            entry.num_symbols as usize
-        } else {
-            // 13-bit escape code
-            self.bit_container <<= 13;
-            self.num_bits -= 13;
-            out[0] = ((p >> 19) & 0xFF) as u8;
-            1
-        };
-
-        // Refill after decode - unconditionally check
-        if self.num_bits <= 32 {
-            self.refill();
-        }
-
-        result
     }
 
     #[inline(always)]
@@ -163,53 +127,36 @@ impl<'a> FastDecoder<'a> {
         }
         elem = elem.saturating_sub(width);
 
-        // Unrolled decode: process 2 sequences when we have enough bits
-        while elem + 4 <= width && self.num_bits >= 32 {
-            // First decode
-            let p1 = (self.bit_container >> 32) as u32;
-            if p1 < 0xF800_0000 {
-                let index = (p1 >> 20) as usize;
-                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-                let bits = entry.bits as u32;
-                self.bit_container <<= bits;
-                self.num_bits -= bits;
-                buf[elem] = entry.symbols[0];
-                buf[elem + 1] = entry.symbols[1];
-                elem += entry.num_symbols as usize;
-            } else {
-                self.bit_container <<= 13;
-                self.num_bits -= 13;
-                buf[elem] = ((p1 >> 19) & 0xFF) as u8;
-                elem += 1;
-            }
-
-            // Second decode
-            let p2 = (self.bit_container >> 32) as u32;
-            if p2 < 0xF800_0000 {
-                let index = (p2 >> 20) as usize;
-                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-                let bits = entry.bits as u32;
-                self.bit_container <<= bits;
-                self.num_bits -= bits;
-                buf[elem] = entry.symbols[0];
-                buf[elem + 1] = entry.symbols[1];
-                elem += entry.num_symbols as usize;
-            } else {
-                self.bit_container <<= 13;
-                self.num_bits -= 13;
-                buf[elem] = ((p2 >> 19) & 0xFF) as u8;
-                elem += 1;
-            }
-
-            // Refill after both decodes
-            if self.num_bits <= 32 {
+        // Main decode loop - use get_unchecked for table and buffer access
+        while elem < width {
+            if self.num_bits < 16 {
                 self.refill();
             }
-        }
 
-        // Handle remaining symbols
-        while elem < width {
-            elem += self.decode_sequence(&mut buf[elem..]);
+            let p = (self.bit_container >> 32) as u32;
+
+            if p < 0xF800_0000 {
+                let index = (p >> 20) as usize;
+                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
+                let bits = entry.bits as u32;
+
+                self.bit_container <<= bits;
+                self.num_bits -= bits;
+
+                // Safety: buf is width + 256 bytes, elem < width, so elem + 1 < width + 256
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = entry.symbols[0];
+                    *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
+                }
+                elem += entry.num_symbols as usize;
+            } else {
+                self.bit_container <<= 13;
+                self.num_bits -= 13;
+                unsafe {
+                    *buf.get_unchecked_mut(elem) = ((p >> 19) & 0xFF) as u8;
+                }
+                elem += 1;
+            }
         }
 
         elem
