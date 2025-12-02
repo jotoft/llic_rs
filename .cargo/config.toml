@@ -1,0 +1,12 @@
+# Cargo configuration for llic_rs2
+#
+# To enable native CPU optimizations, uncomment the line below or run:
+#   RUSTFLAGS="-C target-cpu=native" cargo bench
+
+# Uncomment to always build for native CPU (may not be portable):
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
+
+# Alias for running benchmarks with native optimizations
+[alias]
+bench-native = "bench --config 'build.rustflags = [\"-C\", \"target-cpu=native\"]'"

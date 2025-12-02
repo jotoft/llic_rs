@@ -124,19 +124,13 @@ impl LlicContext {
             .filter(|(_, &size)| size > 0)
             .collect();
         
-        println!("DEBUG: Found {} non-zero blocks out of {} total blocks", non_zero_blocks.len(), num_blocks);
-        
         if non_zero_blocks.len() > 1 {
             // Multiple blocks with data - image is divided among threads
             // Each thread handles a horizontal stripe of the image
             
-            println!("DEBUG: Using multi-block decompression path");
-            
             // Calculate rows per block using the same logic as the C++ code
             let base_block_size = (self.height as usize / num_blocks as usize) / 4 * 4;
             let last_block_size = self.height as usize - base_block_size * (num_blocks as usize - 1);
-            
-            println!("DEBUG: Base block size: {} rows, last block size: {} rows", base_block_size, last_block_size);
             
             // Calculate block positions
             let mut block_positions = Vec::new();
@@ -170,8 +164,6 @@ impl LlicContext {
                 // Decompress this block into a temporary buffer
                 let mut block_output = vec![0u8; self.width as usize * block_rows];
                 
-                println!("Decompressing block {} with {} rows", block_idx, block_rows);
-                
                 match entropy_coder::decompress(
                     block_data,
                     self.width,
@@ -190,15 +182,13 @@ impl LlicContext {
                         
                         row_offset += block_rows;
                     }
-                    Err(e) => {
-                        println!("Failed to decompress block {}: {:?}", block_idx, e);
+                    Err(_e) => {
                         return Err(LlicError::InvalidData);
                     }
                 }
             }
             
             if row_offset != self.height as usize {
-                println!("Warning: only decompressed {} rows out of {}", row_offset, self.height);
                 return Err(LlicError::InvalidData);
             }
         } else if let Some((block_idx, &block_size)) = non_zero_blocks.first() {
@@ -224,6 +214,7 @@ impl LlicContext {
 
 pub mod pgm;
 pub mod entropy_coder;
+pub mod ffi;
 
 // Export aliases for convenience
 pub use Quality as CompressionQuality;

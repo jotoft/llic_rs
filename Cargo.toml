@@ -8,6 +8,12 @@ thiserror = "1.0"
 num_cpus = "1.16"
 rayon = "1.10"
 
+[build-dependencies]
+cc = "1.0"
+
+[dev-dependencies]
+criterion = "0.5"
+
 [lib]
 name = "llic"
 path = "src/lib.rs"
@@ -15,3 +21,18 @@ path = "src/lib.rs"
 [[bin]]
 name = "llic_compress"
 path = "src/bin/llic_compress.rs"
+
+[[bench]]
+name = "llic_benchmark"
+harness = false
+
+# Native CPU optimizations for benchmarking
+# Run with: RUSTFLAGS="-C target-cpu=native" cargo bench
+# Or use the profile below with: cargo bench --profile bench-native
+[profile.bench-native]
+inherits = "release"
+lto = true
+codegen-units = 1
+
+[profile.release]
+lto = "thin"
