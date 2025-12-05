@@ -207,8 +207,57 @@ impl LlicContext {
         Ok((quality, mode))
     }
     
-    pub fn compress_gray8(&self, _src_graymap: &[u8], _quality: Quality, _mode: Mode, _dst_data: &mut [u8]) -> Result<usize> {
-        todo!("Compression not yet implemented")
+    /// Compress grayscale image data.
+    ///
+    /// # Arguments
+    /// * `src_graymap` - Source pixel data (row-major, 8-bit grayscale)
+    /// * `quality` - Compression quality (only Lossless currently supported)
+    /// * `mode` - Compression mode
+    /// * `dst_data` - Output buffer for compressed data
+    ///
+    /// # Returns
+    /// Number of bytes written to dst_data, or error.
+    pub fn compress_gray8(&self, src_graymap: &[u8], quality: Quality, _mode: Mode, dst_data: &mut [u8]) -> Result<usize> {
+        if quality != Quality::Lossless {
+            return Err(LlicError::UnsupportedFormat);
+        }
+
+        // Verify source buffer size
+        let expected_size = self.height as usize * self.bytes_per_line as usize;
+        if src_graymap.len() < expected_size {
+            return Err(LlicError::InvalidArgument);
+        }
+
+        // Compress using entropy coder
+        let compressed = entropy_coder::compress(
+            src_graymap,
+            self.width,
+            self.height,
+            self.bytes_per_line,
+        )?;
+
+        // Build LLIC v3 format header
+        // Format: [version=3][num_blocks=1][quality=0][block_size:u32 LE][compressed_data]
+        let header_size = 3 + 4; // version + num_blocks + quality + 1 block size
+        let total_size = header_size + compressed.len();
+
+        if dst_data.len() < total_size {
+            return Err(LlicError::InvalidArgument);
+        }
+
+        // Write header
+        dst_data[0] = 3; // version
+        dst_data[1] = 1; // num_blocks
+        dst_data[2] = quality as u8;
+
+        // Block size (little-endian u32)
+        let block_size = compressed.len() as u32;
+        dst_data[3..7].copy_from_slice(&block_size.to_le_bytes());
+
+        // Copy compressed data
+        dst_data[7..total_size].copy_from_slice(&compressed);
+
+        Ok(total_size)
     }
 }
 
