@@ -83,18 +83,15 @@ impl LlicContext {
             return Err(LlicError::UnsupportedFormat);
         }
         
-        // Determine quality and mode from header
-        let (quality, mode) = match quality_mode {
-            0 => (Quality::Lossless, Mode::Default),
-            2 => (Quality::VeryHigh, Mode::Default),
-            4 => (Quality::High, Mode::Default),
-            8 => (Quality::Medium, Mode::Default),
-            16 => (Quality::Low, Mode::Default),
-            _ => return Err(LlicError::InvalidData),
-        };
-        
-        // Read block size table
-        let mut pos = 3;
+        // Determine if lossy or lossless based on byte 2
+        // If byte 2 is 0, it's lossless mode (quality_mode = 0, block sizes start at byte 3)
+        // If byte 2 is non-0, it's lossy mode (byte 2 is first byte of block sizes)
+        let is_lossless = quality_mode == 0;
+
+        // Read block size table (always little-endian)
+        // For lossless: starts at byte 3 (after version, num_blocks, quality_mode=0)
+        // For lossy: starts at byte 2 (byte 2 is first byte of first block size)
+        let mut pos = if is_lossless { 3 } else { 2 };
         let mut block_sizes = Vec::with_capacity(num_blocks as usize);
         for _ in 0..num_blocks {
             if pos + 4 > src_data.len() {
@@ -109,29 +106,57 @@ impl LlicContext {
             block_sizes.push(size);
             pos += 4;
         }
-        
-        if quality != Quality::Lossless {
-            return Err(LlicError::UnsupportedFormat);
-        }
+
+        // Determine quality and mode
+        let (quality, mode) = if is_lossless {
+            (Quality::Lossless, Mode::Default)
+        } else {
+            // For lossy, quality is in the first byte of first block data (bits 0-6 = error_limit)
+            // pos now points to start of block data
+            if pos >= src_data.len() {
+                return Err(LlicError::InvalidData);
+            }
+            let first_block_byte = src_data[pos];
+            let error_limit = first_block_byte & 0x7f;
+            let compressed_header = (first_block_byte & 0x80) != 0;
+
+            let quality = match error_limit {
+                2 => Quality::VeryHigh,
+                4 => Quality::High,
+                8 => Quality::Medium,
+                16 => Quality::Low,
+                _ => Quality::VeryHigh, // Default fallback
+            };
+            let mode = if compressed_header { Mode::Default } else { Mode::Fast };
+            (quality, mode)
+        };
         
         // For v3 format with multiple blocks, we need to determine if:
         // 1. Each block contains a portion of the image (rows divided among threads)
         // 2. Only certain blocks contain the full image (excess threads)
-        
+
         // First, check if we have many small blocks of similar size
         let non_zero_blocks: Vec<_> = block_sizes.iter()
             .enumerate()
             .filter(|(_, &size)| size > 0)
             .collect();
-        
+
+        // Choose decompression algorithm based on mode
+        let decompress_block: fn(&[u8], u32, u32, u32, &mut [u8]) -> Result<()> =
+            if is_lossless {
+                |data, w, h, bpl, dst| entropy_coder::decompress(data, w, h, bpl, dst)
+            } else {
+                |data, w, h, bpl, dst| lossy::decompress_tile_block(data, w, h, bpl, dst)
+            };
+
         if non_zero_blocks.len() > 1 {
             // Multiple blocks with data - image is divided among threads
             // Each thread handles a horizontal stripe of the image
-            
+
             // Calculate rows per block using the same logic as the C++ code
             let base_block_size = (self.height as usize / num_blocks as usize) / 4 * 4;
             let last_block_size = self.height as usize - base_block_size * (num_blocks as usize - 1);
-            
+
             // Calculate block positions
             let mut block_positions = Vec::new();
             let mut current_pos = pos;
@@ -139,7 +164,7 @@ impl LlicContext {
                 block_positions.push(current_pos);
                 current_pos += block_sizes[i] as usize;
             }
-            
+
             // Decompress each block into its corresponding rows
             let mut row_offset = 0;
             for block_idx in 0..num_blocks as usize {
@@ -147,24 +172,24 @@ impl LlicContext {
                 if block_size == 0 {
                     continue;
                 }
-                
+
                 let block_rows = if block_idx == num_blocks as usize - 1 {
                     last_block_size
                 } else {
                     base_block_size
                 };
-                
+
                 if block_rows == 0 {
                     continue;
                 }
-                
+
                 let block_pos = block_positions[block_idx];
                 let block_data = &src_data[block_pos..block_pos + block_size as usize];
-                
+
                 // Decompress this block into a temporary buffer
                 let mut block_output = vec![0u8; self.width as usize * block_rows];
-                
-                match entropy_coder::decompress(
+
+                match decompress_block(
                     block_data,
                     self.width,
                     block_rows as u32,
@@ -176,10 +201,10 @@ impl LlicContext {
                         let src_start = 0;
                         let dst_start = row_offset * self.bytes_per_line as usize;
                         let copy_len = block_rows * self.bytes_per_line as usize;
-                        
+
                         dst_graymap[dst_start..dst_start + copy_len]
                             .copy_from_slice(&block_output[src_start..src_start + copy_len]);
-                        
+
                         row_offset += block_rows;
                     }
                     Err(_e) => {
@@ -187,15 +212,15 @@ impl LlicContext {
                     }
                 }
             }
-            
+
             if row_offset != self.height as usize {
                 return Err(LlicError::InvalidData);
             }
-        } else if let Some((block_idx, &block_size)) = non_zero_blocks.first() {
+        } else if let Some((_block_idx, &block_size)) = non_zero_blocks.first() {
             // Single block with data - it should contain the entire image
             let block_data = &src_data[pos..pos + block_size as usize];
-            
-            entropy_coder::decompress(
+
+            decompress_block(
                 block_data,
                 self.width,
                 self.height,
@@ -264,6 +289,7 @@ impl LlicContext {
 pub mod pgm;
 pub mod entropy_coder;
 pub mod ffi;
+pub mod lossy;
 
 // Export aliases for convenience
 pub use Quality as CompressionQuality;

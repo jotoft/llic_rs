@@ -271,10 +271,7 @@ generate_tests! {
     test_radial_64x64_q0: "radial_64x64", 0;
 }
 
-// Lossy tests (q1-q4) - these will fail until lossy decompression is implemented
-// Uncomment these as lossy support is added
-
-/*
+// Lossy tests (q1-q4)
 generate_tests! {
     // VeryHigh quality (q1)
     test_uniform_128_64x64_q1: "uniform_128_64x64", 1;
@@ -296,4 +293,3 @@ generate_tests! {
     test_h_gradient_64x64_q4: "h_gradient_64x64", 4;
     test_noise_64x64_q4: "noise_64x64", 4;
 }
-*/
