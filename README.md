@@ -82,6 +82,29 @@ Output format (PNG or PGM) is determined by the file extension.
 - **Lossy decompression**: Fully implemented (Q1-Q4)
 - **Lossy compression**: Not yet implemented (use C++ tool)
 
+### Library Usage
+
+```rust
+use llic_rs::{LlicContext, Quality, Mode};
+
+// Image dimensions must be multiples of 4
+let width = 64;
+let height = 64;
+let pixels: Vec<u8> = vec![128; width * height]; // grayscale image data
+
+// Create context
+let ctx = LlicContext::new(width as u32, height as u32, width as u32, None)?;
+
+// Compress (lossless)
+let mut compressed = vec![0u8; ctx.compressed_buffer_size()];
+let size = ctx.compress_gray8(&pixels, Quality::Lossless, Mode::Default, &mut compressed)?;
+compressed.truncate(size);
+
+// Decompress
+let mut output = vec![0u8; width * height];
+let (quality, mode) = ctx.decompress_gray8(&compressed, &mut output)?;
+```
+
 ## Technical Details
 
 LLIC uses a custom entropy coding scheme with pre-computed compression tables optimized for image data patterns. The
