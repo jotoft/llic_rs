@@ -133,41 +133,11 @@ impl<'a> FastDecoder<'a> {
         while elem + 4 <= width {
             // First decode
             let p1 = self.reader.peek_refilled_bulk();
-            if p1 < 0xF800_0000 {
-                let index = (p1 >> 20) as usize;
-                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-                self.reader.consume(entry.bits);
-                unsafe {
-                    *buf.get_unchecked_mut(elem) = entry.symbols[0];
-                    *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
-                }
-                elem += entry.num_symbols as usize;
-            } else {
-                self.reader.consume(13);
-                unsafe {
-                    *buf.get_unchecked_mut(elem) = ((p1 >> 19) & 0xFF) as u8;
-                }
-                elem += 1;
-            }
+            self.decode(buf, &mut elem, p1);
 
             // Second decode
             let p2 = self.reader.peek_refilled_bulk();
-            if p2 < 0xF800_0000 {
-                let index = (p2 >> 20) as usize;
-                let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-                self.reader.consume(entry.bits);
-                unsafe {
-                    *buf.get_unchecked_mut(elem) = entry.symbols[0];
-                    *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
-                }
-                elem += entry.num_symbols as usize;
-            } else {
-                self.reader.consume(13);
-                unsafe {
-                    *buf.get_unchecked_mut(elem) = ((p2 >> 19) & 0xFF) as u8;
-                }
-                elem += 1;
-            }
+            self.decode(buf, &mut elem, p2)
         }
 
         // Handle remaining symbols
@@ -176,6 +146,25 @@ impl<'a> FastDecoder<'a> {
         }
 
         elem
+    }
+
+    fn decode(&mut self, buf: &mut [u8], elem: &mut usize, p1: u32) {
+        if p1 < 0xF800_0000 {
+            let index = (p1 >> 20) as usize;
+            let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
+            self.reader.consume(entry.bits);
+            unsafe {
+                *buf.get_unchecked_mut(*elem) = entry.symbols[0];
+                *buf.get_unchecked_mut(*elem + 1) = entry.symbols[1];
+            }
+            *elem += entry.num_symbols as usize;
+        } else {
+            self.reader.consume(13);
+            unsafe {
+                *buf.get_unchecked_mut(*elem) = ((p1 >> 19) & 0xFF) as u8;
+            }
+            *elem += 1;
+        }
     }
 }
 

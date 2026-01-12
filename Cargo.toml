@@ -7,6 +7,8 @@ edition = "2021"
 thiserror = "1.0"
 num_cpus = "1.16"
 rayon = "1.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
 cc = "1.0"
