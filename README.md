@@ -134,14 +134,6 @@ production use without further testing and optimization.
 └── COMPRESSION_TABLES_GUIDE.md  # Compression tables documentation
 ```
 
-## Future Work
-
-- [ ] Support for color images (RGB/RGBA)
-- [ ] Improved compression ratios
-- [ ] GPU acceleration
-- [ ] Streaming compression/decompression
-- [ ] Integration with popular image processing libraries
-
 ## Contact
 
 For questions, issues, or contributions, please open an issue on GitHub.
