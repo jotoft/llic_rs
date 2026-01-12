@@ -57,23 +57,30 @@ make -j$(nproc)
 ### Command Line Interface
 
 ```bash
-# Compress an image (Rust)
-cargo run --release -- encode input.pgm output.llic --quality 2
+# Compress an image to LLIC (lossless)
+cargo run --release --bin llic_compress -- compress input.png output.llic
 
-# Decompress an image (Rust)
-cargo run --release -- decode input.llic output.pgm
-
-# Compress an image (C++)
-./llic_compress input.pgm output.llic 2
+# Decompress an LLIC file (supports both lossless and lossy)
+cargo run --release --bin llic_compress -- decompress input.llic output.png
 ```
+
+Output format (PNG or PGM) is determined by the file extension.
 
 ### Quality Levels
 
-- **Q0**: Lossless compression
-- **Q1**: Near-lossless with minimal quality loss
-- **Q2**: Balanced quality/compression ratio
-- **Q3**: Higher compression with visible quality reduction
-- **Q4**: Maximum compression
+| Level | Name | Description |
+|-------|------|-------------|
+| Q0 | Lossless | No quality loss |
+| Q1 | VeryHigh | Near-lossless (error limit 2) |
+| Q2 | High | Balanced quality/compression |
+| Q3 | Medium | Higher compression |
+| Q4 | Low | Maximum compression |
+
+### Current Status
+
+- **Lossless compression/decompression**: Fully implemented
+- **Lossy decompression**: Fully implemented (Q1-Q4)
+- **Lossy compression**: Not yet implemented (use C++ tool)
 
 ## Technical Details
 
