@@ -28,3 +28,12 @@ core
 *.core
 *.svg
 perf.data*
+
+# WASM build outputs
+/pkg/
+/pkg-*/
+
+# Demo
+/demo/node_modules/
+/demo/dist/
+/demo/pkg

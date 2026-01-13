@@ -2,6 +2,18 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    // Only build C++ if cpp-reference feature is enabled
+    if env::var("CARGO_FEATURE_CPP_REFERENCE").is_err() {
+        return;
+    }
+
+    // Skip C++ build for WASM targets
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("wasm") {
+        println!("cargo:warning=Skipping C++ build for WASM target");
+        return;
+    }
+
     let llic_src = PathBuf::from("llic/src/llic");
 
     // Only build C++ library if the submodule exists

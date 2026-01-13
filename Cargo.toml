@@ -2,13 +2,28 @@
 name = "llic_rs"
 version = "0.2.0"
 edition = "2021"
+description = "LLIC - Lossless and Lossy Image Compression for grayscale images"
+repository = "https://github.com/jotoft/llic_rs"
+license = "Zlib"
+keywords = ["compression", "image", "lossless", "wasm"]
+categories = ["compression", "wasm"]
+
+[features]
+default = ["std"]
+std = ["dep:num_cpus", "dep:image", "dep:clap"]
+wasm = ["dep:wasm-bindgen"]
+cpp-reference = []  # Enable C++ reference build for benchmarking
 
 [dependencies]
 thiserror = "1.0"
-num_cpus = "1.16"
-rayon = "1.10"
-image = { version = "0.25", default-features = false, features = ["png"] }
-clap = { version = "4", features = ["derive"] }
+
+# Optional: only for native builds
+num_cpus = { version = "1.16", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Optional: only for WASM builds
+wasm-bindgen = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1.0"
@@ -19,10 +34,12 @@ criterion = "0.5"
 [lib]
 name = "llic"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "llic_compress"
 path = "src/bin/llic_compress.rs"
+required-features = ["std"]
 
 [[bench]]
 name = "llic_benchmark"

@@ -57,3 +57,74 @@ echo "Step 3: Rebuilding with PGO..."
 cargo clean -p llic_rs2
 RUSTFLAGS="-C target-cpu=native -Cprofile-use=/tmp/pgo-data/merged.profdata" cargo bench -- 'rust/256x256'
 """
+
+# WASM build tasks
+[tasks."wasm:build"]
+description = "Build WASM npm package for web (ES modules) with SIMD"
+env = { RUSTFLAGS = "-C target-feature=+simd128" }
+run = "wasm-pack build --target web --no-default-features --features wasm"
+
+[tasks."wasm:build:no-simd"]
+description = "Build WASM without SIMD (for older browsers)"
+env = { RUSTFLAGS = "" }
+run = "wasm-pack build --target web --no-default-features --features wasm"
+
+[tasks."wasm:build:nodejs"]
+description = "Build WASM npm package for Node.js with SIMD"
+env = { RUSTFLAGS = "-C target-feature=+simd128" }
+run = "rm -rf pkg && wasm-pack build --target nodejs --no-default-features --features wasm && mv pkg pkg-node"
+
+[tasks."wasm:build:bundler"]
+description = "Build WASM npm package for bundlers (webpack, etc) with SIMD"
+env = { RUSTFLAGS = "-C target-feature=+simd128" }
+run = "rm -rf pkg && wasm-pack build --target bundler --no-default-features --features wasm && mv pkg pkg-bundler"
+
+[tasks."wasm:dev"]
+description = "Build WASM with debug info for development"
+env = { RUSTFLAGS = "" }
+run = "wasm-pack build --dev --target web --no-default-features --features wasm"
+
+[tasks."wasm:release"]
+description = "Build optimized WASM npm package for all targets with SIMD"
+env = { RUSTFLAGS = "-C target-feature=+simd128" }
+run = """
+echo "Building for web..."
+wasm-pack build --release --target web --no-default-features --features wasm
+cp -r pkg pkg-web
+echo "Building for Node.js..."
+wasm-pack build --release --target nodejs --no-default-features --features wasm
+mv pkg pkg-node
+echo "Building for bundlers..."
+wasm-pack build --release --target bundler --no-default-features --features wasm
+mv pkg pkg-bundler
+mv pkg-web pkg
+echo "Done! Packages in: pkg/, pkg-node/, pkg-bundler/"
+"""
+
+[tasks."wasm:clean"]
+description = "Clean WASM build artifacts"
+run = "rm -rf pkg pkg-node pkg-bundler pkg-web"
+
+# Demo tasks
+[tasks."demo:setup"]
+description = "Install demo dependencies and build WASM"
+depends = ["wasm:build"]
+run = """
+cd demo && npm install
+rm -rf pkg && ln -s ../pkg pkg
+"""
+
+[tasks."demo:dev"]
+description = "Run demo dev server"
+depends = ["demo:setup"]
+run = "cd demo && npm run dev"
+
+[tasks."demo:build"]
+description = "Build demo for production"
+depends = ["demo:setup"]
+run = """
+cd demo
+rm -rf pkg && cp -r ../pkg pkg
+npm run build
+rm -rf pkg
+"""

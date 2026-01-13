@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLIC WASM Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d9ff; }
+    .container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+    .panel {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .panel h3 { margin-top: 0; color: #00d9ff; }
+    canvas {
+      max-width: 100%;
+      border: 1px solid #333;
+      background: #000;
+    }
+    input[type="file"] {
+      display: block;
+      margin: 1rem 0;
+    }
+    .stats {
+      background: #0f3460;
+      padding: 1rem;
+      border-radius: 4px;
+      font-family: monospace;
+      margin-top: 1rem;
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.5rem;
+    }
+    .stat-label { color: #888; }
+    .stat-value { color: #00ff88; text-align: right; }
+    .drop-zone {
+      border: 2px dashed #444;
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #00d9ff;
+      background: rgba(0, 217, 255, 0.1);
+    }
+    .error { color: #ff6b6b; }
+    .success { color: #00ff88; }
+  </style>
+</head>
+<body>
+  <h1>LLIC WASM Compression Demo</h1>
+  <p>Upload an image to convert to grayscale and compress using LLIC lossless compression.</p>
+
+  <div class="drop-zone" id="dropZone">
+    <p>Drop an image here or click to select</p>
+    <input type="file" id="fileInput" accept="image/*" hidden>
+  </div>
+
+  <div class="container">
+    <div class="panel">
+      <h3>Original (Grayscale)</h3>
+      <canvas id="originalCanvas"></canvas>
+    </div>
+    <div class="panel">
+      <h3>Decompressed</h3>
+      <canvas id="decompressedCanvas"></canvas>
+    </div>
+  </div>
+
+  <div class="stats" id="stats">
+    <div class="stats-grid">
+      <span class="stat-label">Library Version:</span>
+      <span class="stat-value" id="version">Loading...</span>
+      <span class="stat-label">Image Size:</span>
+      <span class="stat-value" id="imageSize">-</span>
+      <span class="stat-label">Original Size:</span>
+      <span class="stat-value" id="originalSize">-</span>
+      <span class="stat-label">Compressed Size:</span>
+      <span class="stat-value" id="compressedSize">-</span>
+      <span class="stat-label">Compression Ratio:</span>
+      <span class="stat-value" id="ratio">-</span>
+      <span class="stat-label">Compress Time:</span>
+      <span class="stat-value" id="compressTime">-</span>
+      <span class="stat-label">Decompress Time:</span>
+      <span class="stat-value" id="decompressTime">-</span>
+      <span class="stat-label">Throughput:</span>
+      <span class="stat-value" id="throughput">-</span>
+      <span class="stat-label">Roundtrip OK:</span>
+      <span class="stat-value" id="roundtripOk">-</span>
+    </div>
+    <button id="benchBtn" style="margin-top:1rem; padding:0.5rem 1rem; display:none;">Run Benchmark (10 iterations)</button>
+    <div id="benchResults" style="margin-top:0.5rem; font-size:0.9em;"></div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
