@@ -6,6 +6,14 @@
 
 * { box-sizing: border-box; }
 
+html {
+  font-size: 18px;
+}
+
+@media (max-width: 1200px) {
+  html { font-size: 16px; }
+}
+
 body {
   font-family: system-ui, -apple-system, sans-serif;
   margin: 0;
@@ -17,7 +25,7 @@ body {
 
 .main-layout {
   display: grid;
-  grid-template-columns: 1fr 240px;
+  grid-template-columns: 1fr 280px;
   gap: 1rem;
   align-items: start;
 }
@@ -79,8 +87,8 @@ button:hover {
 }
 
 .view-btn {
-  padding: 0.3rem 0.8rem;
-  font-size: 0.9em;
+  padding: 0.4rem 1rem;
+  font-size: 1rem;
 }
 
 .view-btn.active {
@@ -111,7 +119,7 @@ button:hover {
   background: #1a1a1a;
   border-radius: 6px;
   font-family: monospace;
-  font-size: 1rem;
+  font-size: 0.9rem;
   border: 1px solid #2a2a2a;
   padding: 0.6rem 0.75rem;
 }
@@ -242,7 +250,7 @@ button:hover {
 .panel h3 {
   margin: 0 0 0.5rem 0;
   color: #e0e0e0;
-  font-size: 0.9em;
+  font-size: 1.1rem;
 }
 
 canvas {
