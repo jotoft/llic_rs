@@ -81,8 +81,7 @@ jobs:
 
       - name: Copy WASM to demo dist
         run: |
-          mkdir -p demo/dist/pkg
-          cp pkg/* demo/dist/pkg/
+          cp -r pkg demo/dist/pkg
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

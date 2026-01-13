@@ -2,7 +2,7 @@
 // For CDN usage, you can import from:
 //   import init, { ... } from 'https://unpkg.com/llic-wasm@latest/llic.js';
 //   import init, { ... } from 'https://cdn.jsdelivr.net/npm/llic-wasm@latest/llic.js';
-import init, { compress_gray8, decompress_gray8, build_info } from './pkg/llic.js';
+import init, { lossless_compress, decompress, build_info } from './pkg/llic.js';
 
 let wasmReady = false;
 let currentGrayData = null;
@@ -94,7 +94,7 @@ async function processImage(file) {
     let compressed;
     const compressStart = performance.now();
     try {
-      compressed = compress_gray8(grayData, width, height);
+      compressed = lossless_compress(grayData, width, height);
     } catch (e) {
       updateStat('compressedSize', `Error: ${e}`);
       return;
@@ -109,7 +109,7 @@ async function processImage(file) {
     let decompressed;
     const decompressStart = performance.now();
     try {
-      decompressed = decompress_gray8(compressed, width, height);
+      decompressed = decompress(compressed, width, height);
     } catch (e) {
       updateStat('decompressTime', `Error: ${e}`);
       return;
@@ -190,9 +190,9 @@ function runBenchmark() {
     // Warmup + benchmark
     for (let i = 0; i < warmup + iterations; i++) {
       const t0 = performance.now();
-      const compressed = compress_gray8(currentGrayData, currentWidth, currentHeight);
+      const compressed = lossless_compress(currentGrayData, currentWidth, currentHeight);
       const t1 = performance.now();
-      decompress_gray8(compressed, currentWidth, currentHeight);
+      decompress(compressed, currentWidth, currentHeight);
       const t2 = performance.now();
 
       if (i >= warmup) {
