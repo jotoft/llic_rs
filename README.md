@@ -14,6 +14,8 @@ grayscale images. This repository contains:
 Both implementations support multiple quality levels from lossless (Q0) to lossy compression with increasing compression
 ratios.
 
+**[Try the live demo](https://jotoft.github.io/llic_rs/)**
+
 ### Features
 
 - **Multiple quality levels**: Q0 (lossless) through Q4 (highest compression)
