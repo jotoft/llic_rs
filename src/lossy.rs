@@ -1,4 +1,4 @@
-//! Lossy decompression for LLIC tile-based compression.
+//! Lossy compression and decompression for LLIC tile-based compression.
 //!
 //! This implements the 4x4 tile-based lossy compression algorithm used by LLIC
 //! for quality levels VeryHigh (2), High (4), Medium (8), and Low (16).
@@ -266,6 +266,258 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
     }
 }
 
+/// Pack 16 pixel indices into the compressed stream.
+///
+/// This is the inverse of `unpack_pixels`. Returns the number of bytes written.
+fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
+    match bits {
+        0 => {
+            // All pixels are the same - no data needed
+            0
+        }
+        1 => {
+            // 16 pixels -> 2 bytes (1 bit each)
+            // Matches C++ addToCompressedStream scalar path
+            dst[0] = (indices[12] << 7)
+                | (indices[8] << 6)
+                | (indices[4] << 5)
+                | (indices[0] << 4)
+                | (indices[13] << 3)
+                | (indices[9] << 2)
+                | (indices[5] << 1)
+                | indices[1];
+            dst[1] = (indices[14] << 7)
+                | (indices[10] << 6)
+                | (indices[6] << 5)
+                | (indices[2] << 4)
+                | (indices[15] << 3)
+                | (indices[11] << 2)
+                | (indices[7] << 1)
+                | indices[3];
+            2
+        }
+        2 => {
+            // 16 pixels -> 4 bytes (2 bits each)
+            dst[0] = (indices[12] << 6) | (indices[8] << 4) | (indices[4] << 2) | indices[0];
+            dst[1] = (indices[13] << 6) | (indices[9] << 4) | (indices[5] << 2) | indices[1];
+            dst[2] = (indices[14] << 6) | (indices[10] << 4) | (indices[6] << 2) | indices[2];
+            dst[3] = (indices[15] << 6) | (indices[11] << 4) | (indices[7] << 2) | indices[3];
+            4
+        }
+        3 => {
+            // 16 pixels -> 6 bytes (3 bits each)
+            let word0 = (indices[0] as u32)
+                | ((indices[4] as u32) << 3)
+                | ((indices[8] as u32) << 6)
+                | ((indices[12] as u32) << 9)
+                | ((indices[2] as u32) << 12)
+                | ((indices[6] as u32) << 15)
+                | ((indices[10] as u32) << 18)
+                | ((indices[14] as u32) << 21);
+            let word1 = (indices[1] as u32)
+                | ((indices[5] as u32) << 3)
+                | ((indices[9] as u32) << 6)
+                | ((indices[13] as u32) << 9)
+                | ((indices[3] as u32) << 12)
+                | ((indices[7] as u32) << 15)
+                | ((indices[11] as u32) << 18)
+                | ((indices[15] as u32) << 21);
+            dst[0] = word0 as u8;
+            dst[1] = (word0 >> 8) as u8;
+            dst[2] = (word0 >> 16) as u8;
+            dst[3] = word1 as u8;
+            dst[4] = (word1 >> 8) as u8;
+            dst[5] = (word1 >> 16) as u8;
+            6
+        }
+        4 => {
+            // 16 pixels -> 8 bytes (4 bits each, nibbles)
+            dst[0] = (indices[8] << 4) | indices[0];
+            dst[1] = (indices[9] << 4) | indices[1];
+            dst[2] = (indices[10] << 4) | indices[2];
+            dst[3] = (indices[11] << 4) | indices[3];
+            dst[4] = (indices[12] << 4) | indices[4];
+            dst[5] = (indices[13] << 4) | indices[5];
+            dst[6] = (indices[14] << 4) | indices[6];
+            dst[7] = (indices[15] << 4) | indices[7];
+            8
+        }
+        5 => {
+            // 16 pixels -> 10 bytes (5 bits each)
+            let word0 = (indices[0] as u32)
+                | ((indices[4] as u32) << 5)
+                | ((indices[8] as u32) << 10)
+                | ((indices[12] as u32) << 15)
+                | ((indices[1] as u32) << 20)
+                | ((indices[5] as u32) << 25)
+                | ((indices[9] as u32) << 30);
+            let word1 = ((indices[9] as u32) >> 2)
+                | ((indices[13] as u32) << 3)
+                | ((indices[2] as u32) << 8)
+                | ((indices[6] as u32) << 13)
+                | ((indices[10] as u32) << 18)
+                | ((indices[14] as u32) << 23)
+                | ((indices[3] as u32) << 28);
+            let word2 = ((indices[3] as u32) >> 4)
+                | ((indices[7] as u32) << 1)
+                | ((indices[11] as u32) << 6)
+                | ((indices[15] as u32) << 11);
+            dst[0] = word0 as u8;
+            dst[1] = (word0 >> 8) as u8;
+            dst[2] = (word0 >> 16) as u8;
+            dst[3] = (word0 >> 24) as u8;
+            dst[4] = word1 as u8;
+            dst[5] = (word1 >> 8) as u8;
+            dst[6] = (word1 >> 16) as u8;
+            dst[7] = (word1 >> 24) as u8;
+            dst[8] = word2 as u8;
+            dst[9] = (word2 >> 8) as u8;
+            10
+        }
+        6 => {
+            // 16 pixels -> 12 bytes (6 bits each)
+            let word0 = (indices[0] as u32)
+                | ((indices[4] as u32) << 6)
+                | ((indices[8] as u32) << 12)
+                | ((indices[12] as u32) << 18)
+                | ((indices[1] as u32) << 24)
+                | ((indices[5] as u32) << 30);
+            let word1 = ((indices[5] as u32) >> 2)
+                | ((indices[9] as u32) << 4)
+                | ((indices[13] as u32) << 10)
+                | ((indices[2] as u32) << 16)
+                | ((indices[6] as u32) << 22)
+                | ((indices[10] as u32) << 28);
+            let word2 = ((indices[10] as u32) >> 4)
+                | ((indices[14] as u32) << 2)
+                | ((indices[3] as u32) << 8)
+                | ((indices[7] as u32) << 14)
+                | ((indices[11] as u32) << 20)
+                | ((indices[15] as u32) << 26);
+            dst[0] = word0 as u8;
+            dst[1] = (word0 >> 8) as u8;
+            dst[2] = (word0 >> 16) as u8;
+            dst[3] = (word0 >> 24) as u8;
+            dst[4] = word1 as u8;
+            dst[5] = (word1 >> 8) as u8;
+            dst[6] = (word1 >> 16) as u8;
+            dst[7] = (word1 >> 24) as u8;
+            dst[8] = word2 as u8;
+            dst[9] = (word2 >> 8) as u8;
+            dst[10] = (word2 >> 16) as u8;
+            dst[11] = (word2 >> 24) as u8;
+            12
+        }
+        8 => {
+            // 16 pixels -> 16 bytes (8 bits each, direct copy)
+            dst[..16].copy_from_slice(indices);
+            16
+        }
+        _ => 0,
+    }
+}
+
+/// Compress a single block of grayscale image data using tile-based lossy compression.
+///
+/// This produces the same format as the C++ encoder's `doCompressTileBased` function.
+///
+/// # Arguments
+/// * `src_data` - Source grayscale image data
+/// * `width` - Image width in pixels (must be multiple of 4)
+/// * `rows` - Number of rows to compress (must be multiple of 4)
+/// * `bytes_per_line` - Stride of the source image
+/// * `error_limit` - Quality level (2, 4, 8, or 16)
+///
+/// # Returns
+/// Compressed data as a Vec<u8>
+pub fn compress_tile_block(
+    src_data: &[u8],
+    width: u32,
+    rows: u32,
+    bytes_per_line: u32,
+    error_limit: u8,
+) -> Result<Vec<u8>> {
+    if width % 4 != 0 || rows % 4 != 0 {
+        return Err(LlicError::ImageDimensions);
+    }
+
+    let num_tiles = ((width / 4) * (rows / 4)) as usize;
+
+    // Generate bucket LUT for this error_limit
+    let bucket_lut = generate_bucket_lut(error_limit);
+
+    // Allocate output buffer
+    // Format: 1 byte header + num_tiles min values + num_tiles dist values + pixel data
+    // Worst case pixel data: 16 bytes per tile (8-bit mode)
+    let max_size = 1 + num_tiles * 2 + num_tiles * 16;
+    let mut output = vec![0u8; max_size];
+
+    // First byte: flags (bit 7 = compressed header = 0) + error_limit
+    output[0] = error_limit & 0x7f;
+
+    // Split output into non-overlapping mutable slices
+    let (header_and_streams, pixel_stream) = output[1..].split_at_mut(num_tiles * 2);
+    let (min_stream, dist_stream) = header_and_streams.split_at_mut(num_tiles);
+    let mut pixel_pos = 0usize;
+
+    // Temporary buffer for pixel indices
+    let mut indices = [0u8; 16];
+
+    // Process each 4x4 block
+    for y in (0..rows).step_by(4) {
+        for x in (0..width).step_by(4) {
+            // Find min and max in this block
+            let mut min_val = 255u8;
+            let mut max_val = 0u8;
+
+            for yy in 0..4u32 {
+                let row_start = ((y + yy) * bytes_per_line + x) as usize;
+                for xx in 0..4u32 {
+                    let pixel = src_data[row_start + xx as usize];
+                    min_val = min_val.min(pixel);
+                    max_val = max_val.max(pixel);
+                }
+            }
+
+            let dist = max_val - min_val;
+
+            // Look up quantization parameters
+            let (bits, bucket_size) = bucket_lut[dist as usize];
+
+            // Calculate block index (matches C++ indexing)
+            let block_idx = ((y * width) >> 4) + (x >> 2);
+            let block_idx = block_idx as usize;
+
+            // Store min and dist
+            min_stream[block_idx] = min_val;
+            dist_stream[block_idx] = dist;
+
+            // Quantize and pack pixels if needed
+            if bits > 0 {
+                // Quantize each pixel
+                for yy in 0..4u32 {
+                    let row_start = ((y + yy) * bytes_per_line + x) as usize;
+                    for xx in 0..4u32 {
+                        let pixel = src_data[row_start + xx as usize];
+                        let idx = (yy * 4 + xx) as usize;
+                        indices[idx] = (pixel - min_val) / bucket_size;
+                    }
+                }
+
+                // Pack indices into pixel stream
+                let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
+                pixel_pos += bytes_written;
+            }
+        }
+    }
+
+    // Calculate final size and truncate
+    let compressed_size = 1 + num_tiles * 2 + pixel_pos;
+    output.truncate(compressed_size);
+
+    Ok(output)
+}
+
 /// Decompress a single block of tile-based lossy compressed data.
 ///
 /// This handles one "thread block" of compressed data as produced by the C++ encoder.
@@ -508,5 +760,163 @@ mod tests {
         assert_eq!(result[13], 0xB);
         assert_eq!(result[14], 0xD);
         assert_eq!(result[15], 0xF);
+    }
+
+    /// Test that pack_pixels and unpack_pixels are inverses of each other
+    #[test]
+    fn test_pack_unpack_roundtrip() {
+        // Test all bit depths with various patterns
+        for bits in [1u8, 2, 3, 4, 5, 6, 8] {
+            let max_val = if bits == 8 { 255u8 } else { (1u8 << bits) - 1 };
+
+            // Test with sequential values
+            let indices: [u8; 16] = std::array::from_fn(|i| (i as u8) % (max_val.saturating_add(1)));
+
+            // Pack
+            let mut packed = [0u8; 16];
+            let bytes_written = pack_pixels(&indices, bits, &mut packed);
+
+            // Unpack
+            let mut unpacked = [0u8; 16];
+            let bytes_read = unpack_pixels(&packed, bits, &mut unpacked);
+
+            assert_eq!(bytes_written, bytes_read, "Bytes mismatch for {} bits", bits);
+            assert_eq!(indices, unpacked, "Roundtrip failed for {} bits: {:?} != {:?}", bits, indices, unpacked);
+        }
+    }
+
+    /// Test pack/unpack with all zeros
+    #[test]
+    fn test_pack_unpack_zeros() {
+        for bits in [1u8, 2, 3, 4, 5, 6, 8] {
+            let indices = [0u8; 16];
+
+            let mut packed = [0u8; 16];
+            let bytes_written = pack_pixels(&indices, bits, &mut packed);
+
+            let mut unpacked = [0u8; 16];
+            unpack_pixels(&packed, bits, &mut unpacked);
+
+            assert_eq!(indices, unpacked, "Zero roundtrip failed for {} bits", bits);
+            assert!(bytes_written > 0 || bits == 0);
+        }
+    }
+
+    /// Test pack/unpack with max values
+    #[test]
+    fn test_pack_unpack_max_values() {
+        for bits in [1u8, 2, 3, 4, 5, 6, 8] {
+            let max_val = if bits == 8 { 255u8 } else { (1u8 << bits) - 1 };
+            let indices = [max_val; 16];
+
+            let mut packed = [0u8; 16];
+            pack_pixels(&indices, bits, &mut packed);
+
+            let mut unpacked = [0u8; 16];
+            unpack_pixels(&packed, bits, &mut unpacked);
+
+            assert_eq!(indices, unpacked, "Max value roundtrip failed for {} bits", bits);
+        }
+    }
+
+    /// Test compression and decompression round-trip
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        // Create a simple 8x8 gradient image
+        let width = 8u32;
+        let height = 8u32;
+        let mut image: Vec<u8> = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                image.push(((x + y * 16) % 256) as u8);
+            }
+        }
+
+        // Test with different quality levels
+        for error_limit in [2u8, 4, 8, 16] {
+            let compressed = compress_tile_block(&image, width, height, width, error_limit)
+                .expect("Compression failed");
+
+            // Verify header
+            assert_eq!(compressed[0] & 0x7f, error_limit, "Error limit mismatch in header");
+            assert_eq!(compressed[0] & 0x80, 0, "Compressed header flag should be 0");
+
+            // Decompress
+            let mut decompressed = vec![0u8; (width * height) as usize];
+            decompress_tile_block(&compressed, width, height, width, &mut decompressed)
+                .expect("Decompression failed");
+
+            // Verify pixel error is within bounds
+            for i in 0..image.len() {
+                let diff = (image[i] as i32 - decompressed[i] as i32).abs();
+                assert!(
+                    diff <= error_limit as i32,
+                    "Pixel {} error {} exceeds limit {} (original={}, decompressed={})",
+                    i, diff, error_limit, image[i], decompressed[i]
+                );
+            }
+        }
+    }
+
+    /// Test compression with uniform blocks (dist=0)
+    #[test]
+    fn test_compress_uniform_block() {
+        let width = 4u32;
+        let height = 4u32;
+        let image = vec![128u8; (width * height) as usize];
+
+        let compressed = compress_tile_block(&image, width, height, width, 16)
+            .expect("Compression failed");
+
+        // For a uniform block, we should have minimal pixel data
+        // Header (1 byte) + min stream (1 byte) + dist stream (1 byte) + no pixel data
+        assert_eq!(compressed.len(), 3, "Uniform block should compress to 3 bytes");
+
+        // Verify dist is 0
+        assert_eq!(compressed[2], 0, "Dist should be 0 for uniform block");
+
+        // Decompress and verify
+        let mut decompressed = vec![0u8; (width * height) as usize];
+        decompress_tile_block(&compressed, width, height, width, &mut decompressed)
+            .expect("Decompression failed");
+
+        // All pixels should be 128 (or very close due to bucket_size adjustment)
+        for (i, &pixel) in decompressed.iter().enumerate() {
+            let diff = (128i32 - pixel as i32).abs();
+            assert!(diff <= 1, "Pixel {} should be ~128, got {}", i, pixel);
+        }
+    }
+
+    /// Test compression with full range block (dist=255)
+    #[test]
+    fn test_compress_full_range_block() {
+        let width = 4u32;
+        let height = 4u32;
+        let mut image = vec![0u8; (width * height) as usize];
+        image[0] = 0;
+        image[15] = 255;
+        // Fill rest with gradient
+        for i in 1..15 {
+            image[i] = (i * 17) as u8;
+        }
+
+        for error_limit in [2u8, 4, 8, 16] {
+            let compressed = compress_tile_block(&image, width, height, width, error_limit)
+                .expect("Compression failed");
+
+            let mut decompressed = vec![0u8; (width * height) as usize];
+            decompress_tile_block(&compressed, width, height, width, &mut decompressed)
+                .expect("Decompression failed");
+
+            // Verify all pixels are within error bounds
+            for i in 0..image.len() {
+                let diff = (image[i] as i32 - decompressed[i] as i32).abs();
+                assert!(
+                    diff <= error_limit as i32 + 1, // +1 for rounding
+                    "Pixel {} error {} exceeds limit {} (original={}, decompressed={})",
+                    i, diff, error_limit, image[i], decompressed[i]
+                );
+            }
+        }
     }
 }

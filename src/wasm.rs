@@ -6,7 +6,7 @@
 use wasm_bindgen::prelude::*;
 use crate::{LlicContext, Quality, Mode};
 
-/// Compress grayscale image data using lossless LLIC compression.
+/// Compress grayscale image data using LLIC compression.
 ///
 /// The input must be raw 8-bit grayscale pixels in row-major order.
 /// Image dimensions must be multiples of 4.
@@ -14,29 +14,47 @@ use crate::{LlicContext, Quality, Mode};
 /// @param data - Raw grayscale pixels (Uint8Array, 8-bit, row-major order)
 /// @param width - Image width in pixels (must be multiple of 4)
 /// @param height - Image height in pixels (must be multiple of 4)
+/// @param quality - Quality level: 'lossless', 'very_high', 'high', 'medium', or 'low'
 /// @returns Compressed data as Uint8Array
-/// @throws Error if dimensions are invalid or not multiples of 4
+/// @throws Error if dimensions are invalid or quality is unrecognized
 ///
 /// @example
 /// ```js
-/// const compressed = lossless_compress(grayPixels, 256, 256);
+/// const lossless = compress(grayPixels, 256, 256, 'lossless');
+/// const lossy = compress(grayPixels, 256, 256, 'high');
 /// ```
 #[wasm_bindgen]
-pub fn lossless_compress(
+pub fn compress(
     data: &[u8],
     width: u32,
     height: u32,
+    quality: &str,
 ) -> Result<Vec<u8>, JsError> {
+    let quality_level = match quality {
+        "lossless" => Quality::Lossless,
+        "very_high" => Quality::VeryHigh,
+        "high" => Quality::High,
+        "medium" => Quality::Medium,
+        "low" => Quality::Low,
+        _ => return Err(JsError::new(&format!(
+            "Invalid quality '{}'. Use: 'lossless', 'very_high', 'high', 'medium', or 'low'",
+            quality
+        ))),
+    };
+
     let context = LlicContext::new(width, height, width, Some(1))
         .map_err(|e| JsError::new(&e.to_string()))?;
 
     let max_size = context.compressed_buffer_size();
     let mut output = vec![0u8; max_size];
 
+    // Use Default mode for lossless, Fast mode for lossy
+    let mode = if quality_level == Quality::Lossless { Mode::Default } else { Mode::Fast };
+
     let compressed_size = context.compress_gray8(
         data,
-        Quality::Lossless,
-        Mode::Default,
+        quality_level,
+        mode,
         &mut output,
     ).map_err(|e| JsError::new(&e.to_string()))?;
 
@@ -44,42 +62,27 @@ pub fn lossless_compress(
     Ok(output)
 }
 
-/// Compress grayscale image data using lossy LLIC compression.
-///
-/// Lossy compression achieves higher compression ratios at the cost of
-/// some image quality. The quality parameter controls the trade-off.
-///
-/// @param data - Raw grayscale pixels (Uint8Array, 8-bit, row-major order)
-/// @param width - Image width in pixels (must be multiple of 4)
-/// @param height - Image height in pixels (must be multiple of 4)
-/// @param quality - Quality level: 'very_high', 'high', 'medium', or 'low'
-/// @returns Compressed data as Uint8Array
-/// @throws Error if dimensions are invalid or quality is unrecognized
-///
-/// @example
-/// ```js
-/// const compressed = lossy_compress(grayPixels, 256, 256, 'high');
-/// ```
+// Keep legacy functions for backwards compatibility
+
+/// @deprecated Use `compress(data, width, height, 'lossless')` instead
+#[wasm_bindgen]
+pub fn lossless_compress(
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, JsError> {
+    compress(data, width, height, "lossless")
+}
+
+/// @deprecated Use `compress(data, width, height, quality)` instead
 #[wasm_bindgen]
 pub fn lossy_compress(
-    _data: &[u8],
-    _width: u32,
-    _height: u32,
+    data: &[u8],
+    width: u32,
+    height: u32,
     quality: &str,
 ) -> Result<Vec<u8>, JsError> {
-    // Validate quality parameter
-    let _quality = match quality {
-        "very_high" => Quality::VeryHigh,
-        "high" => Quality::High,
-        "medium" => Quality::Medium,
-        "low" => Quality::Low,
-        _ => return Err(JsError::new(&format!(
-            "Invalid quality '{}'. Use: 'very_high', 'high', 'medium', or 'low'",
-            quality
-        ))),
-    };
-
-    Err(JsError::new("Lossy compression not yet implemented in WASM bindings"))
+    compress(data, width, height, quality)
 }
 
 /// Decompress LLIC-compressed grayscale image data.

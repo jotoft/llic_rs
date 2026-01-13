@@ -22,7 +22,7 @@
           <canvas id="originalCanvas"></canvas>
         </div>
         <div class="panel">
-          <h3>LLIC Lossless</h3>
+          <h3 id="outputLabel">LLIC Lossless</h3>
           <canvas id="decompressedCanvas"></canvas>
         </div>
       </div>
@@ -41,7 +41,8 @@
         </div>
       </div>
 
-      <p class="subtitle">Lossless grayscale compression. High-frequency noise/texture is harder to compress; smooth gradients compress well.</p>
+      <p class="subtitle">Lossless grayscale compression. High-frequency noise/texture is harder to compress; smooth gradients compress well.<br>
+        <em style="color: #555; font-size: 0.85em;">Note: Demo images are WebP-compressed. Use raw/uncompressed images for accurate compression testing.</em></p>
     </div>
 
     <div class="sidebar-stack">
@@ -54,6 +55,20 @@
         <div class="drop-zone" id="dropZone">
           <span>Drop file or click to browse</span>
           <input type="file" id="fileInput" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <div class="sidebar-box">
+        <h3>Compression</h3>
+        <div class="sidebar-control">
+          <label>Quality</label>
+          <select id="qualitySelect">
+            <option value="lossless" selected>Lossless</option>
+            <option value="very_high">Very High (±2)</option>
+            <option value="high">High (±4)</option>
+            <option value="medium">Medium (±8)</option>
+            <option value="low">Low (±16)</option>
+          </select>
         </div>
       </div>
 

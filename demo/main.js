@@ -2,7 +2,7 @@
 // For CDN usage, you can import from:
 //   import init, { ... } from 'https://unpkg.com/llic-wasm@latest/llic.js';
 //   import init, { ... } from 'https://cdn.jsdelivr.net/npm/llic-wasm@latest/llic.js';
-import init, { lossless_compress, decompress, build_info } from './pkg/llic.js';
+import init, { compress, decompress, build_info } from './pkg/llic.js';
 
 let wasmReady = false;
 let currentGrayData = null;
@@ -12,8 +12,18 @@ let currentHeight = 0;
 let currentCompressed = null;
 let currentImageFile = null;
 let currentBlur = 0;
+let currentQuality = 'lossless'; // 'lossless', 'very_high', 'high', 'medium', 'low'
 let currentView = 'side-by-side';
 let comparePosition = 0.5;
+
+// Quality level display names and error limits
+const qualityInfo = {
+  lossless: { name: 'Lossless', error: 0 },
+  very_high: { name: 'Very High (±2)', error: 2 },
+  high: { name: 'High (±4)', error: 4 },
+  medium: { name: 'Medium (±8)', error: 8 },
+  low: { name: 'Low (±16)', error: 16 },
+};
 
 async function initWasm() {
   await init();
@@ -106,11 +116,11 @@ async function processImage(file, blur = currentBlur) {
     updateStat('imageSize', `${width} x ${height}`);
     updateStat('originalSize', `${grayData.length.toLocaleString()} bytes`);
 
-    // Compress
+    // Compress with selected quality
     let compressed;
     const compressStart = performance.now();
     try {
-      compressed = lossless_compress(grayData, width, height);
+      compressed = compress(grayData, width, height, currentQuality);
     } catch (e) {
       updateStat('compressedSize', `Error: ${e}`);
       return;
@@ -160,7 +170,8 @@ async function processImage(file, blur = currentBlur) {
     const decompCtx = decompCanvas.getContext('2d');
     decompCtx.putImageData(grayscaleToImageData(decompressed, width, height), 0, 0);
 
-    // Update compare view if active
+    // Update labels and compare view
+    updateQualityLabel();
     if (currentView === 'compare') {
       updateCompareCanvas();
     }
@@ -210,7 +221,7 @@ function runBenchmark() {
     // Warmup + benchmark
     for (let i = 0; i < warmup + iterations; i++) {
       const t0 = performance.now();
-      const compressed = lossless_compress(currentGrayData, currentWidth, currentHeight);
+      const compressed = compress(currentGrayData, currentWidth, currentHeight, currentQuality);
       const t1 = performance.now();
       decompress(compressed, currentWidth, currentHeight);
       const t2 = performance.now();
@@ -233,12 +244,13 @@ function runBenchmark() {
     const compressMedian = median(compressTimes);
     const decompressMedian = median(decompressTimes);
 
+    const qualityName = qualityInfo[currentQuality].name;
     results.innerHTML = `
-      <strong>Benchmark Results (${iterations} iterations, ${warmup} warmup):</strong><br>
+      <strong>Benchmark (${qualityName}, ${iterations} iter):</strong><br>
       <table style="margin-top:0.5rem; font-family:monospace;">
-        <tr><td>Compress:</td><td>min ${min(compressTimes).toFixed(2)}ms, median ${compressMedian.toFixed(2)}ms, avg ${avg(compressTimes).toFixed(2)}ms</td></tr>
-        <tr><td>Decompress:</td><td>min ${min(decompressTimes).toFixed(2)}ms, median ${decompressMedian.toFixed(2)}ms, avg ${avg(decompressTimes).toFixed(2)}ms</td></tr>
-        <tr><td>Throughput:</td><td>${formatThroughput(size, compressMedian)} compress, ${formatThroughput(size, decompressMedian)} decompress</td></tr>
+        <tr><td>Compress:</td><td>min ${min(compressTimes).toFixed(2)}ms, median ${compressMedian.toFixed(2)}ms</td></tr>
+        <tr><td>Decompress:</td><td>min ${min(decompressTimes).toFixed(2)}ms, median ${decompressMedian.toFixed(2)}ms</td></tr>
+        <tr><td>Throughput:</td><td>${formatThroughput(size, compressMedian)} / ${formatThroughput(size, decompressMedian)}</td></tr>
       </table>
     `;
   }, 10);
@@ -259,6 +271,32 @@ blurSlider.addEventListener('input', () => {
     processImage(currentImageFile, currentBlur);
   }
 });
+
+// Quality selector handler
+const qualitySelect = document.getElementById('qualitySelect');
+if (qualitySelect) {
+  qualitySelect.addEventListener('change', () => {
+    currentQuality = qualitySelect.value;
+    updateQualityLabel();
+
+    // Re-process current image with new quality
+    if (currentImageFile && wasmReady) {
+      processImage(currentImageFile, currentBlur);
+    }
+  });
+}
+
+// Update panel label based on quality
+function updateQualityLabel() {
+  const label = document.getElementById('outputLabel');
+  if (label) {
+    label.textContent = `LLIC ${qualityInfo[currentQuality].name}`;
+  }
+  const compareLabel = document.querySelector('.compare-label-right');
+  if (compareLabel) {
+    compareLabel.textContent = `LLIC ${qualityInfo[currentQuality].name}`;
+  }
+}
 
 // Load a demo image by filename
 async function loadDemoImage(filename) {
@@ -286,33 +324,133 @@ document.querySelectorAll('.demo-btn').forEach(btn => {
   });
 });
 
-// Compare view functionality
+// WebGL Compare view functionality
+let gl = null;
+let glProgram = null;
+let originalTexture = null;
+let decompressedTexture = null;
+
+const vertexShaderSource = `
+  attribute vec2 a_position;
+  attribute vec2 a_texCoord;
+  varying vec2 v_texCoord;
+  void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+    v_texCoord = a_texCoord;
+  }
+`;
+
+const fragmentShaderSource = `
+  precision mediump float;
+  uniform sampler2D u_original;
+  uniform sampler2D u_decompressed;
+  uniform float u_splitPos;
+  varying vec2 v_texCoord;
+  void main() {
+    vec4 original = texture2D(u_original, v_texCoord);
+    vec4 decompressed = texture2D(u_decompressed, v_texCoord);
+    gl_FragColor = v_texCoord.x < u_splitPos ? original : decompressed;
+  }
+`;
+
+function initWebGL() {
+  const canvas = document.getElementById('compareCanvas');
+  gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (!gl) {
+    console.error('WebGL not supported');
+    return false;
+  }
+
+  // Compile shaders
+  const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vertexShader, vertexShaderSource);
+  gl.compileShader(vertexShader);
+
+  const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fragmentShader, fragmentShaderSource);
+  gl.compileShader(fragmentShader);
+
+  // Create program
+  glProgram = gl.createProgram();
+  gl.attachShader(glProgram, vertexShader);
+  gl.attachShader(glProgram, fragmentShader);
+  gl.linkProgram(glProgram);
+  gl.useProgram(glProgram);
+
+  // Set up geometry (fullscreen quad)
+  const positions = new Float32Array([
+    -1, -1,  1, -1,  -1, 1,
+    -1, 1,   1, -1,   1, 1
+  ]);
+  const posBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(glProgram, 'a_position');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Texture coordinates (flip Y for correct orientation)
+  const texCoords = new Float32Array([
+    0, 1,  1, 1,  0, 0,
+    0, 0,  1, 1,  1, 0
+  ]);
+  const texBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW);
+  const texLoc = gl.getAttribLocation(glProgram, 'a_texCoord');
+  gl.enableVertexAttribArray(texLoc);
+  gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Create textures
+  originalTexture = gl.createTexture();
+  decompressedTexture = gl.createTexture();
+
+  return true;
+}
+
+function uploadGrayscaleTexture(texture, data, width, height, textureUnit) {
+  gl.activeTexture(gl.TEXTURE0 + textureUnit);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, width, height, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
+}
+
 function updateCompareCanvas() {
   if (!currentGrayData || !currentDecompressed) return;
 
   const canvas = document.getElementById('compareCanvas');
-  canvas.width = currentWidth;
-  canvas.height = currentHeight;
-  const ctx = canvas.getContext('2d');
 
-  // Draw decompressed (right side - full)
-  ctx.putImageData(grayscaleToImageData(currentDecompressed, currentWidth, currentHeight), 0, 0);
+  // Initialize WebGL on first use or if context was lost
+  if (!gl || gl.isContextLost()) {
+    canvas.width = currentWidth;
+    canvas.height = currentHeight;
+    if (!initWebGL()) return;
+  } else if (canvas.width !== currentWidth || canvas.height !== currentHeight) {
+    canvas.width = currentWidth;
+    canvas.height = currentHeight;
+    gl.viewport(0, 0, currentWidth, currentHeight);
+  }
 
-  // Draw original (left side - clipped)
-  const splitX = Math.floor(currentWidth * comparePosition);
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(0, 0, splitX, currentHeight);
-  ctx.clip();
-  ctx.putImageData(grayscaleToImageData(currentGrayData, currentWidth, currentHeight), 0, 0);
-  ctx.restore();
+  // Upload textures
+  uploadGrayscaleTexture(originalTexture, currentGrayData, currentWidth, currentHeight, 0);
+  uploadGrayscaleTexture(decompressedTexture, currentDecompressed, currentWidth, currentHeight, 1);
+
+  // Set uniforms
+  gl.useProgram(glProgram);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_original'), 0);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_decompressed'), 1);
+  gl.uniform1f(gl.getUniformLocation(glProgram, 'u_splitPos'), comparePosition);
+
+  // Draw
+  gl.viewport(0, 0, currentWidth, currentHeight);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
 
   // Update slider position
   const slider = document.getElementById('compareSlider');
-  const wrapper = document.getElementById('compareWrapper');
   const canvasRect = canvas.getBoundingClientRect();
-  const wrapperRect = wrapper.getBoundingClientRect();
-  const displayRatio = canvasRect.width / currentWidth;
   slider.style.left = `${comparePosition * canvasRect.width}px`;
 }
 
@@ -332,7 +470,8 @@ document.querySelectorAll('.view-btn').forEach(btn => {
     } else {
       sideBySide.style.display = 'none';
       compare.style.display = 'block';
-      updateCompareCanvas();
+      // Delay to ensure layout is complete before positioning slider
+      requestAnimationFrame(() => updateCompareCanvas());
     }
   });
 });
@@ -347,12 +486,29 @@ function updateSliderPosition(clientX) {
   const rect = canvas.getBoundingClientRect();
   const x = clientX - rect.left;
   comparePosition = Math.max(0, Math.min(1, x / rect.width));
-  updateCompareCanvas();
+
+  // Fast path: just update the uniform and redraw (no texture re-upload)
+  if (gl && glProgram && !gl.isContextLost()) {
+    gl.useProgram(glProgram);
+    gl.uniform1f(gl.getUniformLocation(glProgram, 'u_splitPos'), comparePosition);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Update slider position
+    const slider = document.getElementById('compareSlider');
+    slider.style.left = `${comparePosition * rect.width}px`;
+  } else {
+    updateCompareCanvas();
+  }
 }
 
 compareSlider.addEventListener('mousedown', (e) => {
   isDragging = true;
   e.preventDefault();
+});
+
+// Allow clicking anywhere on the canvas to reposition
+document.getElementById('compareCanvas').addEventListener('click', (e) => {
+  updateSliderPosition(e.clientX);
 });
 
 document.addEventListener('mousemove', (e) => {

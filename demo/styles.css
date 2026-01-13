@@ -231,6 +231,36 @@ button:hover {
 }
 
 /* ==========================================================================
+   Select Dropdown
+   ========================================================================== */
+
+select {
+  width: 100%;
+  background: #0f0f0f;
+  border: 1px solid #404040;
+  color: #d0d0d0;
+  padding: 0.4rem 0.5rem;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.9em;
+  cursor: pointer;
+}
+
+select:hover {
+  border-color: #c9a227;
+}
+
+select:focus {
+  outline: none;
+  border-color: #c9a227;
+}
+
+select option {
+  background: #1a1a1a;
+  color: #d0d0d0;
+}
+
+/* ==========================================================================
    Image Panels
    ========================================================================== */
 

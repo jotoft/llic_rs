@@ -239,53 +239,84 @@ impl LlicContext {
     ///
     /// # Arguments
     /// * `src_graymap` - Source pixel data (row-major, 8-bit grayscale)
-    /// * `quality` - Compression quality (only Lossless currently supported)
-    /// * `mode` - Compression mode
+    /// * `quality` - Compression quality (Lossless, VeryHigh, High, Medium, or Low)
+    /// * `mode` - Compression mode (currently only Fast mode supported for lossy)
     /// * `dst_data` - Output buffer for compressed data
     ///
     /// # Returns
     /// Number of bytes written to dst_data, or error.
     pub fn compress_gray8(&self, src_graymap: &[u8], quality: Quality, _mode: Mode, dst_data: &mut [u8]) -> Result<usize> {
-        if quality != Quality::Lossless {
-            return Err(LlicError::UnsupportedFormat);
-        }
-
         // Verify source buffer size
         let expected_size = self.height as usize * self.bytes_per_line as usize;
         if src_graymap.len() < expected_size {
             return Err(LlicError::InvalidArgument);
         }
 
-        // Compress using entropy coder
-        let compressed = entropy_coder::compress(
-            src_graymap,
-            self.width,
-            self.height,
-            self.bytes_per_line,
-        )?;
+        if quality == Quality::Lossless {
+            // Lossless compression using entropy coder
+            let compressed = entropy_coder::compress(
+                src_graymap,
+                self.width,
+                self.height,
+                self.bytes_per_line,
+            )?;
 
-        // Build LLIC v3 format header
-        // Format: [version=3][num_blocks=1][quality=0][block_size:u32 LE][compressed_data]
-        let header_size = 3 + 4; // version + num_blocks + quality + 1 block size
-        let total_size = header_size + compressed.len();
+            // Build LLIC v3 format header
+            // Format: [version=3][num_blocks=1][quality=0][block_size:u32 LE][compressed_data]
+            let header_size = 3 + 4; // version + num_blocks + quality + 1 block size
+            let total_size = header_size + compressed.len();
 
-        if dst_data.len() < total_size {
-            return Err(LlicError::InvalidArgument);
+            if dst_data.len() < total_size {
+                return Err(LlicError::InvalidArgument);
+            }
+
+            // Write header
+            dst_data[0] = 3; // version
+            dst_data[1] = 1; // num_blocks
+            dst_data[2] = quality as u8;
+
+            // Block size (little-endian u32)
+            let block_size = compressed.len() as u32;
+            dst_data[3..7].copy_from_slice(&block_size.to_le_bytes());
+
+            // Copy compressed data
+            dst_data[7..total_size].copy_from_slice(&compressed);
+
+            Ok(total_size)
+        } else {
+            // Lossy compression using tile-based algorithm
+            let error_limit = quality as u8;
+            let compressed = lossy::compress_tile_block(
+                src_graymap,
+                self.width,
+                self.height,
+                self.bytes_per_line,
+                error_limit,
+            )?;
+
+            // Build LLIC v3 format header for lossy
+            // Format: [version=3][num_blocks=1][block_size:u32 LE][compressed_data]
+            // Note: For lossy, there's no separate quality byte - it's in the block data
+            let header_size = 2 + 4; // version + num_blocks + 1 block size
+            let total_size = header_size + compressed.len();
+
+            if dst_data.len() < total_size {
+                return Err(LlicError::InvalidArgument);
+            }
+
+            // Write header
+            dst_data[0] = 3; // version
+            dst_data[1] = 1; // num_blocks
+
+            // Block size (little-endian u32)
+            let block_size = compressed.len() as u32;
+            dst_data[2..6].copy_from_slice(&block_size.to_le_bytes());
+
+            // Copy compressed data
+            dst_data[6..total_size].copy_from_slice(&compressed);
+
+            Ok(total_size)
         }
-
-        // Write header
-        dst_data[0] = 3; // version
-        dst_data[1] = 1; // num_blocks
-        dst_data[2] = quality as u8;
-
-        // Block size (little-endian u32)
-        let block_size = compressed.len() as u32;
-        dst_data[3..7].copy_from_slice(&block_size.to_le_bytes());
-
-        // Copy compressed data
-        dst_data[7..total_size].copy_from_slice(&compressed);
-
-        Ok(total_size)
     }
 }
 
