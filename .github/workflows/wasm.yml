@@ -23,6 +23,8 @@ jobs:
 
       - name: Build WASM (web target)
         run: wasm-pack build --release --target web --no-default-features --features wasm
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
 
       - name: Upload pkg artifact
         uses: actions/upload-artifact@v4
@@ -35,6 +37,8 @@ jobs:
           rm -rf pkg
           wasm-pack build --release --target nodejs --no-default-features --features wasm
           mv pkg pkg-node
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
 
       - name: Upload nodejs artifact
         uses: actions/upload-artifact@v4
@@ -67,6 +71,8 @@ jobs:
 
       - name: Build WASM
         run: wasm-pack build --release --target web --no-default-features --features wasm
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
