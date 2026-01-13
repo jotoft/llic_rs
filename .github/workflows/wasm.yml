@@ -79,9 +79,10 @@ jobs:
           npm install
           npm run build
 
-      - name: Copy WASM to demo dist
+      - name: Copy WASM and assets to demo dist
         run: |
           cp -r pkg demo/dist/pkg
+          cp demo/demo_image*.webp demo/dist/
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

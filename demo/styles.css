@@ -1,0 +1,362 @@
+/* LLIC WASM Demo Styles */
+
+/* ==========================================================================
+   Base & Layout
+   ========================================================================== */
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  margin: 0;
+  padding: 1rem 1.5rem;
+  background: #141414;
+  color: #d0d0d0;
+  min-height: 100vh;
+}
+
+.main-layout {
+  display: grid;
+  grid-template-columns: 1fr 240px;
+  gap: 1rem;
+  align-items: start;
+}
+
+.main-content {
+  min-width: 0;
+}
+
+/* ==========================================================================
+   Typography
+   ========================================================================== */
+
+h1 {
+  color: #c9a227;
+  margin: 0 0 0.5rem 0;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  color: #606060;
+  font-size: 0.8em;
+  margin-top: 0.75rem;
+}
+
+/* ==========================================================================
+   Buttons
+   ========================================================================== */
+
+button {
+  background: #1a1a1a;
+  border: 1px solid #404040;
+  color: #b0b0b0;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: #c9a227;
+  color: #c9a227;
+}
+
+.demo-btn {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.85em;
+  transition: all 0.2s;
+}
+
+.demo-btn:hover {
+  border-color: #c9a227;
+  color: #c9a227;
+}
+
+.demo-btn.active {
+  background: #2a2a2a;
+  border-color: #c9a227;
+  color: #c9a227;
+}
+
+.view-btn {
+  padding: 0.3rem 0.8rem;
+  font-size: 0.9em;
+}
+
+.view-btn.active {
+  background: #2a2a2a;
+  border-color: #c9a227;
+  color: #c9a227;
+}
+
+.view-toggle {
+  margin-bottom: 0.5rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* ==========================================================================
+   Sidebar
+   ========================================================================== */
+
+.sidebar-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  position: sticky;
+  top: 1rem;
+}
+
+.sidebar-box {
+  background: #1a1a1a;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.8em;
+  border: 1px solid #2a2a2a;
+  padding: 0.6rem 0.75rem;
+}
+
+.sidebar-box h3 {
+  margin: 0 0 0.4rem 0;
+  color: #c9a227;
+  font-size: 0.85em;
+}
+
+.sidebar-version {
+  font-family: monospace;
+  font-size: 0.75em;
+  color: #505050;
+  text-align: center;
+}
+
+.sidebar-control {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.sidebar-control label {
+  color: #707070;
+  font-size: 0.9em;
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+/* ==========================================================================
+   Stats Grid
+   ========================================================================== */
+
+.stats-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.stat-label {
+  color: #707070;
+}
+
+.stat-value {
+  color: #c9a227;
+  text-align: right;
+}
+
+/* ==========================================================================
+   Image Selection
+   ========================================================================== */
+
+.image-select {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.image-select .demo-btn {
+  width: 100%;
+  text-align: center;
+}
+
+.drop-zone {
+  border: 1px dashed #404040;
+  border-radius: 4px;
+  padding: 0.5rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: #606060;
+  font-size: 0.8em;
+  text-align: center;
+}
+
+.drop-zone:hover,
+.drop-zone.dragover {
+  border-color: #c9a227;
+  color: #c9a227;
+  background: rgba(201, 162, 39, 0.05);
+}
+
+/* ==========================================================================
+   Slider Controls
+   ========================================================================== */
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.slider-row input[type="range"] {
+  flex: 1;
+  accent-color: #c9a227;
+}
+
+.slider-row span {
+  color: #c9a227;
+  min-width: 20px;
+  text-align: right;
+}
+
+/* ==========================================================================
+   Image Panels
+   ========================================================================== */
+
+.image-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.panel {
+  background: #1a1a1a;
+  border-radius: 6px;
+  padding: 0.75rem;
+  border: 1px solid #2a2a2a;
+}
+
+.panel h3 {
+  margin: 0 0 0.5rem 0;
+  color: #e0e0e0;
+  font-size: 0.9em;
+}
+
+canvas {
+  max-width: 100%;
+  border: 1px solid #333;
+  background: #000;
+}
+
+/* ==========================================================================
+   Compare View
+   ========================================================================== */
+
+.compare-container {
+  background: #1a1a1a;
+  border-radius: 6px;
+  padding: 0.75rem;
+  border: 1px solid #2a2a2a;
+}
+
+.compare-wrapper {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.compare-wrapper canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.compare-slider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 4px;
+  cursor: ew-resize;
+  z-index: 10;
+}
+
+.compare-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  background: #c9a227;
+  transform: translateX(-50%);
+}
+
+.compare-handle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  background: #c9a227;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+}
+
+.compare-handle::before {
+  content: '◀▶';
+  font-size: 10px;
+  color: #141414;
+  letter-spacing: -2px;
+}
+
+.compare-labels {
+  position: absolute;
+  top: 0.5rem;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 1rem;
+  pointer-events: none;
+}
+
+.compare-label-left,
+.compare-label-right {
+  background: rgba(20,20,20,0.8);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8em;
+  color: #888;
+}
+
+/* ==========================================================================
+   Benchmark
+   ========================================================================== */
+
+.bench-btn {
+  margin-top: 0.5rem;
+  width: 100%;
+  display: none;
+}
+
+.bench-results {
+  margin-top: 0.5rem;
+  font-size: 0.8em;
+}
+
+/* ==========================================================================
+   Utility Classes
+   ========================================================================== */
+
+.error { color: #cc6666; }
+.success { color: #88aa66; }
+
+input[type="file"] {
+  display: block;
+  margin: 1rem 0;
+}

@@ -6,9 +6,14 @@ import init, { lossless_compress, decompress, build_info } from './pkg/llic.js';
 
 let wasmReady = false;
 let currentGrayData = null;
+let currentDecompressed = null;
 let currentWidth = 0;
 let currentHeight = 0;
 let currentCompressed = null;
+let currentImageFile = null;
+let currentBlur = 0;
+let currentView = 'side-by-side';
+let comparePosition = 0.5;
 
 async function initWasm() {
   await init();
@@ -54,10 +59,15 @@ function roundToMultipleOf4(value) {
   return Math.floor(value / 4) * 4;
 }
 
-async function processImage(file) {
+async function processImage(file, blur = currentBlur) {
   if (!wasmReady) {
     alert('WASM not ready yet');
     return;
+  }
+
+  // Store for re-processing with different blur
+  if (file !== currentImageFile) {
+    currentImageFile = file;
   }
 
   const img = new Image();
@@ -75,12 +85,18 @@ async function processImage(file) {
       return;
     }
 
-    // Draw original and get grayscale
+    // Draw original with optional blur and get grayscale
     const originalCanvas = document.getElementById('originalCanvas');
     originalCanvas.width = width;
     originalCanvas.height = height;
     const origCtx = originalCanvas.getContext('2d');
+    if (blur > 0) {
+      origCtx.filter = `blur(${blur}px)`;
+    } else {
+      origCtx.filter = 'none';
+    }
     origCtx.drawImage(img, 0, 0, width, height);
+    origCtx.filter = 'none';
     const originalImageData = origCtx.getImageData(0, 0, width, height);
     const grayData = toGrayscale(originalImageData);
 
@@ -117,7 +133,7 @@ async function processImage(file) {
     const decompressTime = performance.now() - decompressStart;
 
     updateStat('decompressTime', `${decompressTime.toFixed(2)} ms`);
-    updateStat('throughput', `${formatThroughput(grayData.length, compressTime)} compress, ${formatThroughput(grayData.length, decompressTime)} decompress`);
+    updateStat('throughput', `${formatThroughput(grayData.length, compressTime)} / ${formatThroughput(grayData.length, decompressTime)}`);
 
     // Store for benchmarking
     currentGrayData = grayData;
@@ -126,17 +142,16 @@ async function processImage(file) {
     currentCompressed = compressed;
     document.getElementById('benchBtn').style.display = 'block';
 
-    // Verify roundtrip
-    let match = true;
+    // Store for compare view
+    currentDecompressed = decompressed;
+
+    // Calculate similarity (1.0 = identical, lower = lossy difference)
+    let totalError = 0;
     for (let i = 0; i < grayData.length; i++) {
-      if (grayData[i] !== decompressed[i]) {
-        match = false;
-        break;
-      }
+      totalError += Math.abs(grayData[i] - decompressed[i]);
     }
-    const okEl = document.getElementById('roundtripOk');
-    okEl.textContent = match ? 'Yes' : 'MISMATCH!';
-    okEl.className = match ? 'stat-value success' : 'stat-value error';
+    const similarity = 1 - (totalError / (grayData.length * 255));
+    updateStat('similarity', similarity.toFixed(6));
 
     // Draw decompressed
     const decompCanvas = document.getElementById('decompressedCanvas');
@@ -144,6 +159,11 @@ async function processImage(file) {
     decompCanvas.height = height;
     const decompCtx = decompCanvas.getContext('2d');
     decompCtx.putImageData(grayscaleToImageData(decompressed, width, height), 0, 0);
+
+    // Update compare view if active
+    if (currentView === 'compare') {
+      updateCompareCanvas();
+    }
   };
 
   img.src = url;
@@ -226,5 +246,142 @@ function runBenchmark() {
 
 document.getElementById('benchBtn').addEventListener('click', runBenchmark);
 
-// Initialize
-initWasm().catch(console.error);
+// Blur slider handler
+const blurSlider = document.getElementById('blurSlider');
+const blurValue = document.getElementById('blurValue');
+
+blurSlider.addEventListener('input', () => {
+  currentBlur = parseFloat(blurSlider.value);
+  blurValue.textContent = currentBlur;
+
+  // Re-process current image with new blur
+  if (currentImageFile && wasmReady) {
+    processImage(currentImageFile, currentBlur);
+  }
+});
+
+// Load a demo image by filename
+async function loadDemoImage(filename) {
+  try {
+    const response = await fetch(`./${filename}`);
+    const blob = await response.blob();
+    const file = new File([blob], filename, { type: 'image/webp' });
+    await processImage(file);
+
+    // Update active button state
+    document.querySelectorAll('.demo-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.image === filename);
+    });
+  } catch (e) {
+    console.log('Demo image not available:', e);
+  }
+}
+
+// Demo image button handlers
+document.querySelectorAll('.demo-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (wasmReady) {
+      loadDemoImage(btn.dataset.image);
+    }
+  });
+});
+
+// Compare view functionality
+function updateCompareCanvas() {
+  if (!currentGrayData || !currentDecompressed) return;
+
+  const canvas = document.getElementById('compareCanvas');
+  canvas.width = currentWidth;
+  canvas.height = currentHeight;
+  const ctx = canvas.getContext('2d');
+
+  // Draw decompressed (right side - full)
+  ctx.putImageData(grayscaleToImageData(currentDecompressed, currentWidth, currentHeight), 0, 0);
+
+  // Draw original (left side - clipped)
+  const splitX = Math.floor(currentWidth * comparePosition);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, splitX, currentHeight);
+  ctx.clip();
+  ctx.putImageData(grayscaleToImageData(currentGrayData, currentWidth, currentHeight), 0, 0);
+  ctx.restore();
+
+  // Update slider position
+  const slider = document.getElementById('compareSlider');
+  const wrapper = document.getElementById('compareWrapper');
+  const canvasRect = canvas.getBoundingClientRect();
+  const wrapperRect = wrapper.getBoundingClientRect();
+  const displayRatio = canvasRect.width / currentWidth;
+  slider.style.left = `${comparePosition * canvasRect.width}px`;
+}
+
+// View toggle handlers
+document.querySelectorAll('.view-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentView = btn.dataset.view;
+    document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+
+    const sideBySide = document.getElementById('sideBySideView');
+    const compare = document.getElementById('compareView');
+
+    if (currentView === 'side-by-side') {
+      sideBySide.style.display = 'grid';
+      compare.style.display = 'none';
+    } else {
+      sideBySide.style.display = 'none';
+      compare.style.display = 'block';
+      updateCompareCanvas();
+    }
+  });
+});
+
+// Compare slider drag
+const compareSlider = document.getElementById('compareSlider');
+const compareWrapper = document.getElementById('compareWrapper');
+let isDragging = false;
+
+function updateSliderPosition(clientX) {
+  const canvas = document.getElementById('compareCanvas');
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  comparePosition = Math.max(0, Math.min(1, x / rect.width));
+  updateCompareCanvas();
+}
+
+compareSlider.addEventListener('mousedown', (e) => {
+  isDragging = true;
+  e.preventDefault();
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (isDragging) {
+    updateSliderPosition(e.clientX);
+  }
+});
+
+document.addEventListener('mouseup', () => {
+  isDragging = false;
+});
+
+// Touch support for compare slider
+compareSlider.addEventListener('touchstart', (e) => {
+  isDragging = true;
+  e.preventDefault();
+});
+
+document.addEventListener('touchmove', (e) => {
+  if (isDragging && e.touches.length > 0) {
+    updateSliderPosition(e.touches[0].clientX);
+  }
+});
+
+document.addEventListener('touchend', () => {
+  isDragging = false;
+});
+
+// Initialize and load first demo image
+initWasm().then(() => {
+  loadDemoImage('demo_image2.webp');
+}).catch(console.error);
