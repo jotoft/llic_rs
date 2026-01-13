@@ -399,3 +399,114 @@ input[type="file"] {
   display: block;
   margin: 1rem 0;
 }
+
+/* ==========================================================================
+   Checkbox Controls
+   ========================================================================== */
+
+.checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  color: #909090;
+  font-size: 0.85em;
+}
+
+.checkbox-label:hover {
+  color: #c9a227;
+}
+
+.checkbox-label input[type="checkbox"] {
+  accent-color: #c9a227;
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"]:checked + span {
+  color: #c9a227;
+}
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #333;
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  color: #909090;
+  font-size: 0.85em;
+}
+
+.radio-label:hover {
+  color: #c9a227;
+}
+
+.radio-label input[type="radio"] {
+  accent-color: #c9a227;
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+.radio-label input[type="radio"]:checked + span {
+  color: #c9a227;
+}
+
+/* ==========================================================================
+   Hover Info Display
+   ========================================================================== */
+
+.hover-info {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #333;
+  font-size: 0.8em;
+  font-family: monospace;
+  color: #707070;
+  min-height: 3.5em;
+}
+
+.hover-info .hover-label {
+  color: #505050;
+  font-style: italic;
+}
+
+.hover-info .hover-coords {
+  color: #909090;
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.hover-info .hover-values {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.hover-info .hover-row {
+  display: flex;
+  justify-content: space-between;
+}
+
+.hover-info .hover-row span:first-child {
+  color: #707070;
+}
+
+.hover-info .hover-row span:last-child {
+  color: #c9a227;
+}

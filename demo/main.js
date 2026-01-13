@@ -2,11 +2,13 @@
 // For CDN usage, you can import from:
 //   import init, { ... } from 'https://unpkg.com/llic-wasm@latest/llic.js';
 //   import init, { ... } from 'https://cdn.jsdelivr.net/npm/llic-wasm@latest/llic.js';
-import init, { compress, decompress, build_info } from './pkg/llic.js';
+import init, { compress, decompress, build_info, get_prediction_residual } from './pkg/llic.js';
 
 let wasmReady = false;
 let currentGrayData = null;
 let currentDecompressed = null;
+let currentResidual = null;
+let currentError = null;
 let currentWidth = 0;
 let currentHeight = 0;
 let currentCompressed = null;
@@ -15,6 +17,10 @@ let currentBlur = 0;
 let currentQuality = 'lossless'; // 'lossless', 'very_high', 'high', 'medium', 'low'
 let currentView = 'side-by-side';
 let comparePosition = 0.5;
+
+// Debug overlay state
+let showDecompressed = true;
+let debugOverlay = 'none'; // 'none', 'residual', 'error'
 
 // Quality level display names and error limits
 const qualityInfo = {
@@ -155,6 +161,16 @@ async function processImage(file, blur = currentBlur) {
     // Store for compare view
     currentDecompressed = decompressed;
 
+    // Compute debug data
+    currentResidual = get_prediction_residual(grayData, width, height);
+
+    // Compute reconstruction error in JS (scaled for visibility)
+    currentError = new Uint8Array(grayData.length);
+    for (let i = 0; i < grayData.length; i++) {
+      // Scale error by 8x for visibility (max error 16 * 8 = 128)
+      currentError[i] = Math.min(255, Math.abs(grayData[i] - decompressed[i]) * 8);
+    }
+
     // Calculate similarity (1.0 = identical, lower = lossy difference)
     let totalError = 0;
     for (let i = 0; i < grayData.length; i++) {
@@ -163,12 +179,11 @@ async function processImage(file, blur = currentBlur) {
     const similarity = 1 - (totalError / (grayData.length * 255));
     updateStat('similarity', similarity.toFixed(6));
 
-    // Draw decompressed
+    // Draw decompressed (with debug overlays if enabled)
     const decompCanvas = document.getElementById('decompressedCanvas');
     decompCanvas.width = width;
     decompCanvas.height = height;
-    const decompCtx = decompCanvas.getContext('2d');
-    decompCtx.putImageData(grayscaleToImageData(decompressed, width, height), 0, 0);
+    updateDecompressedCanvas();
 
     // Update labels and compare view
     updateQualityLabel();
@@ -273,10 +288,9 @@ blurSlider.addEventListener('input', () => {
 });
 
 // Quality selector handler
-const qualitySelect = document.getElementById('qualitySelect');
-if (qualitySelect) {
-  qualitySelect.addEventListener('change', () => {
-    currentQuality = qualitySelect.value;
+document.querySelectorAll('input[name="quality"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    currentQuality = e.target.value;
     updateQualityLabel();
 
     // Re-process current image with new quality
@@ -284,7 +298,7 @@ if (qualitySelect) {
       processImage(currentImageFile, currentBlur);
     }
   });
-}
+});
 
 // Update panel label based on quality
 function updateQualityLabel() {
@@ -329,6 +343,8 @@ let gl = null;
 let glProgram = null;
 let originalTexture = null;
 let decompressedTexture = null;
+let residualTexture = null;
+let errorTexture = null;
 
 const vertexShaderSource = `
   attribute vec2 a_position;
@@ -344,12 +360,53 @@ const fragmentShaderSource = `
   precision mediump float;
   uniform sampler2D u_original;
   uniform sampler2D u_decompressed;
+  uniform sampler2D u_residual;
+  uniform sampler2D u_error;
   uniform float u_splitPos;
+  uniform bool u_showDecompressed;
+  uniform int u_debugMode; // 0 = none, 1 = residual, 2 = error
   varying vec2 v_texCoord;
+
+  // Magma colormap function
+  vec3 magma(float t) {
+    if (t < 0.25) {
+      return mix(vec3(0.0, 0.0, 0.04), vec3(0.28, 0.08, 0.47), t * 4.0);
+    } else if (t < 0.5) {
+      return mix(vec3(0.28, 0.08, 0.47), vec3(0.72, 0.22, 0.51), (t - 0.25) * 4.0);
+    } else if (t < 0.75) {
+      return mix(vec3(0.72, 0.22, 0.51), vec3(0.99, 0.53, 0.38), (t - 0.5) * 4.0);
+    } else {
+      return mix(vec3(0.99, 0.53, 0.38), vec3(0.99, 0.99, 0.75), (t - 0.75) * 4.0);
+    }
+  }
+
   void main() {
     vec4 original = texture2D(u_original, v_texCoord);
-    vec4 decompressed = texture2D(u_decompressed, v_texCoord);
-    gl_FragColor = v_texCoord.x < u_splitPos ? original : decompressed;
+
+    // Build the right side (composited debug view)
+    vec3 color = vec3(0.0);
+
+    if (u_showDecompressed) {
+      float gray = texture2D(u_decompressed, v_texCoord).r;
+      color = vec3(gray);
+    }
+
+    if (u_debugMode == 1) {
+      // Residual: use absolute value, 0.5 = zero error
+      float r = texture2D(u_residual, v_texCoord).r;
+      float intensity = abs(r - 0.5) * 2.0;
+      vec3 overlayColor = magma(intensity);
+      float blendAmount = u_showDecompressed ? intensity : 1.0;
+      color = mix(color, overlayColor, blendAmount);
+    } else if (u_debugMode == 2) {
+      // Error: already 0-1 scaled
+      float intensity = texture2D(u_error, v_texCoord).r;
+      vec3 overlayColor = magma(intensity);
+      float blendAmount = u_showDecompressed ? intensity : 1.0;
+      color = mix(color, overlayColor, blendAmount);
+    }
+
+    gl_FragColor = v_texCoord.x < u_splitPos ? original : vec4(color, 1.0);
   }
 `;
 
@@ -404,6 +461,8 @@ function initWebGL() {
   // Create textures
   originalTexture = gl.createTexture();
   decompressedTexture = gl.createTexture();
+  residualTexture = gl.createTexture();
+  errorTexture = gl.createTexture();
 
   return true;
 }
@@ -437,12 +496,23 @@ function updateCompareCanvas() {
   // Upload textures
   uploadGrayscaleTexture(originalTexture, currentGrayData, currentWidth, currentHeight, 0);
   uploadGrayscaleTexture(decompressedTexture, currentDecompressed, currentWidth, currentHeight, 1);
+  if (currentResidual) {
+    uploadGrayscaleTexture(residualTexture, currentResidual, currentWidth, currentHeight, 2);
+  }
+  if (currentError) {
+    uploadGrayscaleTexture(errorTexture, currentError, currentWidth, currentHeight, 3);
+  }
 
   // Set uniforms
   gl.useProgram(glProgram);
   gl.uniform1i(gl.getUniformLocation(glProgram, 'u_original'), 0);
   gl.uniform1i(gl.getUniformLocation(glProgram, 'u_decompressed'), 1);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_residual'), 2);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_error'), 3);
   gl.uniform1f(gl.getUniformLocation(glProgram, 'u_splitPos'), comparePosition);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_showDecompressed'), showDecompressed ? 1 : 0);
+  const debugMode = debugOverlay === 'residual' ? 1 : (debugOverlay === 'error' ? 2 : 0);
+  gl.uniform1i(gl.getUniformLocation(glProgram, 'u_debugMode'), debugMode);
 
   // Draw
   gl.viewport(0, 0, currentWidth, currentHeight);
@@ -535,6 +605,154 @@ document.addEventListener('touchmove', (e) => {
 
 document.addEventListener('touchend', () => {
   isDragging = false;
+});
+
+// Debug overlay handlers
+document.getElementById('showDecompressed').addEventListener('change', (e) => {
+  showDecompressed = e.target.checked;
+  updateDecompressedCanvas();
+  if (currentView === 'compare') {
+    updateCompareCanvas();
+  }
+});
+
+document.querySelectorAll('input[name="debugOverlay"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    debugOverlay = e.target.value;
+    updateDecompressedCanvas();
+    if (currentView === 'compare') {
+      updateCompareCanvas();
+    }
+  });
+});
+
+// Magma colormap function for JS
+function magmaColor(t) {
+  let r, g, b;
+  if (t < 0.25) {
+    const s = t * 4;
+    r = s * 0.28 * 255;
+    g = s * 0.08 * 255;
+    b = (0.04 + s * 0.43) * 255;
+  } else if (t < 0.5) {
+    const s = (t - 0.25) * 4;
+    r = (0.28 + s * 0.44) * 255;
+    g = (0.08 + s * 0.14) * 255;
+    b = (0.47 + s * 0.04) * 255;
+  } else if (t < 0.75) {
+    const s = (t - 0.5) * 4;
+    r = (0.72 + s * 0.27) * 255;
+    g = (0.22 + s * 0.31) * 255;
+    b = (0.51 - s * 0.13) * 255;
+  } else {
+    const s = (t - 0.75) * 4;
+    r = 255;
+    g = (0.53 + s * 0.46) * 255;
+    b = (0.38 + s * 0.37) * 255;
+  }
+  return { r, g, b };
+}
+
+// Update the decompressed canvas with debug overlays (side-by-side view)
+function updateDecompressedCanvas() {
+  if (!currentDecompressed || !currentWidth || !currentHeight) return;
+
+  const canvas = document.getElementById('decompressedCanvas');
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.createImageData(currentWidth, currentHeight);
+
+  for (let i = 0; i < currentDecompressed.length; i++) {
+    let r = 0, g = 0, b = 0;
+
+    if (showDecompressed) {
+      const gray = currentDecompressed[i];
+      r = gray;
+      g = gray;
+      b = gray;
+    }
+
+    if (debugOverlay !== 'none') {
+      let intensity = 0;
+      if (debugOverlay === 'residual' && currentResidual) {
+        const res = currentResidual[i] / 255;
+        intensity = Math.abs(res - 0.5) * 2;
+      } else if (debugOverlay === 'error' && currentError) {
+        intensity = currentError[i] / 255;
+      }
+
+      const overlay = magmaColor(intensity);
+      const blendAmount = showDecompressed ? intensity : 1.0;
+      r = r * (1 - blendAmount) + overlay.r * blendAmount;
+      g = g * (1 - blendAmount) + overlay.g * blendAmount;
+      b = b * (1 - blendAmount) + overlay.b * blendAmount;
+    }
+
+    imageData.data[i * 4] = Math.round(r);
+    imageData.data[i * 4 + 1] = Math.round(g);
+    imageData.data[i * 4 + 2] = Math.round(b);
+    imageData.data[i * 4 + 3] = 255;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// Hover info display
+function updateHoverInfo(x, y) {
+  const hoverInfo = document.getElementById('hoverInfo');
+  if (!currentGrayData || x < 0 || y < 0 || x >= currentWidth || y >= currentHeight) {
+    hoverInfo.innerHTML = `
+      <span class="hover-coords">&nbsp;</span>
+      <div class="hover-values">
+        <div class="hover-row"><span>Original:</span><span>-</span></div>
+        <div class="hover-row"><span>Decompressed:</span><span>-</span></div>
+        <div class="hover-row"><span>Residual:</span><span>-</span></div>
+        <div class="hover-row"><span>Error:</span><span>-</span></div>
+      </div>`;
+    return;
+  }
+
+  const idx = y * currentWidth + x;
+  const original = currentGrayData[idx];
+  const decompressed = currentDecompressed ? currentDecompressed[idx] : '-';
+  const residual = currentResidual ? currentResidual[idx] : null;
+  const error = currentDecompressed ? Math.abs(currentGrayData[idx] - currentDecompressed[idx]) : 0;
+
+  // Convert residual from 0-255 (128=zero) to signed value
+  const residualSigned = residual !== null ? residual - 128 : null;
+  const residualStr = residualSigned !== null ? `${residualSigned >= 0 ? '+' : ''}${residualSigned}` : '-';
+  const errorStr = error > 0 ? `±${error}` : '0';
+
+  hoverInfo.innerHTML = `
+    <span class="hover-coords">(${x}, ${y})</span>
+    <div class="hover-values">
+      <div class="hover-row"><span>Original:</span><span>${original}</span></div>
+      <div class="hover-row"><span>Decompressed:</span><span>${decompressed}</span></div>
+      <div class="hover-row"><span>Residual:</span><span>${residualStr}</span></div>
+      <div class="hover-row"><span>Error:</span><span>${errorStr}</span></div>
+    </div>`;
+}
+
+function getCanvasPixelCoords(canvas, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const x = Math.floor((clientX - rect.left) * scaleX);
+  const y = Math.floor((clientY - rect.top) * scaleY);
+  return { x, y };
+}
+
+// Add hover listeners to both canvases
+['decompressedCanvas', 'originalCanvas', 'compareCanvas'].forEach(id => {
+  const canvas = document.getElementById(id);
+  if (canvas) {
+    canvas.addEventListener('mousemove', (e) => {
+      const { x, y } = getCanvasPixelCoords(canvas, e.clientX, e.clientY);
+      updateHoverInfo(x, y);
+    });
+    canvas.addEventListener('mouseleave', () => {
+      updateHoverInfo(-1, -1);
+    });
+  }
 });
 
 // Initialize and load first demo image

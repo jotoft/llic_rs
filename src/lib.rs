@@ -333,6 +333,39 @@ pub mod wasm;
 pub use Quality as CompressionQuality;
 pub use Mode as CompressionMode;
 
+/// Compute prediction residual for grayscale image data.
+///
+/// Uses the same predictor as the lossless compression:
+/// - First pixel: stored as-is (no prediction)
+/// - First row: horizontal prediction (pixel - left)
+/// - First column: vertical prediction (pixel - top)
+/// - Other pixels: average prediction (pixel - (left + top) / 2)
+///
+/// Returns residuals mapped to 0-255 where 128 = zero residual.
+pub fn compute_prediction_residual(data: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut residual = Vec::with_capacity(width * height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = data[y * width + x] as i16;
+            let predicted = if y == 0 {
+                if x == 0 { 0 } else { data[y * width + x - 1] as i16 }
+            } else if x == 0 {
+                data[(y - 1) * width + x] as i16
+            } else {
+                let left = data[y * width + x - 1] as i16;
+                let top = data[(y - 1) * width + x] as i16;
+                (left + top) >> 1
+            };
+            let delta = pixel - predicted;
+            // Map signed delta to unsigned: 128 = zero, <128 = negative, >128 = positive
+            residual.push((delta + 128).clamp(0, 255) as u8);
+        }
+    }
+
+    residual
+}
+
 // File I/O convenience functions (only available with std feature)
 #[cfg(feature = "std")]
 pub fn decode_file(input_path: &str, output_path: &str) -> Result<()> {

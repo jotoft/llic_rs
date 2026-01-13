@@ -146,3 +146,31 @@ pub fn build_info() -> String {
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     format!("{} ({}, {})", env!("CARGO_PKG_VERSION"), simd, profile)
 }
+
+/// Compute prediction residual for grayscale image data.
+///
+/// Returns the difference between actual pixel values and predicted values,
+/// mapped to 0-255 where 128 = zero residual (perfect prediction).
+///
+/// This is useful for visualizing where the compression predictor struggles:
+/// - Values near 128 (white in visualization) = good prediction
+/// - Values far from 128 (blue/red) = high prediction error
+///
+/// @param data - Raw grayscale pixels (Uint8Array, 8-bit, row-major order)
+/// @param width - Image width in pixels
+/// @param height - Image height in pixels
+/// @returns Residual data as Uint8Array (128 = zero, <128 = negative, >128 = positive)
+///
+/// @example
+/// ```js
+/// const residual = get_prediction_residual(grayPixels, 256, 256);
+/// // residual[i] == 128 means perfect prediction at pixel i
+/// ```
+#[wasm_bindgen]
+pub fn get_prediction_residual(
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    crate::compute_prediction_residual(data, width as usize, height as usize)
+}
