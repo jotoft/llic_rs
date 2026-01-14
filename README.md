@@ -1,14 +1,15 @@
-# LLIC - Lossless/Lossy Image Compression (Rust Port)
+# LLIC - Low Latency Image Codec (Rust Port)
 
 This is a Rust port of the LLIC image compression library originally written in C++ by Peter Rundberg. The original C++
 implementation is included as a git submodule in the `llic/` directory (from https://gitlab.com/llic/llic.git).
 
 ## Overview
 
-LLIC (Lossless/Lossy Image Compression) is an experimental image compression format designed for efficient encoding of
-grayscale images. This repository contains:
+LLIC (Low Latency Image Codec) is a fast lossy and lossless grayscale image compression format designed for real-time applications where speed is critical. The codec prioritizes extremely fast compression and decompression over maximum compression ratio.
 
-- **Rust implementation** (main directory) - A port and enhancement of the original C++ code
+This repository contains:
+
+- **Rust implementation** (main directory) - A port of the original C++ code
 - **Original C++ implementation** (`llic/` submodule) - The reference implementation by Peter Rundberg
 
 Both implementations support multiple quality levels from lossless (Q0) to lossy compression with increasing compression
