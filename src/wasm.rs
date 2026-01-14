@@ -1,6 +1,6 @@
 //! WebAssembly bindings for LLIC compression library.
 //!
-//! LLIC (Lossless/Lossy Image Compression) is optimized for grayscale images.
+//! LLIC (Low Latency Image Codec) is optimized for grayscale images.
 //! This module provides JavaScript-friendly APIs for use in browsers and Node.js.
 
 use wasm_bindgen::prelude::*;

@@ -82,8 +82,7 @@ Output format (PNG or PGM) is determined by the file extension.
 ### Current Status
 
 - **Lossless compression/decompression**: Fully implemented
-- **Lossy decompression**: Fully implemented (Q1-Q4)
-- **Lossy compression**: Not yet implemented (use C++ tool)
+- **Lossy compression/decompression**: Fully implemented (Q1-Q4)
 
 ### Library Usage
 
@@ -160,10 +159,14 @@ production use without further testing and optimization.
 ```
 .
 ├── src/                    # Rust implementation
-├── llic/                   # C++ implementation
+├── llic/                   # C++ implementation (git submodule)
+├── demo/                   # Interactive WASM demo
+├── pkg/                    # WASM package (web/ES modules)
+├── pkg-node/               # WASM package (Node.js)
+├── pkg-bundler/            # WASM package (bundlers)
 ├── tables/                 # Pre-computed compression tables
-├── test_data/             # Test images and compressed samples
-├── LLIC_FORMAT_SPEC.md    # Format specification
+├── test_data/              # Test images and compressed samples
+├── LLIC_FORMAT_SPEC.md     # Format specification
 └── COMPRESSION_TABLES_GUIDE.md  # Compression tables documentation
 ```
 

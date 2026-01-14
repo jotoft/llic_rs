@@ -2,7 +2,7 @@
 name = "llic_rs"
 version = "0.2.0"
 edition = "2021"
-description = "LLIC - Lossless and Lossy Image Compression for grayscale images"
+description = "LLIC - Low Latency Image Codec for grayscale images"
 repository = "https://github.com/jotoft/llic_rs"
 license = "Zlib"
 keywords = ["compression", "image", "lossless", "wasm"]

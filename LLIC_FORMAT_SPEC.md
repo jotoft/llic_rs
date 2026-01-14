@@ -4,7 +4,7 @@
 
 ## Overview
 
-LLIC (Lossy and Lossless Image Compression) is a fast grayscale image compression format that supports
+LLIC (Low Latency Image Codec) is a fast grayscale image compression format that supports
 both lossless and lossy compression modes. It is optimized for 8-bit grayscale images and requires image dimensions to
 be multiples of 4.
 
