@@ -14,9 +14,18 @@ use crate::{LlicContext, Quality, Mode};
 /// @param data - Raw grayscale pixels (Uint8Array, 8-bit, row-major order)
 /// @param width - Image width in pixels (must be multiple of 4)
 /// @param height - Image height in pixels (must be multiple of 4)
-/// @param quality - Quality level: 'lossless', 'very_high', 'high', 'medium', or 'low'
+/// @param quality - Quality level: 'lossless', 'lossless_entropy', 'very_high', 'high', 'medium', 'low', or 'very_low'
 /// @returns Compressed data as Uint8Array
 /// @throws Error if dimensions are invalid or quality is unrecognized
+///
+/// Quality levels:
+/// - 'lossless': Tile-based lossless compression (recommended, format v4)
+/// - 'lossless_entropy': Legacy entropy-coded lossless (for compatibility)
+/// - 'very_high': Near-lossless, max error ±2
+/// - 'high': High quality, max error ±4
+/// - 'medium': Medium quality, max error ±8
+/// - 'low': Low quality, max error ±16
+/// - 'very_low': Very low quality, max error ±32
 ///
 /// @example
 /// ```js
@@ -32,12 +41,14 @@ pub fn compress(
 ) -> Result<Vec<u8>, JsError> {
     let quality_level = match quality {
         "lossless" => Quality::Lossless,
+        "lossless_entropy" => Quality::LosslessEntropy,
         "very_high" => Quality::VeryHigh,
         "high" => Quality::High,
         "medium" => Quality::Medium,
         "low" => Quality::Low,
+        "very_low" => Quality::VeryLow,
         _ => return Err(JsError::new(&format!(
-            "Invalid quality '{}'. Use: 'lossless', 'very_high', 'high', 'medium', or 'low'",
+            "Invalid quality '{}'. Use: 'lossless', 'lossless_entropy', 'very_high', 'high', 'medium', 'low', or 'very_low'",
             quality
         ))),
     };
@@ -48,8 +59,12 @@ pub fn compress(
     let max_size = context.compressed_buffer_size();
     let mut output = vec![0u8; max_size];
 
-    // Use Default mode for lossless, Fast mode for lossy
-    let mode = if quality_level == Quality::Lossless { Mode::Default } else { Mode::Fast };
+    // Use Default mode for lossless variants, Fast mode for lossy
+    let mode = if quality_level == Quality::Lossless || quality_level == Quality::LosslessEntropy {
+        Mode::Default
+    } else {
+        Mode::Fast
+    };
 
     let compressed_size = context.compress_gray8(
         data,

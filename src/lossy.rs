@@ -567,30 +567,73 @@ pub fn decompress_tile_block_with_error_limit(
     let bucket_lut = generate_bucket_lut(error_limit);
 
     if compressed_header {
-        // Compressed header - need to decompress min/dist streams
-        // For now, return error - we'll implement this if needed
-        return Err(LlicError::UnsupportedFormat);
+        // Compressed header - decompress min/dist streams using entropy coder
+        // Format: [flags:1][header_size:4][compressed_header:header_size][pixel_data:...]
+        if src_data.len() < 5 {
+            return Err(LlicError::InvalidData);
+        }
+
+        let header_size = u32::from_le_bytes([
+            src_data[1], src_data[2], src_data[3], src_data[4]
+        ]) as usize;
+
+        if src_data.len() < 5 + header_size {
+            return Err(LlicError::InvalidData);
+        }
+
+        // The header is entropy-coded as a (width/4) × (rows/4 * 2) "image"
+        // First half = min values, second half = dist values
+        let header_width = (width / 4) as u32;
+        let header_height = (rows / 4) * 2;
+        let header_decompressed_size = (header_width * header_height) as usize;
+
+        // Decompress the header
+        let mut header_buffer = vec![0u8; header_decompressed_size];
+        crate::entropy_coder::decompress(
+            &src_data[5..5 + header_size],
+            header_width,
+            header_height,
+            header_width,
+            &mut header_buffer,
+        )?;
+
+        // Split into min and dist streams
+        let half = header_decompressed_size / 2;
+        let min_stream = &header_buffer[..half];
+        let dist_stream = &header_buffer[half..];
+        let pixel_stream_start = 5 + header_size;
+
+        decompress_tiles(
+            min_stream,
+            dist_stream,
+            &src_data[pixel_stream_start..],
+            width,
+            rows,
+            bytes_per_line,
+            &bucket_lut,
+            dst_graymap,
+        )
+    } else {
+        // Uncompressed header: min and dist streams start at byte 1
+        if src_data.len() < 1 + num_tiles * 2 {
+            return Err(LlicError::InvalidData);
+        }
+
+        let min_stream = &src_data[1..1 + num_tiles];
+        let dist_stream = &src_data[1 + num_tiles..1 + num_tiles * 2];
+        let pixel_stream_start = 1 + num_tiles * 2;
+
+        decompress_tiles(
+            min_stream,
+            dist_stream,
+            &src_data[pixel_stream_start..],
+            width,
+            rows,
+            bytes_per_line,
+            &bucket_lut,
+            dst_graymap,
+        )
     }
-
-    // Uncompressed header: min and dist streams start at byte 1
-    if src_data.len() < 1 + num_tiles * 2 {
-        return Err(LlicError::InvalidData);
-    }
-
-    let min_stream = &src_data[1..1 + num_tiles];
-    let dist_stream = &src_data[1 + num_tiles..1 + num_tiles * 2];
-    let pixel_stream_start = 1 + num_tiles * 2;
-
-    decompress_tiles(
-        min_stream,
-        dist_stream,
-        &src_data[pixel_stream_start..],
-        width,
-        rows,
-        bytes_per_line,
-        &bucket_lut,
-        dst_graymap,
-    )
 }
 
 /// Helper for decompressing with a pre-decompressed header buffer.

@@ -89,6 +89,7 @@ fn read_pgm(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 /// Parse LLIC container format and return (width, height, compressed_data)
+/// Supports both old format (width height\nsize\ndata) and new LLSC format (LLSC\nwidth height\nsize\ndata)
 fn read_llic_container(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
     let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
@@ -98,31 +99,47 @@ fn read_llic_container(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
         .position(|&b| b == b'\n')
         .ok_or("No newline in LLIC file")?;
 
-    let header_line = std::str::from_utf8(&data[..first_newline]).map_err(|_| "Invalid header")?;
+    let first_line = std::str::from_utf8(&data[..first_newline]).map_err(|_| "Invalid header")?;
 
-    let parts: Vec<&str> = header_line.split_whitespace().collect();
+    // Check if this is the new LLSC format (starts with "LLSC")
+    let (dims_start, dims_end) = if first_line.trim() == "LLSC" {
+        // New format: LLSC\nwidth height\nsize\ndata
+        let second_start = first_newline + 1;
+        let second_newline = data[second_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or("No second newline")?
+            + second_start;
+        (second_start, second_newline)
+    } else {
+        // Old format: width height\nsize\ndata
+        (0, first_newline)
+    };
+
+    let dims_line = std::str::from_utf8(&data[dims_start..dims_end]).map_err(|_| "Invalid dimensions")?;
+    let parts: Vec<&str> = dims_line.split_whitespace().collect();
     if parts.len() != 2 {
-        return Err("Invalid header format".to_string());
+        return Err(format!("Invalid header format: expected 'width height', got '{}'", dims_line));
     }
 
     let width: u32 = parts[0].parse().map_err(|_| "Invalid width")?;
     let height: u32 = parts[1].parse().map_err(|_| "Invalid height")?;
 
-    // Find second newline
-    let second_start = first_newline + 1;
-    let second_newline = data[second_start..]
+    // Find size line
+    let size_start = dims_end + 1;
+    let size_newline = data[size_start..]
         .iter()
         .position(|&b| b == b'\n')
-        .ok_or("No second newline")?
-        + second_start;
+        .ok_or("No size newline")?
+        + size_start;
 
     let size_line =
-        std::str::from_utf8(&data[second_start..second_newline]).map_err(|_| "Invalid size")?;
+        std::str::from_utf8(&data[size_start..size_newline]).map_err(|_| "Invalid size")?;
 
     let _compressed_size: usize = size_line.trim().parse().map_err(|_| "Invalid size")?;
 
     // Extract compressed data
-    let data_start = second_newline + 1;
+    let data_start = size_newline + 1;
     let compressed_data = data[data_start..].to_vec();
 
     Ok((width, height, compressed_data))
@@ -167,8 +184,10 @@ fn test_pattern(pattern_name: &str, quality: u8) -> Result<(), String> {
         .map_err(|e| format!("Decompression failed: {}", e))?;
 
     // Verify quality matches
+    // Note: Test data was created with old C++ (format v3), so quality=0 is entropy-coded
+    // which now returns LosslessEntropy. For tile-based lossless (format v4), use Quality::Lossless.
     let expected_quality = match quality {
-        0 => Quality::Lossless,
+        0 => Quality::LosslessEntropy, // Old format v3 entropy-coded
         1 => Quality::VeryHigh,
         2 => Quality::High,
         3 => Quality::Medium,
@@ -427,21 +446,23 @@ fn test_lossy_compression_format_match() {
     assert_eq!(cpp_width, width);
     assert_eq!(cpp_height, height);
 
-    // Compare the raw block data (skip LLIC v3 header from Rust output)
-    // Rust header: version(1) + num_blocks(1) + block_size(4) = 6 bytes
-    // C++ container adds text header, but read_llic_container extracts just the binary part
-    // which includes version(1) + num_blocks(1) + 16 block_sizes(64) + block data
+    // Compare the raw block data
+    // Both Rust and C++ now use format v4: version(1) + num_blocks(1) + tile_based(1) + mode(1) + block_sizes(n*4) + block data
 
-    // For single-threaded Rust: header is [version=3, num_blocks=1, block_size(4 bytes), block_data...]
-    // For C++ with 16 threads: header is [version=3, num_blocks=16, block_sizes(16*4), block_data...]
+    // Skip Rust v4 header to get to block data
+    let rust_block_data = &rust_compressed[8..]; // version(1) + num_blocks(1) + tile_based(1) + mode(1) + size(4)
 
-    // The block data format should match - let's extract and compare the first block
-    let rust_block_data = &rust_compressed[6..]; // Skip version(1) + num_blocks(1) + size(4)
-
-    // C++ uses 16 blocks, find the block with the actual data
+    // Parse C++ v4 header
+    let cpp_version = cpp_compressed[0];
     let cpp_num_blocks = cpp_compressed[1] as usize;
+    let cpp_tile_based = cpp_compressed[2];
+    let cpp_mode = cpp_compressed[3];
+
+    println!("C++ format: version={}, num_blocks={}, tile_based={}, mode={}", cpp_version, cpp_num_blocks, cpp_tile_based, cpp_mode);
+
+    // Block sizes start at offset 4 for format v4
     let mut cpp_block_sizes = Vec::new();
-    let mut pos = 2;
+    let mut pos = 4;
     for _ in 0..cpp_num_blocks {
         let size = u32::from_le_bytes([
             cpp_compressed[pos],
@@ -453,7 +474,7 @@ fn test_lossy_compression_format_match() {
         pos += 4;
     }
 
-    // Find first non-zero block
+    // Find first non-zero block (C++ may use multiple threads)
     let first_block_idx = cpp_block_sizes.iter().position(|&s| s > 0).unwrap_or(0);
     let cpp_block_start = pos + cpp_block_sizes[..first_block_idx].iter().map(|&s| s as usize).sum::<usize>();
     let cpp_block_size = cpp_block_sizes[first_block_idx] as usize;
