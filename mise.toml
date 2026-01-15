@@ -1,19 +1,23 @@
-[env]
-RUSTFLAGS = "-C target-cpu=native"
+# Note: RUSTFLAGS for native builds are set per-task, not globally,
+# to avoid breaking WASM builds.
 
 [tasks.bench]
+env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run all benchmarks"
 run = "cargo bench"
 
 [tasks."bench:256"]
+env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run 256x256 benchmarks only"
 run = "cargo bench -- '256x256'"
 
 [tasks."bench:rust"]
+env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run Rust-only benchmarks"
 run = "cargo bench -- 'rust'"
 
 [tasks.profile]
+env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Generate flamegraph + perf.data for Rust 256x256 decompression"
 run = "cargo flamegraph --bench llic_benchmark -- --bench 'rust/256x256'"
 

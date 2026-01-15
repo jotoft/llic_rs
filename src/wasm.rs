@@ -162,6 +162,108 @@ pub fn build_info() -> String {
     format!("{} ({}, {})", env!("CARGO_PKG_VERSION"), simd, profile)
 }
 
+/// Extract tile metadata from compressed data for visualization.
+///
+/// Returns a flat array of [min, dist, bits] for each 4x4 tile.
+/// The array length is `(width/4) * (height/4) * 3`.
+///
+/// This is useful for visualizing the tile-based compression:
+/// - `min`: Minimum pixel value in the 4x4 tile
+/// - `dist`: Range (max - min) of pixel values in the tile
+/// - `bits`: Number of bits used per pixel in this tile (0-8)
+///
+/// @param compressed_data - LLIC compressed data (must be tile-based, not entropy-coded)
+/// @param width - Image width in pixels (must be multiple of 4)
+/// @param height - Image height in pixels (must be multiple of 4)
+/// @returns Flat Uint8Array: [min0, dist0, bits0, min1, dist1, bits1, ...]
+/// @throws Error if data is not tile-based compressed or is invalid
+///
+/// @example
+/// ```js
+/// const metadata = get_tile_metadata(compressed, 256, 256);
+/// // metadata.length == (256/4) * (256/4) * 3 == 12288
+/// // Tile at (tx, ty): idx = (ty * (width/4) + tx) * 3
+/// // min = metadata[idx], dist = metadata[idx+1], bits = metadata[idx+2]
+/// ```
+#[wasm_bindgen]
+pub fn get_tile_metadata(
+    compressed_data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, JsError> {
+    if compressed_data.is_empty() {
+        return Err(JsError::new("Empty compressed data"));
+    }
+
+    // Parse format header to find the tile block data
+    let version = compressed_data[0];
+    if version < 4 {
+        return Err(JsError::new("Tile metadata only available for format v4+ (tile-based compression)"));
+    }
+
+    let num_blocks = compressed_data[1] as usize;
+    let tile_based = compressed_data[2] != 0;
+
+    if !tile_based {
+        return Err(JsError::new("Tile metadata not available for entropy-coded compression"));
+    }
+
+    // Parse block sizes (format v4: block sizes start at offset 4)
+    let mut block_sizes = Vec::with_capacity(num_blocks);
+    let mut pos = 4usize;
+    for _ in 0..num_blocks {
+        if pos + 4 > compressed_data.len() {
+            return Err(JsError::new("Invalid compressed data: truncated block sizes"));
+        }
+        let size = u32::from_le_bytes([
+            compressed_data[pos],
+            compressed_data[pos + 1],
+            compressed_data[pos + 2],
+            compressed_data[pos + 3],
+        ]) as usize;
+        block_sizes.push(size);
+        pos += 4;
+    }
+
+    // For single-block data, extract metadata directly
+    // For multi-block data, we need to combine all blocks
+    // For simplicity, we'll handle the common single-block case and
+    // use the last non-zero block for multi-block (which has the full data)
+    let block_data_start = pos;
+
+    // Find the block with actual data (for multi-thread output, it's usually the last block)
+    let mut data_offset = block_data_start;
+    let mut tile_block_data = &compressed_data[0..0];
+
+    for (i, &size) in block_sizes.iter().enumerate() {
+        if size > 0 {
+            // For single block case or the main data block
+            if num_blocks == 1 || i == block_sizes.len() - 1 {
+                tile_block_data = &compressed_data[data_offset..data_offset + size];
+            }
+        }
+        data_offset += size;
+    }
+
+    if tile_block_data.is_empty() {
+        return Err(JsError::new("No tile block data found"));
+    }
+
+    // Extract metadata using the lossy module
+    let metadata = crate::lossy::extract_tile_metadata(tile_block_data, width, height)
+        .map_err(|e| JsError::new(&format!("Failed to extract tile metadata: {}", e)))?;
+
+    // Flatten to [min, dist, bits, min, dist, bits, ...]
+    let mut result = Vec::with_capacity(metadata.len() * 3);
+    for (min, dist, bits) in metadata {
+        result.push(min);
+        result.push(dist);
+        result.push(bits);
+    }
+
+    Ok(result)
+}
+
 /// Compute prediction residual for grayscale image data.
 ///
 /// Returns the difference between actual pixel values and predicted values,

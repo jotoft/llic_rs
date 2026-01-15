@@ -20,18 +20,42 @@ body {
   padding: 1rem 1.5rem;
   background: #141414;
   color: #d0d0d0;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 .main-layout {
   display: grid;
   grid-template-columns: 1fr 280px;
   gap: 1rem;
-  align-items: start;
+  align-items: stretch;
+  height: calc(100vh - 5rem);
+  overflow: hidden;
 }
 
 .main-content {
   min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow: hidden;
+}
+
+.main-content > .view-toggle {
+  flex: 0 0 auto;
+}
+
+.main-content > .image-container,
+.main-content > .tile-viz-container {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.main-content > .compare-container {
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 /* ==========================================================================
@@ -46,9 +70,11 @@ h1 {
 }
 
 .subtitle {
-  color: #606060;
-  font-size: 0.8em;
-  margin-top: 0.75rem;
+  display: none;
+}
+
+footer {
+  display: none;
 }
 
 /* ==========================================================================
@@ -98,9 +124,9 @@ button:hover {
 }
 
 .view-toggle {
-  margin-bottom: 0.5rem;
   display: flex;
   gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 /* ==========================================================================
@@ -111,8 +137,8 @@ button:hover {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  position: sticky;
-  top: 1rem;
+  overflow-y: auto;
+  max-height: 100%;
 }
 
 .sidebar-box {
@@ -267,26 +293,37 @@ select option {
 .image-container {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 0.75rem;
+  gap: 0.5rem;
+  min-height: 0;
 }
 
 .panel {
   background: #1a1a1a;
   border-radius: 6px;
-  padding: 0.75rem;
+  padding: 0;
   border: 1px solid #2a2a2a;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
 }
 
 .panel h3 {
-  margin: 0 0 0.5rem 0;
-  color: #e0e0e0;
-  font-size: 1.1rem;
+  position: absolute;
+  top: 0.25rem;
+  left: 0.5rem;
+  margin: 0;
+  color: #888;
+  font-size: 0.75rem;
+  font-weight: normal;
+  z-index: 10;
+  text-shadow: 0 0 3px #000;
 }
 
 canvas {
-  max-width: 100%;
   border: 1px solid #333;
   background: #000;
+  /* Don't set max-width here - it breaks zoom functionality */
 }
 
 /* ==========================================================================
@@ -509,4 +546,50 @@ input[type="file"] {
 
 .hover-info .hover-row span:last-child {
   color: #c9a227;
+}
+
+/* ==========================================================================
+   Tile Visualization
+   ========================================================================== */
+
+.tile-viz-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  min-height: 0;
+}
+
+.tile-viz-container .panel h3 {
+  font-size: 0.95rem;
+  color: #909090;
+}
+
+.tile-viz-container canvas {
+  image-rendering: pixelated;
+}
+
+/* ==========================================================================
+   Zoom Support
+   ========================================================================== */
+
+.panel canvas {
+  transform-origin: top left;
+  image-rendering: pixelated;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: top left;
+}
+
+.panel {
+  cursor: grab;
+}
+
+.panel.panning {
+  cursor: grabbing;
+}
+
+.panel.zoom-mode {
+  cursor: zoom-in;
 }

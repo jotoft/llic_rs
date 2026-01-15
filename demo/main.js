@@ -2,7 +2,7 @@
 // For CDN usage, you can import from:
 //   import init, { ... } from 'https://unpkg.com/llic-wasm@latest/llic.js';
 //   import init, { ... } from 'https://cdn.jsdelivr.net/npm/llic-wasm@latest/llic.js';
-import init, { compress, decompress, build_info, get_prediction_residual } from './pkg/llic.js';
+import init, { compress, decompress, build_info, get_prediction_residual, get_tile_metadata } from './pkg/llic.js';
 
 let wasmReady = false;
 let currentGrayData = null;
@@ -14,7 +14,7 @@ let currentHeight = 0;
 let currentCompressed = null;
 let currentImageFile = null;
 let currentBlur = 0;
-let currentQuality = 'lossless'; // 'lossless', 'very_high', 'high', 'medium', 'low'
+let currentQuality = 'lossless_entropy';
 let currentView = 'side-by-side';
 let comparePosition = 0.5;
 
@@ -22,13 +22,28 @@ let comparePosition = 0.5;
 let showDecompressed = true;
 let debugOverlay = 'none'; // 'none', 'residual', 'error'
 
+// Tile visualization state
+let currentTileMetadata = null;
+
+// Zoom and pan state
+let zoomLevel = 1.0;
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 16.0;
+let panX = 0;
+let panY = 0;
+let isPanning = false;
+let panStartX = 0;
+let panStartY = 0;
+
 // Quality level display names and error limits
 const qualityInfo = {
-  lossless: { name: 'Lossless', error: 0 },
+  lossless_entropy: { name: 'Lossless (Entropy)', error: 0 },
+  lossless: { name: 'Lossless (±0)', error: 0 },
   very_high: { name: 'Very High (±2)', error: 2 },
   high: { name: 'High (±4)', error: 4 },
   medium: { name: 'Medium (±8)', error: 8 },
   low: { name: 'Low (±16)', error: 16 },
+  very_low: { name: 'Very Low (±32)', error: 32 },
 };
 
 async function initWasm() {
@@ -137,6 +152,14 @@ async function processImage(file, blur = currentBlur) {
     updateStat('ratio', `${(grayData.length / compressed.length).toFixed(2)}x (${(100 * compressed.length / grayData.length).toFixed(1)}%)`);
     updateStat('compressTime', `${compressTime.toFixed(2)} ms`);
 
+    // Get tile metadata (only for tile-based compression)
+    try {
+      currentTileMetadata = get_tile_metadata(compressed, width, height);
+    } catch (e) {
+      // Entropy-coded compression doesn't have tile metadata
+      currentTileMetadata = null;
+    }
+
     // Decompress
     let decompressed;
     const decompressStart = performance.now();
@@ -171,19 +194,30 @@ async function processImage(file, blur = currentBlur) {
       currentError[i] = Math.min(255, Math.abs(grayData[i] - decompressed[i]) * 8);
     }
 
-    // Calculate similarity (1.0 = identical, lower = lossy difference)
-    let totalError = 0;
+    // Calculate PSNR (Peak Signal-to-Noise Ratio) - standard metric for image compression
+    let mse = 0;
     for (let i = 0; i < grayData.length; i++) {
-      totalError += Math.abs(grayData[i] - decompressed[i]);
+      const diff = grayData[i] - decompressed[i];
+      mse += diff * diff;
     }
-    const similarity = 1 - (totalError / (grayData.length * 255));
-    updateStat('similarity', similarity.toFixed(6));
+    mse /= grayData.length;
+
+    // PSNR = 10 * log10(MAX^2 / MSE), where MAX=255 for 8-bit images
+    // Infinite for identical images (MSE=0)
+    const psnr = mse === 0 ? Infinity : 10 * Math.log10(255 * 255 / mse);
+    updateStat('similarity', mse === 0 ? '∞ dB (lossless)' : `${psnr.toFixed(1)} dB`);
 
     // Draw decompressed (with debug overlays if enabled)
     const decompCanvas = document.getElementById('decompressedCanvas');
     decompCanvas.width = width;
     decompCanvas.height = height;
     updateDecompressedCanvas();
+
+    // Update tile visualization canvases
+    updateTileVizCanvases();
+
+    // Reapply zoom transform to all canvases
+    updateTransform();
 
     // Update labels and compare view
     updateQualityLabel();
@@ -533,13 +567,16 @@ document.querySelectorAll('.view-btn').forEach(btn => {
 
     const sideBySide = document.getElementById('sideBySideView');
     const compare = document.getElementById('compareView');
+    const tileViz = document.getElementById('tileVizView');
 
     if (currentView === 'side-by-side') {
       sideBySide.style.display = 'grid';
       compare.style.display = 'none';
+      tileViz.style.display = 'grid';
     } else {
       sideBySide.style.display = 'none';
       compare.style.display = 'block';
+      tileViz.style.display = 'none';
       // Delay to ensure layout is complete before positioning slider
       requestAnimationFrame(() => updateCompareCanvas());
     }
@@ -696,6 +733,200 @@ function updateDecompressedCanvas() {
   ctx.putImageData(imageData, 0, 0);
 }
 
+// Render grayscale data to a canvas
+function renderGrayscaleToCanvas(canvasId, data, width, height) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.createImageData(width, height);
+
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i];
+    imageData.data[i * 4] = v;
+    imageData.data[i * 4 + 1] = v;
+    imageData.data[i * 4 + 2] = v;
+    imageData.data[i * 4 + 3] = 255;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// Update tile visualization canvases
+function updateTileVizCanvases() {
+  const minCanvas = document.getElementById('minCanvas');
+  const distCanvas = document.getElementById('distCanvas');
+
+  if (!currentWidth || !currentHeight) {
+    return;
+  }
+
+  if (!currentTileMetadata) {
+    // No tile metadata available (entropy-coded) - draw black at same size
+    if (minCanvas) {
+      minCanvas.width = currentWidth;
+      minCanvas.height = currentHeight;
+      const ctx = minCanvas.getContext('2d');
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, currentWidth, currentHeight);
+    }
+    if (distCanvas) {
+      distCanvas.width = currentWidth;
+      distCanvas.height = currentHeight;
+      const ctx = distCanvas.getContext('2d');
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, currentWidth, currentHeight);
+    }
+    return;
+  }
+
+  const tilesX = Math.floor(currentWidth / 4);
+  const tilesY = Math.floor(currentHeight / 4);
+
+  // Create min and dist images (4x4 repeated values)
+  const minData = new Uint8Array(currentWidth * currentHeight);
+  const distData = new Uint8Array(currentWidth * currentHeight);
+
+  for (let ty = 0; ty < tilesY; ty++) {
+    for (let tx = 0; tx < tilesX; tx++) {
+      const tileIdx = ty * tilesX + tx;
+      const metaIdx = tileIdx * 3;
+      const min = currentTileMetadata[metaIdx];
+      const dist = currentTileMetadata[metaIdx + 1];
+
+      // Fill 4x4 block with tile values
+      for (let dy = 0; dy < 4; dy++) {
+        for (let dx = 0; dx < 4; dx++) {
+          const px = tx * 4 + dx;
+          const py = ty * 4 + dy;
+          const idx = py * currentWidth + px;
+          minData[idx] = min;
+          distData[idx] = dist;
+        }
+      }
+    }
+  }
+
+  // Render to canvases
+  renderGrayscaleToCanvas('minCanvas', minData, currentWidth, currentHeight);
+  renderGrayscaleToCanvas('distCanvas', distData, currentWidth, currentHeight);
+}
+
+// Zoom and pan functionality
+function updateTransform() {
+  const canvases = document.querySelectorAll('#sideBySideView canvas, #tileVizView canvas');
+  canvases.forEach(canvas => {
+    canvas.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+  });
+}
+
+// Reset pan when zoom goes back to 1
+function resetPan() {
+  panX = 0;
+  panY = 0;
+}
+
+// Track if mouse is over zoomable area
+let isOverZoomArea = false;
+
+// Add zoom and pan event listeners
+function setupZoomAndPan() {
+  const panels = document.querySelectorAll('#sideBySideView .panel, #tileVizView .panel');
+
+  panels.forEach(panel => {
+    panel.addEventListener('mouseenter', () => { isOverZoomArea = true; });
+    panel.addEventListener('mouseleave', () => {
+      isOverZoomArea = false;
+      if (isPanning) {
+        isPanning = false;
+        panel.classList.remove('panning');
+      }
+    });
+
+    // Zoom with ctrl+scroll
+    panel.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const oldZoom = zoomLevel;
+      const delta = e.deltaY > 0 ? 0.9 : 1.1;
+      zoomLevel = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel * delta));
+
+      // Zoom towards mouse position
+      const rect = panel.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      // Adjust pan to zoom towards cursor
+      const zoomRatio = zoomLevel / oldZoom;
+      panX = mouseX - (mouseX - panX) * zoomRatio;
+      panY = mouseY - (mouseY - panY) * zoomRatio;
+
+      // Reset pan if zoomed out to 1x
+      if (zoomLevel <= 1.0) {
+        resetPan();
+      }
+
+      updateTransform();
+    }, { passive: false });
+
+    // Pan with mouse drag
+    panel.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return; // Left click only
+      isPanning = true;
+      panStartX = e.clientX - panX;
+      panStartY = e.clientY - panY;
+      panel.classList.add('panning');
+      e.preventDefault();
+    });
+
+    panel.addEventListener('mousemove', (e) => {
+      if (!isPanning) return;
+      panX = e.clientX - panStartX;
+      panY = e.clientY - panStartY;
+      updateTransform();
+    });
+
+    panel.addEventListener('mouseup', () => {
+      isPanning = false;
+      panel.classList.remove('panning');
+    });
+  });
+
+  // Prevent browser zoom when over our zoom areas
+  document.addEventListener('wheel', (e) => {
+    if (e.ctrlKey && isOverZoomArea) {
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  // Stop panning if mouse released outside panel
+  document.addEventListener('mouseup', () => {
+    if (isPanning) {
+      isPanning = false;
+      document.querySelectorAll('.panel.panning').forEach(p => p.classList.remove('panning'));
+    }
+  });
+
+  // Show zoom cursor when ctrl is held
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Control' && isOverZoomArea) {
+      panels.forEach(p => p.classList.add('zoom-mode'));
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Control') {
+      panels.forEach(p => p.classList.remove('zoom-mode'));
+    }
+  });
+}
+
+setupZoomAndPan();
+
 // Hover info display
 function updateHoverInfo(x, y) {
   const hoverInfo = document.getElementById('hoverInfo');
@@ -707,6 +938,7 @@ function updateHoverInfo(x, y) {
         <div class="hover-row"><span>Decompressed:</span><span>-</span></div>
         <div class="hover-row"><span>Residual:</span><span>-</span></div>
         <div class="hover-row"><span>Error:</span><span>-</span></div>
+        <div class="hover-row"><span>Tile:</span><span>-</span></div>
       </div>`;
     return;
   }
@@ -722,6 +954,23 @@ function updateHoverInfo(x, y) {
   const residualStr = residualSigned !== null ? `${residualSigned >= 0 ? '+' : ''}${residualSigned}` : '-';
   const errorStr = error > 0 ? `±${error}` : '0';
 
+  // Get tile info
+  let tileStr = '-';
+  if (currentTileMetadata) {
+    const tileX = Math.floor(x / 4);
+    const tileY = Math.floor(y / 4);
+    const tilesPerRow = Math.floor(currentWidth / 4);
+    const tileIdx = tileY * tilesPerRow + tileX;
+    const metaIdx = tileIdx * 3;
+
+    if (metaIdx + 2 < currentTileMetadata.length) {
+      const min = currentTileMetadata[metaIdx];
+      const dist = currentTileMetadata[metaIdx + 1];
+      const bits = currentTileMetadata[metaIdx + 2];
+      tileStr = `min=${min}, dist=${dist}, ${bits}bpp`;
+    }
+  }
+
   hoverInfo.innerHTML = `
     <span class="hover-coords">(${x}, ${y})</span>
     <div class="hover-values">
@@ -729,20 +978,36 @@ function updateHoverInfo(x, y) {
       <div class="hover-row"><span>Decompressed:</span><span>${decompressed}</span></div>
       <div class="hover-row"><span>Residual:</span><span>${residualStr}</span></div>
       <div class="hover-row"><span>Error:</span><span>${errorStr}</span></div>
+      <div class="hover-row"><span>Tile:</span><span>${tileStr}</span></div>
     </div>`;
 }
 
 function getCanvasPixelCoords(canvas, clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const x = Math.floor((clientX - rect.left) * scaleX);
-  const y = Math.floor((clientY - rect.top) * scaleY);
+
+  // With object-fit: contain, we need to find the actual displayed image size
+  // The image is scaled uniformly to fit, so find the scale factor
+  const scaleX = rect.width / canvas.width;
+  const scaleY = rect.height / canvas.height;
+  const scale = Math.min(scaleX, scaleY); // object-fit: contain uses the smaller scale
+
+  // Actual displayed image dimensions
+  const displayWidth = canvas.width * scale;
+  const displayHeight = canvas.height * scale;
+
+  // With object-position: top left, image starts at rect.left, rect.top
+  const relX = clientX - rect.left;
+  const relY = clientY - rect.top;
+
+  // Map to canvas pixels
+  const x = Math.floor(relX / scale);
+  const y = Math.floor(relY / scale);
+
   return { x, y };
 }
 
-// Add hover listeners to both canvases
-['decompressedCanvas', 'originalCanvas', 'compareCanvas'].forEach(id => {
+// Add hover listeners to all canvases
+['decompressedCanvas', 'originalCanvas', 'compareCanvas', 'minCanvas', 'distCanvas'].forEach(id => {
   const canvas = document.getElementById(id);
   if (canvas) {
     canvas.addEventListener('mousemove', (e) => {

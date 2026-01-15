@@ -665,6 +665,93 @@ fn decompress_tile_block_with_header(
     )
 }
 
+/// Extract tile metadata (min, dist, bits) from compressed tile-based data.
+///
+/// Returns a vector of (min, dist, bits) tuples for each 4x4 tile.
+/// This is useful for visualization and debugging.
+///
+/// # Arguments
+/// * `src_data` - Compressed tile block data (starts after format header)
+/// * `width` - Image width in pixels (must be multiple of 4)
+/// * `height` - Image height in pixels (must be multiple of 4)
+///
+/// # Returns
+/// Vec of (min, dist, bits) for each tile in row-major order
+pub fn extract_tile_metadata(
+    src_data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<(u8, u8, u8)>> {
+    if src_data.is_empty() {
+        return Err(LlicError::InvalidData);
+    }
+
+    let num_tiles = ((width / 4) * (height / 4)) as usize;
+
+    // First byte contains flags and error_limit
+    let flags = src_data[0];
+    let compressed_header = (flags & 0x80) != 0;
+    let error_limit = flags & 0x7f;
+
+    // Generate bucket LUT for this error_limit
+    let bucket_lut = generate_bucket_lut(error_limit);
+
+    let (min_stream, dist_stream): (Vec<u8>, Vec<u8>) = if compressed_header {
+        // Compressed header - decompress min/dist streams using entropy coder
+        if src_data.len() < 5 {
+            return Err(LlicError::InvalidData);
+        }
+
+        let header_size = u32::from_le_bytes([
+            src_data[1], src_data[2], src_data[3], src_data[4]
+        ]) as usize;
+
+        if src_data.len() < 5 + header_size {
+            return Err(LlicError::InvalidData);
+        }
+
+        // The header is entropy-coded as a (width/4) × (height/4 * 2) "image"
+        let header_width = (width / 4) as u32;
+        let header_height = (height / 4) * 2;
+        let header_decompressed_size = (header_width * header_height) as usize;
+
+        // Decompress the header
+        let mut header_buffer = vec![0u8; header_decompressed_size];
+        crate::entropy_coder::decompress(
+            &src_data[5..5 + header_size],
+            header_width,
+            header_height,
+            header_width,
+            &mut header_buffer,
+        )?;
+
+        // Split into min and dist streams
+        let half = header_decompressed_size / 2;
+        (header_buffer[..half].to_vec(), header_buffer[half..].to_vec())
+    } else {
+        // Uncompressed header: min and dist streams start at byte 1
+        if src_data.len() < 1 + num_tiles * 2 {
+            return Err(LlicError::InvalidData);
+        }
+
+        (
+            src_data[1..1 + num_tiles].to_vec(),
+            src_data[1 + num_tiles..1 + num_tiles * 2].to_vec(),
+        )
+    };
+
+    // Build result vector
+    let mut result = Vec::with_capacity(num_tiles);
+    for i in 0..num_tiles {
+        let min_val = min_stream[i];
+        let dist = dist_stream[i];
+        let (bits, _bucket_size) = bucket_lut[dist as usize];
+        result.push((min_val, dist, bits));
+    }
+
+    Ok(result)
+}
+
 /// Core tile decompression loop.
 fn decompress_tiles(
     min_stream: &[u8],

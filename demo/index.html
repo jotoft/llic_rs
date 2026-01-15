@@ -41,6 +41,17 @@
         </div>
       </div>
 
+      <div class="tile-viz-container" id="tileVizView">
+        <div class="panel">
+          <h3>Tile Min Values</h3>
+          <canvas id="minCanvas"></canvas>
+        </div>
+        <div class="panel">
+          <h3>Tile Dist (Range)</h3>
+          <canvas id="distCanvas"></canvas>
+        </div>
+      </div>
+
       <p class="subtitle">Lossless grayscale compression. High-frequency noise/texture is harder to compress; smooth gradients compress well.<br>
         <em style="color: #555; font-size: 0.85em;">Note: Demo images are WebP-compressed. Use raw/uncompressed images for accurate compression testing.</em></p>
     </div>
@@ -62,8 +73,12 @@
         <h3>Quality</h3>
         <div class="radio-group" style="margin-top: 0; padding-top: 0; border-top: none;">
           <label class="radio-label">
-            <input type="radio" name="quality" value="lossless" checked>
-            <span>Lossless</span>
+            <input type="radio" name="quality" value="lossless_entropy" checked>
+            <span>Lossless (Entropy)</span>
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="quality" value="lossless">
+            <span>Lossless (±0)</span>
           </label>
           <label class="radio-label">
             <input type="radio" name="quality" value="very_high">
