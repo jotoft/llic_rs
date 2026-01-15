@@ -14,7 +14,7 @@ let currentHeight = 0;
 let currentCompressed = null;
 let currentImageFile = null;
 let currentBlur = 0;
-let currentQuality = 'lossless_entropy';
+let currentQuality = 'lossless';
 let currentView = 'side-by-side';
 let comparePosition = 0.5;
 
@@ -1021,6 +1021,8 @@ function getCanvasPixelCoords(canvas, clientX, clientY) {
 });
 
 // Initialize and load first demo image
-initWasm().then(() => {
-  loadDemoImage('demo_image2.webp');
+initWasm().then(async () => {
+  await loadDemoImage('demo_image2.webp');
+  // Ensure transform is applied after initial load
+  updateTransform();
 }).catch(console.error);
