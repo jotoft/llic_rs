@@ -30,7 +30,7 @@ body {
   grid-template-columns: 1fr 280px;
   gap: 1rem;
   align-items: stretch;
-  height: calc(100vh - 5rem);
+  height: calc(100vh - 6.5rem);
   overflow: hidden;
 }
 
