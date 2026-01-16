@@ -28,42 +28,42 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         }
 
         // Try with 2 buckets (1 bit)
-        let bucket_size = (dist_plus1 + 1) / 2; // ceil division
+        let bucket_size = dist_plus1.div_ceil(2);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (1, bucket_size as u8);
             continue;
         }
 
         // Try with 4 buckets (2 bits)
-        let bucket_size = (dist_plus1 + 3) / 4;
+        let bucket_size = dist_plus1.div_ceil(4);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (2, bucket_size as u8);
             continue;
         }
 
         // Try with 8 buckets (3 bits)
-        let bucket_size = (dist_plus1 + 7) / 8;
+        let bucket_size = dist_plus1.div_ceil(8);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (3, bucket_size as u8);
             continue;
         }
 
         // Try with 16 buckets (4 bits)
-        let bucket_size = (dist_plus1 + 15) / 16;
+        let bucket_size = dist_plus1.div_ceil(16);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (4, bucket_size as u8);
             continue;
         }
 
         // Try with 32 buckets (5 bits)
-        let bucket_size = (dist_plus1 + 31) / 32;
+        let bucket_size = dist_plus1.div_ceil(32);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (5, bucket_size as u8);
             continue;
         }
 
         // Try with 64 buckets (6 bits)
-        let bucket_size = (dist_plus1 + 63) / 64;
+        let bucket_size = dist_plus1.div_ceil(64);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (6, bucket_size as u8);
             continue;
@@ -93,7 +93,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
             let byte0 = src[0];
             let byte1 = src[1];
 
-            result[1] = (byte0 >> 0) & 0x1;
+            result[1] = byte0 & 0x1;
             result[5] = (byte0 >> 1) & 0x1;
             result[9] = (byte0 >> 2) & 0x1;
             result[13] = (byte0 >> 3) & 0x1;
@@ -102,7 +102,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
             result[8] = (byte0 >> 6) & 0x1;
             result[12] = (byte0 >> 7) & 0x1;
 
-            result[3] = (byte1 >> 0) & 0x1;
+            result[3] = byte1 & 0x1;
             result[7] = (byte1 >> 1) & 0x1;
             result[11] = (byte1 >> 2) & 0x1;
             result[15] = (byte1 >> 3) & 0x1;
@@ -120,10 +120,10 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
             let byte2 = src[2];
             let byte3 = src[3];
 
-            result[0] = (byte0 >> 0) & 0x3;
-            result[1] = (byte1 >> 0) & 0x3;
-            result[2] = (byte2 >> 0) & 0x3;
-            result[3] = (byte3 >> 0) & 0x3;
+            result[0] = byte0 & 0x3;
+            result[1] = byte1 & 0x3;
+            result[2] = byte2 & 0x3;
+            result[3] = byte3 & 0x3;
 
             result[4] = (byte0 >> 2) & 0x3;
             result[5] = (byte1 >> 2) & 0x3;
@@ -147,7 +147,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
             let word0 = (src[0] as u32) | ((src[1] as u32) << 8) | ((src[2] as u32) << 16);
             let word1 = (src[3] as u32) | ((src[4] as u32) << 8) | ((src[5] as u32) << 16);
 
-            result[0] = ((word0 >> 0) & 0x7) as u8;
+            result[0] = (word0 & 0x7) as u8;
             result[4] = ((word0 >> 3) & 0x7) as u8;
             result[8] = ((word0 >> 6) & 0x7) as u8;
             result[12] = ((word0 >> 9) & 0x7) as u8;
@@ -156,7 +156,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
             result[10] = ((word0 >> 18) & 0x7) as u8;
             result[14] = ((word0 >> 21) & 0x7) as u8;
 
-            result[1] = ((word1 >> 0) & 0x7) as u8;
+            result[1] = (word1 & 0x7) as u8;
             result[5] = ((word1 >> 3) & 0x7) as u8;
             result[9] = ((word1 >> 6) & 0x7) as u8;
             result[13] = ((word1 >> 9) & 0x7) as u8;
@@ -169,21 +169,21 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
         }
         4 => {
             // 8 bytes -> 16 pixels (4 bits each, nibbles)
-            result[0] = (src[0] >> 0) & 0xf;
+            result[0] = src[0] & 0xf;
             result[8] = (src[0] >> 4) & 0xf;
-            result[1] = (src[1] >> 0) & 0xf;
+            result[1] = src[1] & 0xf;
             result[9] = (src[1] >> 4) & 0xf;
-            result[2] = (src[2] >> 0) & 0xf;
+            result[2] = src[2] & 0xf;
             result[10] = (src[2] >> 4) & 0xf;
-            result[3] = (src[3] >> 0) & 0xf;
+            result[3] = src[3] & 0xf;
             result[11] = (src[3] >> 4) & 0xf;
-            result[4] = (src[4] >> 0) & 0xf;
+            result[4] = src[4] & 0xf;
             result[12] = (src[4] >> 4) & 0xf;
-            result[5] = (src[5] >> 0) & 0xf;
+            result[5] = src[5] & 0xf;
             result[13] = (src[5] >> 4) & 0xf;
-            result[6] = (src[6] >> 0) & 0xf;
+            result[6] = src[6] & 0xf;
             result[14] = (src[6] >> 4) & 0xf;
-            result[7] = (src[7] >> 0) & 0xf;
+            result[7] = src[7] & 0xf;
             result[15] = (src[7] >> 4) & 0xf;
 
             8
@@ -200,7 +200,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
                 | ((src[7] as u32) << 24);
             let word2 = (src[8] as u32) | ((src[9] as u32) << 8);
 
-            result[0] = ((word0 >> 0) & 0x1f) as u8;
+            result[0] = (word0 & 0x1f) as u8;
             result[4] = ((word0 >> 5) & 0x1f) as u8;
             result[8] = ((word0 >> 10) & 0x1f) as u8;
             result[12] = ((word0 >> 15) & 0x1f) as u8;
@@ -234,7 +234,7 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
                 | ((src[10] as u32) << 16)
                 | ((src[11] as u32) << 24);
 
-            result[0] = ((word0 >> 0) & 0x3f) as u8;
+            result[0] = (word0 & 0x3f) as u8;
             result[4] = ((word0 >> 6) & 0x3f) as u8;
             result[8] = ((word0 >> 12) & 0x3f) as u8;
             result[12] = ((word0 >> 18) & 0x3f) as u8;
@@ -437,7 +437,7 @@ pub fn compress_tile_block(
     bytes_per_line: u32,
     error_limit: u8,
 ) -> Result<Vec<u8>> {
-    if width % 4 != 0 || rows % 4 != 0 {
+    if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
     }
 
@@ -573,9 +573,8 @@ pub fn decompress_tile_block_with_error_limit(
             return Err(LlicError::InvalidData);
         }
 
-        let header_size = u32::from_le_bytes([
-            src_data[1], src_data[2], src_data[3], src_data[4]
-        ]) as usize;
+        let header_size =
+            u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
 
         if src_data.len() < 5 + header_size {
             return Err(LlicError::InvalidData);
@@ -583,7 +582,7 @@ pub fn decompress_tile_block_with_error_limit(
 
         // The header is entropy-coded as a (width/4) × (rows/4 * 2) "image"
         // First half = min values, second half = dist values
-        let header_width = (width / 4) as u32;
+        let header_width = width / 4;
         let header_height = (rows / 4) * 2;
         let header_decompressed_size = (header_width * header_height) as usize;
 
@@ -702,16 +701,15 @@ pub fn extract_tile_metadata(
             return Err(LlicError::InvalidData);
         }
 
-        let header_size = u32::from_le_bytes([
-            src_data[1], src_data[2], src_data[3], src_data[4]
-        ]) as usize;
+        let header_size =
+            u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
 
         if src_data.len() < 5 + header_size {
             return Err(LlicError::InvalidData);
         }
 
         // The header is entropy-coded as a (width/4) × (height/4 * 2) "image"
-        let header_width = (width / 4) as u32;
+        let header_width = width / 4;
         let header_height = (height / 4) * 2;
         let header_decompressed_size = (header_width * header_height) as usize;
 
@@ -727,7 +725,10 @@ pub fn extract_tile_metadata(
 
         // Split into min and dist streams
         let half = header_decompressed_size / 2;
-        (header_buffer[..half].to_vec(), header_buffer[half..].to_vec())
+        (
+            header_buffer[..half].to_vec(),
+            header_buffer[half..].to_vec(),
+        )
     } else {
         // Uncompressed header: min and dist streams start at byte 1
         if src_data.len() < 1 + num_tiles * 2 {
@@ -753,6 +754,7 @@ pub fn extract_tile_metadata(
 }
 
 /// Core tile decompression loop.
+#[allow(clippy::too_many_arguments)]
 fn decompress_tiles(
     min_stream: &[u8],
     dist_stream: &[u8],
@@ -900,7 +902,8 @@ mod tests {
             let max_val = if bits == 8 { 255u8 } else { (1u8 << bits) - 1 };
 
             // Test with sequential values
-            let indices: [u8; 16] = std::array::from_fn(|i| (i as u8) % (max_val.saturating_add(1)));
+            let indices: [u8; 16] =
+                std::array::from_fn(|i| (i as u8) % (max_val.saturating_add(1)));
 
             // Pack
             let mut packed = [0u8; 16];
@@ -910,8 +913,16 @@ mod tests {
             let mut unpacked = [0u8; 16];
             let bytes_read = unpack_pixels(&packed, bits, &mut unpacked);
 
-            assert_eq!(bytes_written, bytes_read, "Bytes mismatch for {} bits", bits);
-            assert_eq!(indices, unpacked, "Roundtrip failed for {} bits: {:?} != {:?}", bits, indices, unpacked);
+            assert_eq!(
+                bytes_written, bytes_read,
+                "Bytes mismatch for {} bits",
+                bits
+            );
+            assert_eq!(
+                indices, unpacked,
+                "Roundtrip failed for {} bits: {:?} != {:?}",
+                bits, indices, unpacked
+            );
         }
     }
 
@@ -945,7 +956,11 @@ mod tests {
             let mut unpacked = [0u8; 16];
             unpack_pixels(&packed, bits, &mut unpacked);
 
-            assert_eq!(indices, unpacked, "Max value roundtrip failed for {} bits", bits);
+            assert_eq!(
+                indices, unpacked,
+                "Max value roundtrip failed for {} bits",
+                bits
+            );
         }
     }
 
@@ -968,8 +983,16 @@ mod tests {
                 .expect("Compression failed");
 
             // Verify header
-            assert_eq!(compressed[0] & 0x7f, error_limit, "Error limit mismatch in header");
-            assert_eq!(compressed[0] & 0x80, 0, "Compressed header flag should be 0");
+            assert_eq!(
+                compressed[0] & 0x7f,
+                error_limit,
+                "Error limit mismatch in header"
+            );
+            assert_eq!(
+                compressed[0] & 0x80,
+                0,
+                "Compressed header flag should be 0"
+            );
 
             // Decompress
             let mut decompressed = vec![0u8; (width * height) as usize];
@@ -982,7 +1005,11 @@ mod tests {
                 assert!(
                     diff <= error_limit as i32,
                     "Pixel {} error {} exceeds limit {} (original={}, decompressed={})",
-                    i, diff, error_limit, image[i], decompressed[i]
+                    i,
+                    diff,
+                    error_limit,
+                    image[i],
+                    decompressed[i]
                 );
             }
         }
@@ -995,12 +1022,16 @@ mod tests {
         let height = 4u32;
         let image = vec![128u8; (width * height) as usize];
 
-        let compressed = compress_tile_block(&image, width, height, width, 16)
-            .expect("Compression failed");
+        let compressed =
+            compress_tile_block(&image, width, height, width, 16).expect("Compression failed");
 
         // For a uniform block, we should have minimal pixel data
         // Header (1 byte) + min stream (1 byte) + dist stream (1 byte) + no pixel data
-        assert_eq!(compressed.len(), 3, "Uniform block should compress to 3 bytes");
+        assert_eq!(
+            compressed.len(),
+            3,
+            "Uniform block should compress to 3 bytes"
+        );
 
         // Verify dist is 0
         assert_eq!(compressed[2], 0, "Dist should be 0 for uniform block");
@@ -1026,8 +1057,8 @@ mod tests {
         image[0] = 0;
         image[15] = 255;
         // Fill rest with gradient
-        for i in 1..15 {
-            image[i] = (i * 17) as u8;
+        for (i, pixel) in image.iter_mut().enumerate().take(15).skip(1) {
+            *pixel = (i * 17) as u8;
         }
 
         for error_limit in [2u8, 4, 8, 16] {
@@ -1044,7 +1075,11 @@ mod tests {
                 assert!(
                     diff <= error_limit as i32 + 1, // +1 for rounding
                     "Pixel {} error {} exceeds limit {} (original={}, decompressed={})",
-                    i, diff, error_limit, image[i], decompressed[i]
+                    i,
+                    diff,
+                    error_limit,
+                    image[i],
+                    decompressed[i]
                 );
             }
         }

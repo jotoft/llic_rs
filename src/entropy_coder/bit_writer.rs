@@ -38,8 +38,12 @@ impl BitWriter {
     #[inline]
     pub fn write_bits(&mut self, value: u32, num_bits: u8) {
         debug_assert!(num_bits <= 32);
-        debug_assert!(num_bits == 0 || value >> (32 - num_bits) << (32 - num_bits) == value,
-            "value has bits beyond num_bits: value={:#x}, num_bits={}", value, num_bits);
+        debug_assert!(
+            num_bits == 0 || value >> (32 - num_bits) << (32 - num_bits) == value,
+            "value has bits beyond num_bits: value={:#x}, num_bits={}",
+            value,
+            num_bits
+        );
 
         if num_bits == 0 {
             return;
@@ -60,7 +64,7 @@ impl BitWriter {
     #[inline]
     pub fn write_packed(&mut self, packed: u32) {
         let num_bits = (packed & 0x3F) as u8;
-        let code = packed & !0x3F;  // Clear the length bits, keep code MSB-justified
+        let code = packed & !0x3F; // Clear the length bits, keep code MSB-justified
         self.write_bits(code, num_bits);
     }
 

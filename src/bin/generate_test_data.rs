@@ -24,7 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if llic_compress exists
     if !llic_compress.exists() {
-        eprintln!("Error: llic_compress not found at {}", llic_compress.display());
+        eprintln!(
+            "Error: llic_compress not found at {}",
+            llic_compress.display()
+        );
         eprintln!("Please build the C++ LLIC library first:");
         eprintln!("  cd llic/build && cmake .. && make");
         std::process::exit(1);
@@ -56,7 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .output()?;
 
             if !status.status.success() {
-                eprintln!("Warning: Failed to compress {} at quality {}", base, quality);
+                eprintln!(
+                    "Warning: Failed to compress {} at quality {}",
+                    base, quality
+                );
                 continue;
             }
 
@@ -98,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn count_files(dir: &Path, ext: &str) -> Result<usize, std::io::Error> {
     Ok(fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |e| e == ext))
+        .filter(|e| e.path().extension().is_some_and(|e| e == ext))
         .count())
 }
 

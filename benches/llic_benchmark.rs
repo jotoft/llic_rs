@@ -1,7 +1,10 @@
 //! Criterion benchmarks comparing Rust and C++ LLIC implementations.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use llic::{LlicContext, Quality, ffi::{CppLlicContext, LlicQuality, LlicMode}};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use llic::{
+    ffi::{CppLlicContext, LlicMode, LlicQuality},
+    LlicContext, Quality,
+};
 
 /// Generate a gradient test image of the specified size
 fn generate_gradient_image(width: u32, height: u32) -> Vec<u8> {
@@ -95,7 +98,8 @@ fn benchmark_decompression(c: &mut Criterion) {
             }
         };
 
-        let compressed = match cpp_ctx.compress(&original, LlicQuality::Lossless, LlicMode::Default) {
+        let compressed = match cpp_ctx.compress(&original, LlicQuality::Lossless, LlicMode::Default)
+        {
             Ok(data) => data,
             Err(e) => {
                 eprintln!("Failed to compress with C++ for {}: {:?}", label, e);
@@ -112,7 +116,9 @@ fn benchmark_decompression(c: &mut Criterion) {
             |b, compressed| {
                 let mut output = vec![0u8; pixel_count];
                 b.iter(|| {
-                    rust_ctx.decompress_gray8(black_box(compressed), black_box(&mut output)).unwrap();
+                    rust_ctx
+                        .decompress_gray8(black_box(compressed), black_box(&mut output))
+                        .unwrap();
                 });
             },
         );
@@ -157,12 +163,14 @@ fn benchmark_compression(c: &mut Criterion) {
             &image,
             |b, image| {
                 b.iter(|| {
-                    rust_ctx.compress_gray8(
-                        black_box(image),
-                        Quality::Lossless,
-                        llic::Mode::Default,
-                        black_box(&mut rust_output),
-                    ).unwrap()
+                    rust_ctx
+                        .compress_gray8(
+                            black_box(image),
+                            Quality::Lossless,
+                            llic::Mode::Default,
+                            black_box(&mut rust_output),
+                        )
+                        .unwrap()
                 });
             },
         );
@@ -181,7 +189,9 @@ fn benchmark_compression(c: &mut Criterion) {
             &image,
             |b, image| {
                 b.iter(|| {
-                    cpp_ctx.compress(black_box(image), LlicQuality::Lossless, LlicMode::Default).unwrap();
+                    cpp_ctx
+                        .compress(black_box(image), LlicQuality::Lossless, LlicMode::Default)
+                        .unwrap();
                 });
             },
         );
@@ -192,7 +202,9 @@ fn benchmark_compression(c: &mut Criterion) {
             &image,
             |b, image| {
                 b.iter(|| {
-                    cpp_ctx.compress(black_box(image), LlicQuality::High, LlicMode::Default).unwrap();
+                    cpp_ctx
+                        .compress(black_box(image), LlicQuality::High, LlicMode::Default)
+                        .unwrap();
                 });
             },
         );
@@ -222,24 +234,24 @@ fn benchmark_roundtrip(c: &mut Criterion) {
         let mut compressed_buf = vec![0u8; rust_ctx.compressed_buffer_size()];
         let mut decompressed = vec![0u8; pixel_count];
 
-        group.bench_with_input(
-            BenchmarkId::new("rust", label),
-            &image,
-            |b, image| {
-                b.iter(|| {
-                    let compressed_size = rust_ctx.compress_gray8(
+        group.bench_with_input(BenchmarkId::new("rust", label), &image, |b, image| {
+            b.iter(|| {
+                let compressed_size = rust_ctx
+                    .compress_gray8(
                         black_box(image),
                         Quality::Lossless,
                         llic::Mode::Default,
                         black_box(&mut compressed_buf),
-                    ).unwrap();
-                    rust_ctx.decompress_gray8(
+                    )
+                    .unwrap();
+                rust_ctx
+                    .decompress_gray8(
                         black_box(&compressed_buf[..compressed_size]),
                         black_box(&mut decompressed),
-                    ).unwrap()
-                });
-            },
-        );
+                    )
+                    .unwrap()
+            });
+        });
 
         // Benchmark C++ roundtrip
         let mut cpp_ctx = match CppLlicContext::new(width, height, 1) {
@@ -250,16 +262,14 @@ fn benchmark_roundtrip(c: &mut Criterion) {
             }
         };
 
-        group.bench_with_input(
-            BenchmarkId::new("cpp", label),
-            &image,
-            |b, image| {
-                b.iter(|| {
-                    let compressed = cpp_ctx.compress(black_box(image), LlicQuality::Lossless, LlicMode::Default).unwrap();
-                    cpp_ctx.decompress(black_box(&compressed)).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("cpp", label), &image, |b, image| {
+            b.iter(|| {
+                let compressed = cpp_ctx
+                    .compress(black_box(image), LlicQuality::Lossless, LlicMode::Default)
+                    .unwrap();
+                cpp_ctx.decompress(black_box(&compressed)).unwrap()
+            });
+        });
     }
 
     group.finish();
@@ -321,7 +331,9 @@ fn benchmark_real_file(c: &mut Criterion) {
         group.bench_function("rust_decompress_patterns_64x64", |b| {
             let mut output = vec![0u8; pixel_count];
             b.iter(|| {
-                rust_ctx.decompress_gray8(black_box(&compressed), black_box(&mut output)).unwrap();
+                rust_ctx
+                    .decompress_gray8(black_box(&compressed), black_box(&mut output))
+                    .unwrap();
             });
         });
 
@@ -343,18 +355,26 @@ fn benchmark_real_file(c: &mut Criterion) {
 
         group.bench_function("rust_compress_patterns_64x64", |b| {
             b.iter(|| {
-                rust_ctx.compress_gray8(
-                    black_box(&image_data),
-                    Quality::Lossless,
-                    llic::Mode::Default,
-                    black_box(&mut rust_output),
-                ).unwrap()
+                rust_ctx
+                    .compress_gray8(
+                        black_box(&image_data),
+                        Quality::Lossless,
+                        llic::Mode::Default,
+                        black_box(&mut rust_output),
+                    )
+                    .unwrap()
             });
         });
 
         group.bench_function("cpp_compress_patterns_64x64", |b| {
             b.iter(|| {
-                cpp_ctx.compress(black_box(&image_data), LlicQuality::Lossless, LlicMode::Default).unwrap();
+                cpp_ctx
+                    .compress(
+                        black_box(&image_data),
+                        LlicQuality::Lossless,
+                        LlicMode::Default,
+                    )
+                    .unwrap();
             });
         });
     }
@@ -366,10 +386,7 @@ fn benchmark_compression_ratio(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression_ratio");
 
     // Test different image types to compare compression characteristics
-    let sizes: &[(u32, u32, &str)] = &[
-        (256, 256, "256x256"),
-        (512, 512, "512x512"),
-    ];
+    let sizes: &[(u32, u32, &str)] = &[(256, 256, "256x256"), (512, 512, "512x512")];
 
     for &(width, height, label) in sizes {
         let pixel_count = (width * height) as usize;
@@ -386,12 +403,14 @@ fn benchmark_compression_ratio(c: &mut Criterion) {
             &gradient_image,
             |b, image| {
                 b.iter(|| {
-                    rust_ctx.compress_gray8(
-                        black_box(image),
-                        Quality::Lossless,
-                        llic::Mode::Default,
-                        black_box(&mut rust_output),
-                    ).unwrap()
+                    rust_ctx
+                        .compress_gray8(
+                            black_box(image),
+                            Quality::Lossless,
+                            llic::Mode::Default,
+                            black_box(&mut rust_output),
+                        )
+                        .unwrap()
                 });
             },
         );
@@ -404,12 +423,14 @@ fn benchmark_compression_ratio(c: &mut Criterion) {
             &pattern_image,
             |b, image| {
                 b.iter(|| {
-                    rust_ctx.compress_gray8(
-                        black_box(image),
-                        Quality::Lossless,
-                        llic::Mode::Default,
-                        black_box(&mut rust_output),
-                    ).unwrap()
+                    rust_ctx
+                        .compress_gray8(
+                            black_box(image),
+                            Quality::Lossless,
+                            llic::Mode::Default,
+                            black_box(&mut rust_output),
+                        )
+                        .unwrap()
                 });
             },
         );
@@ -422,12 +443,14 @@ fn benchmark_compression_ratio(c: &mut Criterion) {
             &noise_image,
             |b, image| {
                 b.iter(|| {
-                    rust_ctx.compress_gray8(
-                        black_box(image),
-                        Quality::Lossless,
-                        llic::Mode::Default,
-                        black_box(&mut rust_output),
-                    ).unwrap()
+                    rust_ctx
+                        .compress_gray8(
+                            black_box(image),
+                            Quality::Lossless,
+                            llic::Mode::Default,
+                            black_box(&mut rust_output),
+                        )
+                        .unwrap()
                 });
             },
         );

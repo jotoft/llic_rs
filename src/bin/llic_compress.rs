@@ -4,7 +4,7 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 use image::{GrayImage, ImageReader};
-use llic::{LlicContext, Mode, Quality, pgm::Pgm};
+use llic::{pgm::Pgm, LlicContext, Mode, Quality};
 
 /// LLIC container format:
 /// - Magic: "LLIC" (4 bytes)
@@ -86,7 +86,12 @@ fn compress(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>>
 
     // Load input image
     let (width, height, image_data) = load_grayscale_image(input)?;
-    println!("Loaded image: {}x{} ({} bytes)", width, height, image_data.len());
+    println!(
+        "Loaded image: {}x{} ({} bytes)",
+        width,
+        height,
+        image_data.len()
+    );
 
     // Create compression context
     let context = LlicContext::new(width, height, width, None)?;
@@ -96,8 +101,12 @@ fn compress(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>>
     let mut compressed = vec![0u8; max_size];
 
     // Compress
-    let compressed_size =
-        context.compress_gray8(&image_data, Quality::Lossless, Mode::Default, &mut compressed)?;
+    let compressed_size = context.compress_gray8(
+        &image_data,
+        Quality::Lossless,
+        Mode::Default,
+        &mut compressed,
+    )?;
     compressed.truncate(compressed_size);
 
     let ratio = compressed_size as f64 / image_data.len() as f64;

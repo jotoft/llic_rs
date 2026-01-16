@@ -79,7 +79,11 @@ mod patterns {
             for x in 0..width {
                 let block_x = x / block_size;
                 let block_y = y / block_size;
-                data.push(if (block_x + block_y) % 2 == 0 { 255 } else { 0 });
+                data.push(if (block_x + block_y).is_multiple_of(2) {
+                    255
+                } else {
+                    0
+                });
             }
         }
         data
@@ -128,7 +132,7 @@ mod patterns {
         for _y in 0..height {
             for x in 0..width {
                 let stripe = x / stripe_width;
-                data.push(if stripe % 2 == 0 { 255 } else { 0 });
+                data.push(if stripe.is_multiple_of(2) { 255 } else { 0 });
             }
         }
         data
@@ -155,7 +159,7 @@ mod patterns {
     pub fn radial(width: usize, height: usize) -> Vec<u8> {
         let center_x = width as f32 / 2.0;
         let center_y = height as f32 / 2.0;
-        let max_dist = ((center_x * center_x + center_y * center_y) as f32).sqrt();
+        let max_dist = (center_x * center_x + center_y * center_y).sqrt();
         let mut data = Vec::with_capacity(width * height);
         for y in 0..height {
             for x in 0..width {
@@ -403,6 +407,8 @@ fn test_roundtrip_all_values() {
 #[test]
 fn test_roundtrip_alternating_extremes() {
     // Alternating 0 and 255
-    let input: Vec<u8> = (0..64 * 64).map(|i| if i % 2 == 0 { 0 } else { 255 }).collect();
+    let input: Vec<u8> = (0..64 * 64)
+        .map(|i| if i % 2 == 0 { 0 } else { 255 })
+        .collect();
     roundtrip_test(&input, 64, 64, "alternating_extremes");
 }

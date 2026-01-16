@@ -33,9 +33,9 @@ fn main() {
         .std("c++11")
         .opt_level(3)
         .define("NDEBUG", None)
-        .define("LLIC_STATIC_DEFINE", None)  // Use static library macros
+        .define("LLIC_STATIC_DEFINE", None) // Use static library macros
         .include(&llic_src)
-        .include(&llic_build)  // For llic_export.h
+        .include(&llic_build) // For llic_export.h
         .include(llic_src.join("entropycoder"))
         .file(llic_src.join("llic.cpp"))
         .file(llic_src.join("entropycoder/u8v1_compress.cpp"))

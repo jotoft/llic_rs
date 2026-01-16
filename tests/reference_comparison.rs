@@ -14,13 +14,11 @@ fn read_pgm(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
     let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
     // Find header end (after "P5\nwidth height\n255\n")
-    let mut pos = 0;
-
     // Skip "P5"
     if data.len() < 3 || &data[0..2] != b"P5" {
         return Err(format!("Not a P5 PGM file: {}", path.display()));
     }
-    pos = 2;
+    let mut pos = 2;
 
     // Skip whitespace
     while pos < data.len() && (data[pos] == b' ' || data[pos] == b'\n' || data[pos] == b'\r') {
@@ -116,10 +114,14 @@ fn read_llic_container(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
         (0, first_newline)
     };
 
-    let dims_line = std::str::from_utf8(&data[dims_start..dims_end]).map_err(|_| "Invalid dimensions")?;
+    let dims_line =
+        std::str::from_utf8(&data[dims_start..dims_end]).map_err(|_| "Invalid dimensions")?;
     let parts: Vec<&str> = dims_line.split_whitespace().collect();
     if parts.len() != 2 {
-        return Err(format!("Invalid header format: expected 'width height', got '{}'", dims_line));
+        return Err(format!(
+            "Invalid header format: expected 'width height', got '{}'",
+            dims_line
+        ));
     }
 
     let width: u32 = parts[0].parse().map_err(|_| "Invalid width")?;
@@ -148,16 +150,18 @@ fn read_llic_container(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
 /// Test a single pattern at a specific quality level
 fn test_pattern(pattern_name: &str, quality: u8) -> Result<(), String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let compressed_path =
-        Path::new(manifest_dir).join(format!("test_data/compressed/{}_q{}.llic", pattern_name, quality));
-    let reference_path =
-        Path::new(manifest_dir).join(format!("test_data/reference/{}_q{}.pgm", pattern_name, quality));
+    let compressed_path = Path::new(manifest_dir).join(format!(
+        "test_data/compressed/{}_q{}.llic",
+        pattern_name, quality
+    ));
+    let reference_path = Path::new(manifest_dir).join(format!(
+        "test_data/reference/{}_q{}.pgm",
+        pattern_name, quality
+    ));
 
     // Skip if files don't exist (test data not generated)
     if !compressed_path.exists() || !reference_path.exists() {
-        return Err(format!(
-            "Test data not found. Run: cargo run --bin generate_test_data"
-        ));
+        return Err("Test data not found. Run: cargo run --bin generate_test_data".to_string());
     }
 
     // Read compressed LLIC file
@@ -342,8 +346,8 @@ fn test_lossy_compression_roundtrip() {
         (Quality::Low, 16),
     ] {
         // Compress with Rust
-        let context = LlicContext::new(width, height, width, Some(1))
-            .expect("Failed to create context");
+        let context =
+            LlicContext::new(width, height, width, Some(1)).expect("Failed to create context");
 
         let mut compressed = vec![0u8; context.compressed_buffer_size()];
         let compressed_size = context
@@ -397,7 +401,10 @@ fn test_lossy_compression_format_match() {
     }
 
     if !cpp_tool.exists() {
-        eprintln!("C++ tool not found: {:?}. Run: cd llic/build && make llic_compress", cpp_tool);
+        eprintln!(
+            "C++ tool not found: {:?}. Run: cd llic/build && make llic_compress",
+            cpp_tool
+        );
         return;
     }
 
@@ -411,8 +418,8 @@ fn test_lossy_compression_format_match() {
     let cpp_quality_level = 2; // Corresponds to Quality::High
 
     // Compress with Rust
-    let context = LlicContext::new(width, height, width, Some(1))
-        .expect("Failed to create context");
+    let context =
+        LlicContext::new(width, height, width, Some(1)).expect("Failed to create context");
 
     let mut rust_compressed = vec![0u8; context.compressed_buffer_size()];
     let rust_size = context
@@ -434,12 +441,15 @@ fn test_lossy_compression_format_match() {
         .expect("Failed to run C++ tool");
 
     if !output.status.success() {
-        eprintln!("C++ tool failed: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "C++ tool failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
 
     // Read C++ output (skip container header)
-    let cpp_data = fs::read(&cpp_output_path).expect("Failed to read C++ output");
+    let _cpp_data = fs::read(&cpp_output_path).expect("Failed to read C++ output");
     let (cpp_width, cpp_height, cpp_compressed) =
         read_llic_container(&cpp_output_path).expect("Failed to parse C++ output");
 
@@ -458,7 +468,10 @@ fn test_lossy_compression_format_match() {
     let cpp_tile_based = cpp_compressed[2];
     let cpp_mode = cpp_compressed[3];
 
-    println!("C++ format: version={}, num_blocks={}, tile_based={}, mode={}", cpp_version, cpp_num_blocks, cpp_tile_based, cpp_mode);
+    println!(
+        "C++ format: version={}, num_blocks={}, tile_based={}, mode={}",
+        cpp_version, cpp_num_blocks, cpp_tile_based, cpp_mode
+    );
 
     // Block sizes start at offset 4 for format v4
     let mut cpp_block_sizes = Vec::new();
@@ -476,7 +489,11 @@ fn test_lossy_compression_format_match() {
 
     // Find first non-zero block (C++ may use multiple threads)
     let first_block_idx = cpp_block_sizes.iter().position(|&s| s > 0).unwrap_or(0);
-    let cpp_block_start = pos + cpp_block_sizes[..first_block_idx].iter().map(|&s| s as usize).sum::<usize>();
+    let cpp_block_start = pos
+        + cpp_block_sizes[..first_block_idx]
+            .iter()
+            .map(|&s| s as usize)
+            .sum::<usize>();
     let cpp_block_size = cpp_block_sizes[first_block_idx] as usize;
     let cpp_block_data = &cpp_compressed[cpp_block_start..cpp_block_start + cpp_block_size];
 
@@ -520,12 +537,16 @@ fn test_lossy_compression_format_match() {
         assert!(
             rust_diff <= error_limit + 1,
             "Rust pixel {} error {} exceeds limit {}",
-            i, rust_diff, error_limit
+            i,
+            rust_diff,
+            error_limit
         );
         assert!(
             cpp_diff <= error_limit + 1,
             "C++ pixel {} error {} exceeds limit {}",
-            i, cpp_diff, error_limit
+            i,
+            cpp_diff,
+            error_limit
         );
     }
 

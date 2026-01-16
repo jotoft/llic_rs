@@ -3,13 +3,13 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use llic::{decode_file, encode_file, CompressionQuality, CompressionMode};
+use llic::{decode_file, encode_file, CompressionMode, CompressionQuality};
 
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  llic_rs2 decode <input.llic> <output.pgm>");
     eprintln!("  llic_rs2 encode <input.pgm> <output.llic> [quality] [mode]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Quality options: lossless (default), very_high, high, medium, low");
     eprintln!("Mode options: default (default), fast");
 }
@@ -37,15 +37,13 @@ fn main() {
     }
 
     match command.as_str() {
-        "decode" => {
-            match decode_file(input_path, output_path) {
-                Ok(_) => {},
-                Err(e) => {
-                    eprintln!("Error decoding file: {}", e);
-                    process::exit(1);
-                }
+        "decode" => match decode_file(input_path, output_path) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error decoding file: {}", e);
+                process::exit(1);
             }
-        }
+        },
         "encode" => {
             let quality = if args.len() > 4 {
                 match args[4].as_str() {
@@ -79,7 +77,7 @@ fn main() {
             };
 
             match encode_file(input_path, output_path, quality, mode) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     eprintln!("Error encoding file: {}", e);
                     process::exit(1);

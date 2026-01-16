@@ -113,9 +113,8 @@ impl CppLlicContext {
         let max_size = self.compressed_buffer_size();
         let mut dst = vec![0u8; max_size];
 
-        let compressed_size = unsafe {
-            llic_compressGray8(self.ctx, src.as_ptr(), quality, mode, dst.as_mut_ptr())
-        };
+        let compressed_size =
+            unsafe { llic_compressGray8(self.ctx, src.as_ptr(), quality, mode, dst.as_mut_ptr()) };
 
         if compressed_size == 0 {
             return Err(unsafe { llic_getLastError(self.ctx) });
@@ -126,7 +125,10 @@ impl CppLlicContext {
     }
 
     /// Decompress LLIC data
-    pub fn decompress(&mut self, src: &[u8]) -> Result<(Vec<u8>, LlicQuality, LlicMode), LlicError> {
+    pub fn decompress(
+        &mut self,
+        src: &[u8],
+    ) -> Result<(Vec<u8>, LlicQuality, LlicMode), LlicError> {
         let output_size = (self.width * self.height) as usize;
         let mut dst = vec![0u8; output_size];
         let mut quality = LlicQuality::Lossless;
