@@ -226,6 +226,8 @@ pub fn get_tile_metadata(
 
     let num_blocks = compressed_data[1] as usize;
     let tile_based = compressed_data[2] != 0;
+    let mode = compressed_data[3];
+    let use_dynamic_predictor = mode == 2; // Mode::Dynamic = 2
 
     if !tile_based {
         return Err(JsError::new(
@@ -277,8 +279,9 @@ pub fn get_tile_metadata(
     }
 
     // Extract metadata using the lossy module
-    let metadata = crate::lossy::extract_tile_metadata(tile_block_data, width, height)
-        .map_err(|e| JsError::new(&format!("Failed to extract tile metadata: {}", e)))?;
+    let metadata =
+        crate::lossy::extract_tile_metadata(tile_block_data, width, height, use_dynamic_predictor)
+            .map_err(|e| JsError::new(&format!("Failed to extract tile metadata: {}", e)))?;
 
     // Flatten to [min, dist, bits, min, dist, bits, ...]
     let mut result = Vec::with_capacity(metadata.len() * 3);

@@ -764,6 +764,7 @@ pub fn extract_tile_metadata(
     src_data: &[u8],
     width: u32,
     height: u32,
+    use_dynamic_predictor: bool,
 ) -> Result<Vec<(u8, u8, u8)>> {
     if src_data.is_empty() {
         return Err(LlicError::InvalidData);
@@ -797,15 +798,25 @@ pub fn extract_tile_metadata(
         let header_height = (height / 4) * 2;
         let header_decompressed_size = (header_width * header_height) as usize;
 
-        // Decompress the header
+        // Decompress the header (using dynamic predictor if requested)
         let mut header_buffer = vec![0u8; header_decompressed_size];
-        crate::entropy_coder::decompress(
-            &src_data[5..5 + header_size],
-            header_width,
-            header_height,
-            header_width,
-            &mut header_buffer,
-        )?;
+        if use_dynamic_predictor {
+            crate::entropy_coder::decompress_dynamic(
+                &src_data[5..5 + header_size],
+                header_width,
+                header_height,
+                header_width,
+                &mut header_buffer,
+            )?;
+        } else {
+            crate::entropy_coder::decompress(
+                &src_data[5..5 + header_size],
+                header_width,
+                header_height,
+                header_width,
+                &mut header_buffer,
+            )?;
+        }
 
         // Split into min and dist streams
         let half = header_decompressed_size / 2;
