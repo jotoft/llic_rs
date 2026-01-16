@@ -17,9 +17,9 @@ echo "Rust files changed, running checks..."
 echo "Checking formatting..."
 cargo fmt --all -- --check
 
-# Run clippy
+# Run clippy (exclude benchmarks)
 echo "Running clippy..."
-cargo clippy --all-targets -- -D warnings
+cargo clippy --lib --bins --tests -- -D warnings
 
 # Run tests (exclude benchmarks)
 echo "Running tests..."

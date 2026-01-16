@@ -178,12 +178,15 @@ impl LlicContext {
             .filter(|(_, &size)| size > 0)
             .collect();
 
-        // Choose decompression algorithm based on tile_based flag
+        // Choose decompression algorithm based on tile_based flag and mode
+        // For Dynamic mode with entropy coding, use the dynamic decompressor
         type DecompressFn = fn(&[u8], u32, u32, u32, &mut [u8]) -> Result<()>;
         let decompress_block: DecompressFn = if tile_based {
-            |data, w, h, bpl, dst| lossy::decompress_tile_block(data, w, h, bpl, dst)
+            lossy::decompress_tile_block
+        } else if mode == Mode::Dynamic {
+            entropy_coder::decompress_dynamic
         } else {
-            |data, w, h, bpl, dst| entropy_coder::decompress(data, w, h, bpl, dst)
+            entropy_coder::decompress
         };
 
         if non_zero_blocks.len() > 1 {
@@ -313,8 +316,17 @@ impl LlicContext {
 
         if use_entropy {
             // Legacy entropy-coded lossless path
-            let compressed =
-                entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?;
+            // Use dynamic predictor when mode is Dynamic
+            let compressed = if mode == Mode::Dynamic {
+                entropy_coder::compress_dynamic(
+                    src_graymap,
+                    self.width,
+                    self.height,
+                    self.bytes_per_line,
+                )?
+            } else {
+                entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?
+            };
 
             // Build LLIC v4 format header for entropy-coded
             // Format: [version=4][num_blocks=1][tile_based=0][mode][block_size:u32 LE][data]
@@ -343,7 +355,7 @@ impl LlicContext {
             // Tile-based compression (all qualities including lossless)
             // Determine if we should compress headers based on mode
             // Fast mode: no header compression
-            // Default/Dynamic: compress headers
+            // Default/Dynamic: compress headers (Dynamic uses adaptive predictor in entropy coder)
             let compress_header = mode != Mode::Fast;
 
             let compressed = lossy::compress_tile_block(

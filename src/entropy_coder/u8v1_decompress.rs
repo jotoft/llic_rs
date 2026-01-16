@@ -2,6 +2,30 @@ use super::bit_reader::BitReader64;
 use super::tables::DECOMPRESS_TABLE;
 use crate::{LlicError, Result};
 
+/// MED (Median Edge Detector) predictor used in JPEG-LS and Dynamic mode.
+#[inline]
+fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
+    let a = left as i32;
+    let b = top as i32;
+    let c = top_left as i32;
+    let min_ab = a.min(b);
+    let max_ab = a.max(b);
+
+    if c >= max_ab {
+        min_ab as u8
+    } else if c <= min_ab {
+        max_ab as u8
+    } else {
+        (a + b - c) as u8
+    }
+}
+
+/// Align a value up to the next multiple of 4.
+#[inline]
+fn align_to_4(value: usize) -> usize {
+    (value + 3) & !3
+}
+
 /// Decompresses data encoded with the u8v1 entropy coder (optimized path)
 pub fn decompress(
     src_data: &[u8],
@@ -74,6 +98,108 @@ fn decompress_fast(
             let top = p0[x];
             let avg = ((left as u16 + top as u16) >> 1) as u8;
             p1[x] = buf[x].wrapping_add(avg);
+        }
+    }
+
+    Ok(())
+}
+
+/// Decompresses data encoded with the u8v1 entropy coder with dynamic predictor.
+///
+/// Dynamic mode uses a per-row predictor bitmap to choose between average and MED predictors.
+///
+/// # Arguments
+/// * `src_data` - Compressed data with predictor bitmap at the start
+/// * `width` - Image width in pixels
+/// * `height` - Image height in pixels
+/// * `bytes_per_line` - Stride between rows in output
+/// * `dst_image` - Output buffer for decompressed pixels
+pub fn decompress_dynamic(
+    src_data: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst_image: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(LlicError::InvalidArgument);
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let bytes_per_line = bytes_per_line as usize;
+
+    // Assert bounds upfront
+    assert!(dst_image.len() >= height * bytes_per_line);
+    assert!(bytes_per_line >= width);
+
+    // Calculate predictor bitmap size
+    let predictor_bytes = height.div_ceil(8);
+    let predictor_storage_bytes = align_to_4(predictor_bytes);
+
+    if src_data.len() < predictor_storage_bytes {
+        return Err(LlicError::InvalidData);
+    }
+
+    // Extract predictor bitmap
+    let predictor_bits = &src_data[..predictor_storage_bytes];
+
+    // Compressed data starts after predictor bitmap
+    let compressed_data = &src_data[predictor_storage_bytes..];
+
+    let mut decoder = FastDecoder::new(compressed_data);
+    let mut row_buffer = vec![0u8; width + 256];
+
+    // Decompress first row
+    let mut num_filled = decoder.decompress_row(&mut row_buffer, 0, width);
+
+    // First row: Horizontal delta only (same as non-dynamic)
+    {
+        let dst = &mut dst_image[..width];
+        let buf = &row_buffer[..width];
+        dst[0] = buf[0];
+        for x in 1..width {
+            dst[x] = buf[x].wrapping_add(dst[x - 1]);
+        }
+    }
+
+    // Remaining rows: Use predictor based on bitmap
+    for y in 1..height {
+        let row_offset = y * bytes_per_line;
+        let prev_row_offset = (y - 1) * bytes_per_line;
+
+        num_filled = decoder.decompress_row(&mut row_buffer, num_filled, width);
+
+        // Check if this row uses MED predictor
+        let use_med = (predictor_bits[y / 8] >> (y % 8)) & 1 != 0;
+
+        let buf = &row_buffer[..width];
+
+        // Use split_at_mut to get non-overlapping mutable access
+        let (prev_rows, curr_row_and_rest) = dst_image.split_at_mut(row_offset);
+        let p0 = &prev_rows[prev_row_offset..prev_row_offset + width];
+        let p1 = &mut curr_row_and_rest[..width];
+
+        // First pixel uses only top predictor (same for both modes)
+        p1[0] = buf[0].wrapping_add(p0[0]);
+
+        if use_med {
+            // MED predictor for remaining pixels
+            for x in 1..width {
+                let left = p1[x - 1];
+                let top = p0[x];
+                let top_left = p0[x - 1];
+                let predictor = med_predictor(left, top, top_left);
+                p1[x] = buf[x].wrapping_add(predictor);
+            }
+        } else {
+            // Average predictor for remaining pixels
+            for x in 1..width {
+                let left = p1[x - 1];
+                let top = p0[x];
+                let avg = ((left as u16 + top as u16) >> 1) as u8;
+                p1[x] = buf[x].wrapping_add(avg);
+            }
         }
     }
 

@@ -427,6 +427,7 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
 /// * `rows` - Number of rows to compress (must be multiple of 4)
 /// * `bytes_per_line` - Stride of the source image
 /// * `error_limit` - Quality level (2, 4, 8, or 16)
+/// * `compress_header` - Whether to attempt header compression
 ///
 /// # Returns
 /// Compressed data as a Vec<u8>
