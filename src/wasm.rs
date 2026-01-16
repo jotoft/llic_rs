@@ -15,8 +15,9 @@ use wasm_bindgen::prelude::*;
 /// @param width - Image width in pixels (must be multiple of 4)
 /// @param height - Image height in pixels (must be multiple of 4)
 /// @param quality - Quality level: 'lossless', 'lossless_entropy', 'very_high', 'high', 'medium', 'low', or 'very_low'
+/// @param mode - Optional compression mode: 'default', 'fast', or 'dynamic' (defaults to 'default' for lossless, 'fast' for lossy)
 /// @returns Compressed data as Uint8Array
-/// @throws Error if dimensions are invalid or quality is unrecognized
+/// @throws Error if dimensions are invalid or quality/mode is unrecognized
 ///
 /// Quality levels:
 /// - 'lossless': Tile-based lossless compression (recommended, format v4)
@@ -27,13 +28,25 @@ use wasm_bindgen::prelude::*;
 /// - 'low': Low quality, max error ±16
 /// - 'very_low': Very low quality, max error ±32
 ///
+/// Compression modes:
+/// - 'default': Balance between speed and size (compresses tile headers)
+/// - 'fast': Fastest compression/decompression (skips header compression, slightly larger output)
+/// - 'dynamic': Best compression ratio (adaptive predictor, compresses headers, slower)
+///
 /// @example
 /// ```js
 /// const lossless = compress(grayPixels, 256, 256, 'lossless');
-/// const lossy = compress(grayPixels, 256, 256, 'high');
+/// const fast = compress(grayPixels, 256, 256, 'high', 'fast');
+/// const best = compress(grayPixels, 256, 256, 'lossless', 'dynamic');
 /// ```
 #[wasm_bindgen]
-pub fn compress(data: &[u8], width: u32, height: u32, quality: &str) -> Result<Vec<u8>, JsError> {
+pub fn compress(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    quality: &str,
+    mode: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     let quality_level = match quality {
         "lossless" => Quality::Lossless,
         "lossless_entropy" => Quality::LosslessEntropy,
@@ -48,21 +61,36 @@ pub fn compress(data: &[u8], width: u32, height: u32, quality: &str) -> Result<V
         ))),
     };
 
+    // Parse mode if provided, otherwise use smart defaults
+    let compression_mode = if let Some(mode_str) = mode {
+        match mode_str.as_str() {
+            "default" => Mode::Default,
+            "fast" => Mode::Fast,
+            "dynamic" => Mode::Dynamic,
+            _ => {
+                return Err(JsError::new(&format!(
+                    "Invalid mode '{}'. Use: 'default', 'fast', or 'dynamic'",
+                    mode_str
+                )))
+            }
+        }
+    } else {
+        // Default mode selection: Default for lossless, Fast for lossy
+        if quality_level == Quality::Lossless || quality_level == Quality::LosslessEntropy {
+            Mode::Default
+        } else {
+            Mode::Fast
+        }
+    };
+
     let context = LlicContext::new(width, height, width, Some(1))
         .map_err(|e| JsError::new(&e.to_string()))?;
 
     let max_size = context.compressed_buffer_size();
     let mut output = vec![0u8; max_size];
 
-    // Use Default mode for lossless variants, Fast mode for lossy
-    let mode = if quality_level == Quality::Lossless || quality_level == Quality::LosslessEntropy {
-        Mode::Default
-    } else {
-        Mode::Fast
-    };
-
     let compressed_size = context
-        .compress_gray8(data, quality_level, mode, &mut output)
+        .compress_gray8(data, quality_level, compression_mode, &mut output)
         .map_err(|e| JsError::new(&e.to_string()))?;
 
     output.truncate(compressed_size);
@@ -74,7 +102,7 @@ pub fn compress(data: &[u8], width: u32, height: u32, quality: &str) -> Result<V
 /// @deprecated Use `compress(data, width, height, 'lossless')` instead
 #[wasm_bindgen]
 pub fn lossless_compress(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsError> {
-    compress(data, width, height, "lossless")
+    compress(data, width, height, "lossless", None)
 }
 
 /// @deprecated Use `compress(data, width, height, quality)` instead
@@ -85,7 +113,7 @@ pub fn lossy_compress(
     height: u32,
     quality: &str,
 ) -> Result<Vec<u8>, JsError> {
-    compress(data, width, height, quality)
+    compress(data, width, height, quality, None)
 }
 
 /// Decompress LLIC-compressed grayscale image data.

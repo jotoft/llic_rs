@@ -15,6 +15,7 @@ let currentCompressed = null;
 let currentImageFile = null;
 let currentBlur = 0;
 let currentQuality = 'lossless';
+let currentMode = 'default';
 let currentView = 'side-by-side';
 let comparePosition = 0.5;
 
@@ -137,11 +138,11 @@ async function processImage(file, blur = currentBlur) {
     updateStat('imageSize', `${width} x ${height}`);
     updateStat('originalSize', `${grayData.length.toLocaleString()} bytes`);
 
-    // Compress with selected quality
+    // Compress with selected quality and mode
     let compressed;
     const compressStart = performance.now();
     try {
-      compressed = compress(grayData, width, height, currentQuality);
+      compressed = compress(grayData, width, height, currentQuality, currentMode);
     } catch (e) {
       updateStat('compressedSize', `Error: ${e}`);
       return;
@@ -328,6 +329,19 @@ document.querySelectorAll('input[name="quality"]').forEach(radio => {
     updateQualityLabel();
 
     // Re-process current image with new quality
+    if (currentImageFile && wasmReady) {
+      processImage(currentImageFile, currentBlur);
+    }
+  });
+});
+
+// Mode selector handler
+document.querySelectorAll('input[name="mode"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    currentMode = e.target.value;
+    updateQualityLabel();
+
+    // Re-process current image with new mode
     if (currentImageFile && wasmReady) {
       processImage(currentImageFile, currentBlur);
     }

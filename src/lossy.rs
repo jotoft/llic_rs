@@ -436,6 +436,7 @@ pub fn compress_tile_block(
     rows: u32,
     bytes_per_line: u32,
     error_limit: u8,
+    compress_header: bool,
 ) -> Result<Vec<u8>> {
     if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
@@ -446,17 +447,18 @@ pub fn compress_tile_block(
     // Generate bucket LUT for this error_limit
     let bucket_lut = generate_bucket_lut(error_limit);
 
-    // Allocate output buffer
+    // Allocate output buffer for uncompressed header first
     // Format: 1 byte header + num_tiles min values + num_tiles dist values + pixel data
     // Worst case pixel data: 16 bytes per tile (8-bit mode)
     let max_size = 1 + num_tiles * 2 + num_tiles * 16;
-    let mut output = vec![0u8; max_size];
+    let mut temp_output = vec![0u8; max_size];
 
-    // First byte: flags (bit 7 = compressed header = 0) + error_limit
-    output[0] = error_limit & 0x7f;
+    // First byte: flags (bit 7 = compressed header) + error_limit
+    // Set bit 7 to 0 initially (uncompressed header)
+    temp_output[0] = error_limit & 0x7f;
 
-    // Split output into non-overlapping mutable slices
-    let (header_and_streams, pixel_stream) = output[1..].split_at_mut(num_tiles * 2);
+    // Split temp_output into non-overlapping mutable slices
+    let (header_and_streams, pixel_stream) = temp_output[1..].split_at_mut(num_tiles * 2);
     let (min_stream, dist_stream) = header_and_streams.split_at_mut(num_tiles);
     let mut pixel_pos = 0usize;
 
@@ -511,11 +513,54 @@ pub fn compress_tile_block(
         }
     }
 
-    // Calculate final size and truncate
-    let compressed_size = 1 + num_tiles * 2 + pixel_pos;
-    output.truncate(compressed_size);
+    // Calculate uncompressed size
+    let uncompressed_size = 1 + num_tiles * 2 + pixel_pos;
 
-    Ok(output)
+    // Try header compression if requested
+    if compress_header {
+        // Arrange header as: [min_values][dist_values] in a single buffer
+        let header_width = width / 4;
+        let header_height = (rows / 4) * 2;
+        let mut header_buffer = vec![0u8; num_tiles * 2];
+
+        // Copy min and dist streams from their slices (which are views into temp_output)
+        header_buffer[..num_tiles].copy_from_slice(min_stream);
+        header_buffer[num_tiles..].copy_from_slice(dist_stream);
+
+        // Compress header using entropy coder
+        let compressed_header = crate::entropy_coder::compress(
+            &header_buffer,
+            header_width,
+            header_height,
+            header_width,
+        )?;
+
+        // Check if compression actually saves space (need at least 5 bytes overhead)
+        let compressed_size_with_header = 1 + 4 + compressed_header.len() + pixel_pos;
+
+        if compressed_size_with_header < uncompressed_size {
+            // Use compressed header
+            // Format: [flags|error_limit:1][header_size:4][compressed_header][pixel_data]
+            let mut output = vec![0u8; compressed_size_with_header];
+            output[0] = 0x80 | (error_limit & 0x7f); // Set bit 7 for compressed header
+
+            // Write header size (little-endian u32)
+            let header_size = compressed_header.len() as u32;
+            output[1..5].copy_from_slice(&header_size.to_le_bytes());
+
+            // Copy compressed header
+            output[5..5 + compressed_header.len()].copy_from_slice(&compressed_header);
+
+            // Copy pixel data
+            output[5 + compressed_header.len()..].copy_from_slice(&pixel_stream[..pixel_pos]);
+
+            return Ok(output);
+        }
+    }
+
+    // Use uncompressed header (or compression didn't help)
+    temp_output.truncate(uncompressed_size);
+    Ok(temp_output)
 }
 
 /// Decompress a single block of tile-based lossy compressed data.
@@ -979,7 +1024,7 @@ mod tests {
 
         // Test with different quality levels
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed = compress_tile_block(&image, width, height, width, error_limit)
+            let compressed = compress_tile_block(&image, width, height, width, error_limit, false)
                 .expect("Compression failed");
 
             // Verify header
@@ -1022,8 +1067,8 @@ mod tests {
         let height = 4u32;
         let image = vec![128u8; (width * height) as usize];
 
-        let compressed =
-            compress_tile_block(&image, width, height, width, 16).expect("Compression failed");
+        let compressed = compress_tile_block(&image, width, height, width, 16, false)
+            .expect("Compression failed");
 
         // For a uniform block, we should have minimal pixel data
         // Header (1 byte) + min stream (1 byte) + dist stream (1 byte) + no pixel data
@@ -1062,7 +1107,7 @@ mod tests {
         }
 
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed = compress_tile_block(&image, width, height, width, error_limit)
+            let compressed = compress_tile_block(&image, width, height, width, error_limit, false)
                 .expect("Compression failed");
 
             let mut decompressed = vec![0u8; (width * height) as usize];

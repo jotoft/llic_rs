@@ -28,8 +28,7 @@ pub enum Quality {
 pub enum Mode {
     Default = 0,
     Fast = 1,
-    // Dynamic mode not yet implemented
-    // Dynamic = 2,
+    Dynamic = 2,
 }
 
 #[derive(Error, Debug)]
@@ -117,7 +116,7 @@ impl LlicContext {
             let mode = match src_data[3] {
                 0 => Mode::Default,
                 1 => Mode::Fast,
-                // 2 => Mode::Dynamic, // Not yet supported
+                2 => Mode::Dynamic,
                 _ => Mode::Default,
             };
             (tile_based, mode, 4usize)
@@ -342,12 +341,18 @@ impl LlicContext {
             Ok(total_size)
         } else {
             // Tile-based compression (all qualities including lossless)
+            // Determine if we should compress headers based on mode
+            // Fast mode: no header compression
+            // Default/Dynamic: compress headers
+            let compress_header = mode != Mode::Fast;
+
             let compressed = lossy::compress_tile_block(
                 src_graymap,
                 self.width,
                 self.height,
                 self.bytes_per_line,
                 error_limit,
+                compress_header,
             )?;
 
             // Build LLIC v4 format header for tile-based
@@ -754,5 +759,83 @@ mod tests {
         assert_eq!(quality, Quality::LosslessEntropy);
         assert_eq!(mode, Mode::Default);
         assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_all_modes_roundtrip() {
+        // Test all three modes with tile-based lossless
+        let original: Vec<u8> = (0..64).collect(); // 8x8 gradient
+
+        let context = LlicContext::new(8, 8, 8, Some(1)).unwrap();
+
+        for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
+            let mut compressed = vec![0u8; context.compressed_buffer_size()];
+
+            let compressed_size = context
+                .compress_gray8(&original, Quality::Lossless, mode, &mut compressed)
+                .unwrap();
+            compressed.truncate(compressed_size);
+
+            // Check format v4 header
+            assert_eq!(compressed[0], 4, "version should be 4 for mode {:?}", mode);
+            assert_eq!(
+                compressed[2], 1,
+                "tile_based should be 1 for mode {:?}",
+                mode
+            );
+            assert_eq!(compressed[3], mode as u8, "mode byte mismatch");
+
+            // Decompress
+            let mut output = vec![0u8; 64];
+            let (quality, decoded_mode) =
+                context.decompress_gray8(&compressed, &mut output).unwrap();
+
+            assert_eq!(
+                quality,
+                Quality::Lossless,
+                "quality mismatch for mode {:?}",
+                mode
+            );
+            assert_eq!(decoded_mode, mode, "mode mismatch");
+            assert_eq!(output, original, "pixel data mismatch for mode {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn test_mode_compression_differences() {
+        // Test that Fast mode produces larger output than Default/Dynamic (for some images)
+        // and that Default/Dynamic compress headers
+        let mut image = vec![0u8; 64]; // 8x8
+                                       // Create a pattern with some structure (compressible headers)
+        for (i, pixel) in image.iter_mut().enumerate().take(64) {
+            *pixel = ((i / 4) * 17) as u8;
+        }
+
+        let context = LlicContext::new(8, 8, 8, Some(1)).unwrap();
+
+        let mut compressed_default = vec![0u8; context.compressed_buffer_size()];
+        let mut compressed_fast = vec![0u8; context.compressed_buffer_size()];
+
+        let size_default = context
+            .compress_gray8(
+                &image,
+                Quality::Lossless,
+                Mode::Default,
+                &mut compressed_default,
+            )
+            .unwrap();
+
+        let size_fast = context
+            .compress_gray8(&image, Quality::Lossless, Mode::Fast, &mut compressed_fast)
+            .unwrap();
+
+        // Fast mode should be >= Default mode (no header compression)
+        // The difference may be small or zero for very simple images
+        assert!(
+            size_fast >= size_default,
+            "Fast mode should produce >= size than Default (fast={}, default={})",
+            size_fast,
+            size_default
+        );
     }
 }
