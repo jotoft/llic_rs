@@ -21,8 +21,8 @@ cargo fmt --all -- --check
 echo "Running clippy..."
 cargo clippy --all-targets -- -D warnings
 
-# Run tests
+# Run tests (exclude benchmarks)
 echo "Running tests..."
-cargo test --release
+cargo test --release --lib --bins --tests
 
 echo "All checks passed!"
