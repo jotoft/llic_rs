@@ -428,6 +428,7 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
 /// * `bytes_per_line` - Stride of the source image
 /// * `error_limit` - Quality level (2, 4, 8, or 16)
 /// * `compress_header` - Whether to attempt header compression
+/// * `use_dynamic_predictor` - Whether to use dynamic predictor for header compression
 ///
 /// # Returns
 /// Compressed data as a Vec<u8>
@@ -438,6 +439,7 @@ pub fn compress_tile_block(
     bytes_per_line: u32,
     error_limit: u8,
     compress_header: bool,
+    use_dynamic_predictor: bool,
 ) -> Result<Vec<u8>> {
     if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
@@ -528,13 +530,22 @@ pub fn compress_tile_block(
         header_buffer[..num_tiles].copy_from_slice(min_stream);
         header_buffer[num_tiles..].copy_from_slice(dist_stream);
 
-        // Compress header using entropy coder
-        let compressed_header = crate::entropy_coder::compress(
-            &header_buffer,
-            header_width,
-            header_height,
-            header_width,
-        )?;
+        // Compress header using entropy coder (dynamic predictor if requested)
+        let compressed_header = if use_dynamic_predictor {
+            crate::entropy_coder::compress_dynamic(
+                &header_buffer,
+                header_width,
+                header_height,
+                header_width,
+            )?
+        } else {
+            crate::entropy_coder::compress(
+                &header_buffer,
+                header_width,
+                header_height,
+                header_width,
+            )?
+        };
 
         // Check if compression actually saves space (need at least 5 bytes overhead)
         let compressed_size_with_header = 1 + 4 + compressed_header.len() + pixel_pos;
@@ -575,13 +586,30 @@ pub fn decompress_tile_block(
     bytes_per_line: u32,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
-    // For now, use a fixed error_limit based on typical quality levels
-    // The actual error_limit should come from the main header
-    // We'll detect it from the block structure
-    decompress_tile_block_with_error_limit(src_data, width, rows, bytes_per_line, 16, dst_graymap)
+    // Default: no dynamic predictor for headers
+    decompress_tile_block_impl(src_data, width, rows, bytes_per_line, false, dst_graymap)
 }
 
-/// Decompress a tile-based block.
+/// Decompress a single block of tile-based lossy compressed data with dynamic predictor option.
+pub fn decompress_tile_block_dynamic(
+    src_data: &[u8],
+    width: u32,
+    rows: u32,
+    bytes_per_line: u32,
+    use_dynamic_predictor: bool,
+    dst_graymap: &mut [u8],
+) -> Result<()> {
+    decompress_tile_block_impl(
+        src_data,
+        width,
+        rows,
+        bytes_per_line,
+        use_dynamic_predictor,
+        dst_graymap,
+    )
+}
+
+/// Decompress a tile-based block implementation.
 ///
 /// The block format from C++:
 /// - Byte 0: flags/quality (bit 7 = compressed header, bits 0-6 = error_limit)
@@ -590,12 +618,12 @@ pub fn decompress_tile_block(
 /// - If compressed header (flags & 0x80 == 0x80):
 ///   - Bytes 1-4: header_size (u32)
 ///   - Bytes 5..: compressed_header[header_size], pixels[...]
-pub fn decompress_tile_block_with_error_limit(
+fn decompress_tile_block_impl(
     src_data: &[u8],
     width: u32,
     rows: u32,
     bytes_per_line: u32,
-    _error_limit_hint: u8, // Ignored - we read it from block data
+    use_dynamic_predictor: bool,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     if src_data.is_empty() {
@@ -632,15 +660,25 @@ pub fn decompress_tile_block_with_error_limit(
         let header_height = (rows / 4) * 2;
         let header_decompressed_size = (header_width * header_height) as usize;
 
-        // Decompress the header
+        // Decompress the header (using dynamic predictor if requested)
         let mut header_buffer = vec![0u8; header_decompressed_size];
-        crate::entropy_coder::decompress(
-            &src_data[5..5 + header_size],
-            header_width,
-            header_height,
-            header_width,
-            &mut header_buffer,
-        )?;
+        if use_dynamic_predictor {
+            crate::entropy_coder::decompress_dynamic(
+                &src_data[5..5 + header_size],
+                header_width,
+                header_height,
+                header_width,
+                &mut header_buffer,
+            )?;
+        } else {
+            crate::entropy_coder::decompress(
+                &src_data[5..5 + header_size],
+                header_width,
+                header_height,
+                header_width,
+                &mut header_buffer,
+            )?;
+        }
 
         // Split into min and dist streams
         let half = header_decompressed_size / 2;
@@ -1025,8 +1063,9 @@ mod tests {
 
         // Test with different quality levels
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed = compress_tile_block(&image, width, height, width, error_limit, false)
-                .expect("Compression failed");
+            let compressed =
+                compress_tile_block(&image, width, height, width, error_limit, false, false)
+                    .expect("Compression failed");
 
             // Verify header
             assert_eq!(
@@ -1068,7 +1107,7 @@ mod tests {
         let height = 4u32;
         let image = vec![128u8; (width * height) as usize];
 
-        let compressed = compress_tile_block(&image, width, height, width, 16, false)
+        let compressed = compress_tile_block(&image, width, height, width, 16, false, false)
             .expect("Compression failed");
 
         // For a uniform block, we should have minimal pixel data
@@ -1108,8 +1147,9 @@ mod tests {
         }
 
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed = compress_tile_block(&image, width, height, width, error_limit, false)
-                .expect("Compression failed");
+            let compressed =
+                compress_tile_block(&image, width, height, width, error_limit, false, false)
+                    .expect("Compression failed");
 
             let mut decompressed = vec![0u8; (width * height) as usize];
             decompress_tile_block(&compressed, width, height, width, &mut decompressed)

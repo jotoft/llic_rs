@@ -178,16 +178,21 @@ impl LlicContext {
             .filter(|(_, &size)| size > 0)
             .collect();
 
-        // Choose decompression algorithm based on tile_based flag and mode
-        // For Dynamic mode with entropy coding, use the dynamic decompressor
-        type DecompressFn = fn(&[u8], u32, u32, u32, &mut [u8]) -> Result<()>;
-        let decompress_block: DecompressFn = if tile_based {
-            lossy::decompress_tile_block
-        } else if mode == Mode::Dynamic {
-            entropy_coder::decompress_dynamic
-        } else {
-            entropy_coder::decompress
-        };
+        // Helper closure to decompress a block based on mode and tile_based flag
+        let decompress_block =
+            |data: &[u8], w: u32, h: u32, bpl: u32, dst: &mut [u8]| -> Result<()> {
+                if tile_based {
+                    if mode == Mode::Dynamic {
+                        lossy::decompress_tile_block_dynamic(data, w, h, bpl, true, dst)
+                    } else {
+                        lossy::decompress_tile_block(data, w, h, bpl, dst)
+                    }
+                } else if mode == Mode::Dynamic {
+                    entropy_coder::decompress_dynamic(data, w, h, bpl, dst)
+                } else {
+                    entropy_coder::decompress(data, w, h, bpl, dst)
+                }
+            };
 
         if non_zero_blocks.len() > 1 {
             // Multiple blocks with data - image is divided among threads
@@ -357,6 +362,7 @@ impl LlicContext {
             // Fast mode: no header compression
             // Default/Dynamic: compress headers (Dynamic uses adaptive predictor in entropy coder)
             let compress_header = mode != Mode::Fast;
+            let use_dynamic_predictor = mode == Mode::Dynamic;
 
             let compressed = lossy::compress_tile_block(
                 src_graymap,
@@ -365,6 +371,7 @@ impl LlicContext {
                 self.bytes_per_line,
                 error_limit,
                 compress_header,
+                use_dynamic_predictor,
             )?;
 
             // Build LLIC v4 format header for tile-based
@@ -849,5 +856,61 @@ mod tests {
             size_fast,
             size_default
         );
+    }
+
+    #[test]
+    fn test_dynamic_mode_with_edges() {
+        // Test dynamic mode with an image that has sharp edges
+        // where MED predictor should outperform average predictor
+        let width = 64u32;
+        let height = 64u32;
+        let mut image = vec![0u8; (width * height) as usize];
+
+        // Create vertical stripes - MED predictor should help here
+        for y in 0..height {
+            for x in 0..width {
+                image[(y * width + x) as usize] = if x % 8 < 4 { 0 } else { 255 };
+            }
+        }
+
+        let context = LlicContext::new(width, height, width, Some(1)).unwrap();
+
+        // Test with all quality levels (the discriminant is the error limit)
+        for quality in [
+            Quality::Lossless,
+            Quality::VeryHigh,
+            Quality::High,
+            Quality::Medium,
+            Quality::Low,
+        ] {
+            let mut compressed = vec![0u8; context.compressed_buffer_size()];
+
+            let compressed_size = context
+                .compress_gray8(&image, quality, Mode::Dynamic, &mut compressed)
+                .unwrap();
+            compressed.truncate(compressed_size);
+
+            // Decompress
+            let mut output = vec![0u8; (width * height) as usize];
+            let (decoded_quality, decoded_mode) =
+                context.decompress_gray8(&compressed, &mut output).unwrap();
+
+            assert_eq!(decoded_quality, quality);
+            assert_eq!(decoded_mode, Mode::Dynamic);
+
+            // Verify pixels are within error bounds (discriminant is the error limit)
+            let error_limit = quality as u8;
+            for i in 0..image.len() {
+                let diff = (image[i] as i32 - output[i] as i32).abs();
+                assert!(
+                    diff <= error_limit as i32 + 1, // +1 for rounding
+                    "Pixel {} error {} exceeds limit {} for quality {:?}",
+                    i,
+                    diff,
+                    error_limit,
+                    quality
+                );
+            }
+        }
     }
 }
