@@ -132,3 +132,15 @@ rm -rf pkg && cp -r ../pkg pkg
 npm run build
 rm -rf pkg
 """
+
+# Development setup
+[tasks."setup:hooks"]
+description = "Install git pre-commit hooks"
+run = "./scripts/setup-hooks.sh"
+
+[tasks.lint]
+description = "Run clippy and rustfmt checks"
+run = """
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+"""

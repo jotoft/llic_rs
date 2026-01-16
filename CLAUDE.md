@@ -20,6 +20,9 @@ cargo build --release
 # Run all tests
 cargo test --release
 
+# Run linting (clippy + rustfmt)
+mise run lint
+
 # Run benchmarks (native optimizations)
 mise run bench              # All benchmarks
 mise run bench:256          # 256x256 only
@@ -35,6 +38,9 @@ mise run wasm:release       # All targets (pkg/, pkg-node/, pkg-bundler/)
 
 # Run demo locally
 mise run demo:dev
+
+# Setup git hooks (runs tests/lint on commit when Rust files change)
+mise run setup:hooks
 ```
 
 ### CLI Tool
@@ -75,15 +81,19 @@ src/
 - Three streams: min values, dist values, packed pixel indices
 - Quality determines quantization bits (Q1=2, Q2=4, Q3=8, Q4=16 error limit)
 
-### File Format
+### File Format (LLSC Container)
 
+The file container format matches the original C++ `llic_compress` tool:
 ```
+LLSC\n
 <width> <height>\n
 <compressed_size>\n
 <binary_compressed_data>
 ```
 
-Header byte structure varies by format version (3 or 4). See `LLIC_FORMAT_SPEC.md` for full specification.
+The parser also supports legacy files without the "LLSC" magic header for backward compatibility.
+
+Header byte structure of the compressed stream varies by format version (3 or 4). See `LLIC_FORMAT_SPEC.md` for full specification.
 
 ### Core API
 

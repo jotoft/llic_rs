@@ -56,15 +56,21 @@ pub struct LlicContext {
     width: u32,
     height: u32,
     bytes_per_line: u32,
+    #[allow(dead_code)] // Will be used for multi-threaded compression
     num_threads: usize,
 }
 
 impl LlicContext {
-    pub fn new(width: u32, height: u32, bytes_per_line: u32, num_threads: Option<usize>) -> Result<Self> {
-        if width % 4 != 0 || height % 4 != 0 {
+    pub fn new(
+        width: u32,
+        height: u32,
+        bytes_per_line: u32,
+        num_threads: Option<usize>,
+    ) -> Result<Self> {
+        if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             return Err(LlicError::ImageDimensions);
         }
-        
+
         if width == 0 || height == 0 {
             return Err(LlicError::InvalidArgument);
         }
@@ -73,7 +79,7 @@ impl LlicContext {
         let num_threads = num_threads.unwrap_or_else(num_cpus::get);
         #[cfg(not(feature = "std"))]
         let num_threads = num_threads.unwrap_or(1);
-        
+
         Ok(Self {
             width,
             height,
@@ -81,12 +87,16 @@ impl LlicContext {
             num_threads,
         })
     }
-    
+
     pub fn compressed_buffer_size(&self) -> usize {
         ((self.width as usize * self.height as usize * 5) / 4) + 16384
     }
-    
-    pub fn decompress_gray8(&self, src_data: &[u8], dst_graymap: &mut [u8]) -> Result<(Quality, Mode)> {
+
+    pub fn decompress_gray8(
+        &self,
+        src_data: &[u8],
+        dst_graymap: &mut [u8],
+    ) -> Result<(Quality, Mode)> {
         if src_data.len() < 4 {
             return Err(LlicError::InvalidData);
         }
@@ -163,18 +173,19 @@ impl LlicContext {
 
         // For formats with multiple blocks, image is divided among threads
         // First, check if we have many small blocks of similar size
-        let non_zero_blocks: Vec<_> = block_sizes.iter()
+        let non_zero_blocks: Vec<_> = block_sizes
+            .iter()
             .enumerate()
             .filter(|(_, &size)| size > 0)
             .collect();
 
         // Choose decompression algorithm based on tile_based flag
-        let decompress_block: fn(&[u8], u32, u32, u32, &mut [u8]) -> Result<()> =
-            if tile_based {
-                |data, w, h, bpl, dst| lossy::decompress_tile_block(data, w, h, bpl, dst)
-            } else {
-                |data, w, h, bpl, dst| entropy_coder::decompress(data, w, h, bpl, dst)
-            };
+        type DecompressFn = fn(&[u8], u32, u32, u32, &mut [u8]) -> Result<()>;
+        let decompress_block: DecompressFn = if tile_based {
+            |data, w, h, bpl, dst| lossy::decompress_tile_block(data, w, h, bpl, dst)
+        } else {
+            |data, w, h, bpl, dst| entropy_coder::decompress(data, w, h, bpl, dst)
+        };
 
         if non_zero_blocks.len() > 1 {
             // Multiple blocks with data - image is divided among threads
@@ -182,14 +193,15 @@ impl LlicContext {
 
             // Calculate rows per block using the same logic as the C++ code
             let base_block_size = (self.height as usize / num_blocks as usize) / 4 * 4;
-            let last_block_size = self.height as usize - base_block_size * (num_blocks as usize - 1);
+            let last_block_size =
+                self.height as usize - base_block_size * (num_blocks as usize - 1);
 
             // Calculate block positions
             let mut block_positions = Vec::new();
             let mut current_pos = pos;
-            for i in 0..num_blocks as usize {
+            for size in block_sizes.iter().take(num_blocks as usize) {
                 block_positions.push(current_pos);
-                current_pos += block_sizes[i] as usize;
+                current_pos += *size as usize;
             }
 
             // Decompress each block into its corresponding rows
@@ -255,10 +267,10 @@ impl LlicContext {
                 dst_graymap,
             )?;
         }
-        
+
         Ok((quality, mode))
     }
-    
+
     /// Compress grayscale image data.
     ///
     /// # Arguments
@@ -274,7 +286,13 @@ impl LlicContext {
     /// Uses format v4: `[version=4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]`
     /// - `tile_based=1` for all qualities except LosslessEntropy
     /// - `tile_based=0` for LosslessEntropy (legacy entropy-coded path)
-    pub fn compress_gray8(&self, src_graymap: &[u8], quality: Quality, mode: Mode, dst_data: &mut [u8]) -> Result<usize> {
+    pub fn compress_gray8(
+        &self,
+        src_graymap: &[u8],
+        quality: Quality,
+        mode: Mode,
+        dst_data: &mut [u8],
+    ) -> Result<usize> {
         // Verify source buffer size
         let expected_size = self.height as usize * self.bytes_per_line as usize;
         if src_graymap.len() < expected_size {
@@ -296,12 +314,8 @@ impl LlicContext {
 
         if use_entropy {
             // Legacy entropy-coded lossless path
-            let compressed = entropy_coder::compress(
-                src_graymap,
-                self.width,
-                self.height,
-                self.bytes_per_line,
-            )?;
+            let compressed =
+                entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?;
 
             // Build LLIC v4 format header for entropy-coded
             // Format: [version=4][num_blocks=1][tile_based=0][mode][block_size:u32 LE][data]
@@ -363,18 +377,18 @@ impl LlicContext {
     }
 }
 
-#[cfg(feature = "std")]
-pub mod pgm;
 pub mod entropy_coder;
 #[cfg(feature = "cpp-reference")]
 pub mod ffi;
 pub mod lossy;
+#[cfg(feature = "std")]
+pub mod pgm;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
 // Export aliases for convenience
-pub use Quality as CompressionQuality;
 pub use Mode as CompressionMode;
+pub use Quality as CompressionQuality;
 
 /// Compute prediction residual for grayscale image data.
 ///
@@ -392,7 +406,11 @@ pub fn compute_prediction_residual(data: &[u8], width: usize, height: usize) -> 
         for x in 0..width {
             let pixel = data[y * width + x] as i16;
             let predicted = if y == 0 {
-                if x == 0 { 0 } else { data[y * width + x - 1] as i16 }
+                if x == 0 {
+                    0
+                } else {
+                    data[y * width + x - 1] as i16
+                }
             } else if x == 0 {
                 data[(y - 1) * width + x] as i16
             } else {
@@ -409,6 +427,17 @@ pub fn compute_prediction_residual(data: &[u8], width: usize, height: usize) -> 
     residual
 }
 
+/// LLSC file format magic header.
+///
+/// The file container format follows the original C++ implementation:
+/// ```text
+/// LLSC\n
+/// <width> <height>\n
+/// <compressed_size>\n
+/// <binary_compressed_data>
+/// ```
+pub const LLSC_MAGIC: &[u8] = b"LLSC";
+
 // File I/O convenience functions (only available with std feature)
 #[cfg(feature = "std")]
 pub fn decode_file(input_path: &str, output_path: &str) -> Result<()> {
@@ -418,7 +447,8 @@ pub fn decode_file(input_path: &str, output_path: &str) -> Result<()> {
     // Read the LLIC file
     let mut file = File::open(input_path).map_err(|_| LlicError::FileIO)?;
     let mut llic_data = Vec::new();
-    file.read_to_end(&mut llic_data).map_err(|_| LlicError::FileIO)?;
+    file.read_to_end(&mut llic_data)
+        .map_err(|_| LlicError::FileIO)?;
 
     // Parse the simple container format to extract dimensions and compressed data
     let (width, height, compressed_data) = parse_llic_container(&llic_data)?;
@@ -435,8 +465,56 @@ pub fn decode_file(input_path: &str, output_path: &str) -> Result<()> {
 }
 
 #[cfg(feature = "std")]
-pub fn encode_file(_input_path: &str, _output_path: &str, _quality: CompressionQuality, _mode: CompressionMode) -> Result<()> {
+pub fn encode_file(
+    _input_path: &str,
+    _output_path: &str,
+    _quality: CompressionQuality,
+    _mode: CompressionMode,
+) -> Result<()> {
     todo!("Encoding not yet implemented")
+}
+
+/// Write compressed data to LLSC file format.
+///
+/// Format follows the original C++ implementation:
+/// ```text
+/// LLSC\n
+/// <width> <height>\n
+/// <compressed_size>\n
+/// <binary_compressed_data>
+/// ```
+#[cfg(feature = "std")]
+pub fn write_llic_file(path: &str, width: u32, height: u32, compressed_data: &[u8]) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(path).map_err(|_| LlicError::FileIO)?;
+
+    // Write LLSC magic header
+    writeln!(file, "LLSC").map_err(|_| LlicError::FileIO)?;
+    writeln!(file, "{} {}", width, height).map_err(|_| LlicError::FileIO)?;
+    writeln!(file, "{}", compressed_data.len()).map_err(|_| LlicError::FileIO)?;
+    file.write_all(compressed_data)
+        .map_err(|_| LlicError::FileIO)?;
+
+    Ok(())
+}
+
+/// Read compressed data from LLSC file format.
+///
+/// Supports both formats:
+/// - New format with "LLSC" magic header (from C++ llic_compress)
+/// - Legacy format without magic header (width height on first line)
+#[cfg(feature = "std")]
+pub fn read_llic_file(path: &str) -> Result<(u32, u32, Vec<u8>)> {
+    use std::fs::File;
+    use std::io::Read;
+
+    let mut file = File::open(path).map_err(|_| LlicError::FileIO)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|_| LlicError::FileIO)?;
+
+    parse_llic_container(&data)
 }
 
 #[cfg(feature = "std")]
@@ -444,33 +522,66 @@ fn parse_llic_container(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     use std::str;
 
     // Find first newline
-    let first_newline = data.iter().position(|&b| b == b'\n')
+    let first_newline = data
+        .iter()
+        .position(|&b| b == b'\n')
         .ok_or(LlicError::UnsupportedFormat)?;
 
-    let header_line = str::from_utf8(&data[..first_newline])
+    let first_line =
+        str::from_utf8(&data[..first_newline]).map_err(|_| LlicError::UnsupportedFormat)?;
+
+    // Check if this is the new format with LLSC magic header
+    let (width, height, size_line_start) = if first_line == "LLSC" {
+        // New format: LLSC\n<width> <height>\n<size>\n<data>
+        let second_start = first_newline + 1;
+        let second_newline = data[second_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or(LlicError::UnsupportedFormat)?
+            + second_start;
+
+        let dims_line = str::from_utf8(&data[second_start..second_newline])
+            .map_err(|_| LlicError::UnsupportedFormat)?;
+
+        let parts: Vec<&str> = dims_line.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(LlicError::UnsupportedFormat);
+        }
+
+        let width: u32 = parts[0].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+        let height: u32 = parts[1].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+
+        (width, height, second_newline + 1)
+    } else {
+        // Legacy format: <width> <height>\n<size>\n<data>
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(LlicError::UnsupportedFormat);
+        }
+
+        let width: u32 = parts[0].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+        let height: u32 = parts[1].parse().map_err(|_| LlicError::UnsupportedFormat)?;
+
+        (width, height, first_newline + 1)
+    };
+
+    // Parse compressed size
+    let size_newline = data[size_line_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or(LlicError::UnsupportedFormat)?
+        + size_line_start;
+
+    let size_line = str::from_utf8(&data[size_line_start..size_newline])
         .map_err(|_| LlicError::UnsupportedFormat)?;
 
-    let parts: Vec<&str> = header_line.split_whitespace().collect();
-    if parts.len() != 2 {
-        return Err(LlicError::UnsupportedFormat);
-    }
-
-    let width: u32 = parts[0].parse().map_err(|_| LlicError::UnsupportedFormat)?;
-    let height: u32 = parts[1].parse().map_err(|_| LlicError::UnsupportedFormat)?;
-
-    // Find second newline
-    let second_start = first_newline + 1;
-    let second_newline = data[second_start..].iter().position(|&b| b == b'\n')
-        .ok_or(LlicError::UnsupportedFormat)? + second_start;
-
-    let size_line = str::from_utf8(&data[second_start..second_newline])
-        .map_err(|_| LlicError::UnsupportedFormat)?;
-
-    let compressed_size: usize = size_line.trim().parse()
+    let compressed_size: usize = size_line
+        .trim()
+        .parse()
         .map_err(|_| LlicError::UnsupportedFormat)?;
 
     // Extract compressed data
-    let data_start = second_newline + 1;
+    let data_start = size_newline + 1;
     if data_start + compressed_size > data.len() {
         return Err(LlicError::UnsupportedFormat);
     }
@@ -483,7 +594,7 @@ fn parse_llic_container(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_simple_decompression_v3_entropy() {
         // Test with a known format v3 entropy-coded compressed file
@@ -497,7 +608,9 @@ mod tests {
         let context = LlicContext::new(4, 4, 4, Some(1)).unwrap();
         let mut output = vec![0u8; 16];
 
-        let (quality, mode) = context.decompress_gray8(&compressed_data, &mut output).unwrap();
+        let (quality, mode) = context
+            .decompress_gray8(&compressed_data, &mut output)
+            .unwrap();
 
         // Format v3 entropy-coded returns LosslessEntropy
         assert_eq!(quality, Quality::LosslessEntropy);
@@ -515,7 +628,8 @@ mod tests {
             let file_content = std::fs::read(compressed_path).unwrap();
 
             // Skip the text header "4 4\n79\n"
-            let header_end = file_content.windows(1)
+            let header_end = file_content
+                .windows(1)
                 .enumerate()
                 .filter(|(_, w)| w[0] == b'\n')
                 .nth(1)
@@ -527,7 +641,9 @@ mod tests {
             let context = LlicContext::new(4, 4, 4, Some(1)).unwrap();
             let mut output = vec![0u8; 16];
 
-            let (quality, mode) = context.decompress_gray8(compressed_data, &mut output).unwrap();
+            let (quality, mode) = context
+                .decompress_gray8(compressed_data, &mut output)
+                .unwrap();
 
             // Format v3 lossless returns LosslessEntropy
             assert_eq!(quality, Quality::LosslessEntropy);
@@ -551,7 +667,8 @@ mod tests {
             let file_content = std::fs::read(compressed_path).unwrap();
 
             // Skip the text header
-            let header_end = file_content.windows(1)
+            let header_end = file_content
+                .windows(1)
                 .enumerate()
                 .filter(|(_, w)| w[0] == b'\n')
                 .nth(1)
@@ -563,14 +680,20 @@ mod tests {
             let context = LlicContext::new(4, 4, 4, Some(1)).unwrap();
             let mut output = vec![0u8; 16];
 
-            let (quality, mode) = context.decompress_gray8(compressed_data, &mut output).unwrap();
+            let (quality, mode) = context
+                .decompress_gray8(compressed_data, &mut output)
+                .unwrap();
 
             // Format v3 lossless returns LosslessEntropy
             assert_eq!(quality, Quality::LosslessEntropy);
             assert_eq!(mode, Mode::Default);
 
             // All pixels should be 0
-            assert!(output.iter().all(|&x| x == 0), "Expected all zeros, got: {:?}", output);
+            assert!(
+                output.iter().all(|&x| x == 0),
+                "Expected all zeros, got: {:?}",
+                output
+            );
         }
     }
 
@@ -583,7 +706,9 @@ mod tests {
         let mut compressed = vec![0u8; context.compressed_buffer_size()];
 
         // Compress with tile-based lossless
-        let compressed_size = context.compress_gray8(&original, Quality::Lossless, Mode::Default, &mut compressed).unwrap();
+        let compressed_size = context
+            .compress_gray8(&original, Quality::Lossless, Mode::Default, &mut compressed)
+            .unwrap();
         compressed.truncate(compressed_size);
 
         // Check format v4 header
@@ -608,7 +733,14 @@ mod tests {
         let mut compressed = vec![0u8; context.compressed_buffer_size()];
 
         // Compress with entropy-coded lossless (legacy)
-        let compressed_size = context.compress_gray8(&original, Quality::LosslessEntropy, Mode::Default, &mut compressed).unwrap();
+        let compressed_size = context
+            .compress_gray8(
+                &original,
+                Quality::LosslessEntropy,
+                Mode::Default,
+                &mut compressed,
+            )
+            .unwrap();
         compressed.truncate(compressed_size);
 
         // Check format v4 header
