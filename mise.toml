@@ -4,12 +4,12 @@
 [tasks.bench]
 env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run all benchmarks"
-run = "cargo bench"
+run = "cargo bench --features cpp-reference"
 
 [tasks."bench:256"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run 256x256 benchmarks only"
-run = "cargo bench -- '256x256'"
+run = "cargo bench --features cpp-reference -- '256x256'"
 
 [tasks."bench:rust"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
@@ -137,6 +137,21 @@ rm -rf pkg
 [tasks."setup:hooks"]
 description = "Install git pre-commit hooks"
 run = "./scripts/setup-hooks.sh"
+
+[tasks."bench:modes"]
+env = { RUSTFLAGS = "-C target-cpu=native" }
+description = "Run mode comparison benchmarks (compress + decompress, 512x512)"
+run = "cargo bench --features cpp-reference -- 'modes_'"
+
+[tasks."bench:summary"]
+env = { RUSTFLAGS = "-C target-cpu=native" }
+description = "Run all benchmarks and generate summary"
+run = """
+echo "=== LLIC Performance Comparison: Rust vs C++ ==="
+echo ""
+echo "Running benchmarks..."
+cargo bench --features cpp-reference 2>&1 | grep -E '^(compression|decompression|roundtrip|modes)/|time:|thrpt:'
+"""
 
 [tasks.lint]
 description = "Run clippy and rustfmt checks"

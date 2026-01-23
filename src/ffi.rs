@@ -20,6 +20,7 @@ pub enum LlicQuality {
 pub enum LlicMode {
     Default = 0,
     Fast = 1,
+    Dynamic = 2,
 }
 
 /// Error codes (matches C++ llic_error_t)
