@@ -629,12 +629,11 @@ unsafe fn pack_pixels_bmi2(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usiz
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
 unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
-    // Temporarily disable BMI2 to test
-    // #[cfg(target_feature = "bmi2")]
-    // {
-    //     pack_pixels_bmi2(result, bits, dst)
-    // }
-    // #[cfg(not(target_feature = "bmi2"))]
+    #[cfg(target_feature = "bmi2")]
+    {
+        pack_pixels_bmi2(result, bits, dst)
+    }
+    #[cfg(not(target_feature = "bmi2"))]
     {
         pack_pixels_u32_impl(result, bits, dst)
     }
