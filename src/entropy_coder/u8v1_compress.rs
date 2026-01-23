@@ -42,28 +42,29 @@ fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
 /// Estimate how many bits a row of delta values would take to compress.
 ///
 /// Uses the compression table to estimate the output size without actually compressing.
+/// Optimized version using pointer reads like C++.
 #[inline]
 fn estimate_row_bits(deltas: &[u8]) -> u64 {
     let mut bits: u64 = 0;
     let width = deltas.len();
-    let mut x = 0;
+    let num_pairs = width / 2;
 
-    // Process pairs of symbols
-    while x + 1 < width {
-        let index = (deltas[x] as usize) | ((deltas[x + 1] as usize) << 8);
+    // Cast to u16 pointer like C++
+    let ptr = deltas.as_ptr() as *const u16;
+
+    for i in 0..num_pairs {
+        // SAFETY: i < num_pairs ensures we're within bounds
+        let index = unsafe { *ptr.add(i) as usize };
         let entry = get_compress_table_entry(index);
-        // Extract bits count from packed entry (lower 6 bits)
         bits += (entry & 0x3F) as u64;
-        x += 2;
     }
 
-    // Handle odd trailing symbol (use escape code: 13 bits)
-    if x < width {
-        // For single symbols, estimate using the table with sym2=0, then subtract 2 bits
-        let index = deltas[x] as usize;
+    // Handle odd trailing symbol
+    if (width & 1) != 0 {
+        let index = deltas[width - 1] as usize;
         let entry = get_compress_table_entry(index);
-        let entry_bits = (entry & 0x3F) as u64;
-        bits += entry_bits.saturating_sub(2);
+        // Subtract 2 bits (the encoding of the dummy zero)
+        bits += ((entry & 0x3F) - 2) as u64;
     }
 
     bits
@@ -72,21 +73,30 @@ fn estimate_row_bits(deltas: &[u8]) -> u64 {
 /// Compute MED residuals for a row.
 ///
 /// Returns residuals computed using MED predictor instead of average predictor.
+/// Uses unsafe unchecked access for performance.
+#[inline]
 fn compute_med_residual_row(current_row: &[u8], prev_row: &[u8], width: usize, out_row: &mut [u8]) {
     if width == 0 {
         return;
     }
 
-    // First pixel: use only top as predictor (same as average for first pixel)
-    out_row[0] = current_row[0].wrapping_sub(prev_row[0]);
+    // SAFETY: bounds already verified by caller
+    unsafe {
+        // First pixel: use only top as predictor
+        *out_row.get_unchecked_mut(0) = current_row
+            .get_unchecked(0)
+            .wrapping_sub(*prev_row.get_unchecked(0));
 
-    // Remaining pixels: use MED predictor
-    for x in 1..width {
-        let left = current_row[x - 1];
-        let top = prev_row[x];
-        let top_left = prev_row[x - 1];
-        let predictor = med_predictor(left, top, top_left);
-        out_row[x] = current_row[x].wrapping_sub(predictor);
+        // Remaining pixels: use MED predictor
+        let mut left = *current_row.get_unchecked(0);
+        for x in 1..width {
+            let value = *current_row.get_unchecked(x);
+            let top = *prev_row.get_unchecked(x);
+            let top_left = *prev_row.get_unchecked(x - 1);
+            let predictor = med_predictor(left, top, top_left);
+            *out_row.get_unchecked_mut(x) = value.wrapping_sub(predictor);
+            left = value;
+        }
     }
 }
 
@@ -126,38 +136,126 @@ pub fn compress(
     // Buffer for delta-encoded values for current row
     let mut delta_buffer = vec![0u8; width];
 
-    // Process first row (horizontal delta only)
+    // Process first row (horizontal delta only) - optimized version
     {
         let src_row = &src_image[..width];
-        delta_buffer[0] = src_row[0];
-        for x in 1..width {
-            delta_buffer[x] = src_row[x].wrapping_sub(src_row[x - 1]);
-        }
-        encode_row(&delta_buffer, &mut writer);
+        compute_first_row_deltas(src_row, &mut delta_buffer);
     }
 
-    // Process remaining rows (combined predictor: average of left and top)
+    // Process remaining rows using pipelined approach like C++:
+    // Encode previous row while computing current row
     for y in 1..height {
+        // Encode the previously computed delta row
+        encode_row(&delta_buffer, &mut writer);
+
         let row_offset = y * bytes_per_line;
         let prev_row_offset = (y - 1) * bytes_per_line;
         let src_row = &src_image[row_offset..row_offset + width];
         let prev_row = &src_image[prev_row_offset..prev_row_offset + width];
 
-        // First pixel uses only top predictor
-        delta_buffer[0] = src_row[0].wrapping_sub(prev_row[0]);
-
-        // Remaining pixels use average of left and top
-        for x in 1..width {
-            let left = src_row[x - 1];
-            let top = prev_row[x];
-            let avg = ((left as u16 + top as u16) >> 1) as u8;
-            delta_buffer[x] = src_row[x].wrapping_sub(avg);
-        }
-
-        encode_row(&delta_buffer, &mut writer);
+        // Compute deltas for current row
+        compute_avg_predictor_deltas(src_row, prev_row, &mut delta_buffer);
     }
 
+    // Encode the final row
+    encode_row(&delta_buffer, &mut writer);
+
     Ok(writer.finish())
+}
+
+/// Compute delta values for the first row (horizontal differences).
+/// Uses unsafe unchecked access for performance.
+#[inline]
+fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
+    let width = src_row.len();
+
+    // SAFETY: bounds already verified by caller
+    unsafe {
+        *delta_buffer.get_unchecked_mut(0) = *src_row.get_unchecked(0);
+
+        // Process in chunks of 4 (matches C++ non-SIMD path)
+        let mut x = 1;
+        let mut c0 = *src_row.get_unchecked(0);
+
+        while x + 3 < width {
+            let c1 = *src_row.get_unchecked(x);
+            let c2 = *src_row.get_unchecked(x + 1);
+            let c3 = *src_row.get_unchecked(x + 2);
+            let c4 = *src_row.get_unchecked(x + 3);
+            *delta_buffer.get_unchecked_mut(x) = c1.wrapping_sub(c0);
+            *delta_buffer.get_unchecked_mut(x + 1) = c2.wrapping_sub(c1);
+            *delta_buffer.get_unchecked_mut(x + 2) = c3.wrapping_sub(c2);
+            *delta_buffer.get_unchecked_mut(x + 3) = c4.wrapping_sub(c3);
+            c0 = c4;
+            x += 4;
+        }
+
+        // Handle remaining pixels
+        while x < width {
+            let c1 = *src_row.get_unchecked(x);
+            *delta_buffer.get_unchecked_mut(x) = c1.wrapping_sub(c0);
+            c0 = c1;
+            x += 1;
+        }
+    }
+}
+
+/// Compute delta values using average predictor (left + top) / 2.
+/// Uses unsafe unchecked access for performance.
+#[inline]
+fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
+    let width = src_row.len();
+
+    // SAFETY: bounds already verified by caller
+    unsafe {
+        // First pixel uses only top predictor
+        *delta_buffer.get_unchecked_mut(0) = src_row
+            .get_unchecked(0)
+            .wrapping_sub(*prev_row.get_unchecked(0));
+
+        // Process remaining pixels - unrolled for better performance
+        let mut x = 1;
+        let mut left = *src_row.get_unchecked(0);
+
+        while x + 3 < width {
+            // Pixel x
+            let top0 = *prev_row.get_unchecked(x);
+            let val0 = *src_row.get_unchecked(x);
+            let avg0 = ((left as u16 + top0 as u16) >> 1) as u8;
+            *delta_buffer.get_unchecked_mut(x) = val0.wrapping_sub(avg0);
+
+            // Pixel x+1
+            let top1 = *prev_row.get_unchecked(x + 1);
+            let val1 = *src_row.get_unchecked(x + 1);
+            let avg1 = ((val0 as u16 + top1 as u16) >> 1) as u8;
+            *delta_buffer.get_unchecked_mut(x + 1) = val1.wrapping_sub(avg1);
+
+            // Pixel x+2
+            let top2 = *prev_row.get_unchecked(x + 2);
+            let val2 = *src_row.get_unchecked(x + 2);
+            let avg2 = ((val1 as u16 + top2 as u16) >> 1) as u8;
+            *delta_buffer.get_unchecked_mut(x + 2) = val2.wrapping_sub(avg2);
+
+            // Pixel x+3
+            let top3 = *prev_row.get_unchecked(x + 3);
+            let val3 = *src_row.get_unchecked(x + 3);
+            let avg3 = ((val2 as u16 + top3 as u16) >> 1) as u8;
+            *delta_buffer.get_unchecked_mut(x + 3) = val3.wrapping_sub(avg3);
+
+            left = val3;
+            x += 4;
+        }
+
+        // Handle remaining pixels
+        while x < width {
+            let top = *prev_row.get_unchecked(x);
+            let val = *src_row.get_unchecked(x);
+            let avg = ((left as u16 + top as u16) >> 1) as u8;
+            *delta_buffer.get_unchecked_mut(x) = val.wrapping_sub(avg);
+            left = val;
+            x += 1;
+        }
+    }
 }
 
 /// Align a value up to the next multiple of 4.
@@ -276,45 +374,86 @@ pub fn compress_dynamic(
 /// Encode a row of delta values to the bit stream.
 ///
 /// Uses the compression table which encodes pairs of symbols for efficiency.
+/// Matches C++ optimization: 8x unrolled loop processing 16 symbols per iteration.
 #[inline]
 fn encode_row(deltas: &[u8], writer: &mut BitWriter) {
     let width = deltas.len();
-    let mut x = 0;
+    let num_pairs = width / 2;
 
-    // Process pairs of symbols
-    while x + 1 < width {
-        let sym1 = deltas[x];
-        let sym2 = deltas[x + 1];
-        encode_pair(sym1, sym2, writer);
-        x += 2;
+    // Cast to u16 pointer like C++ (safe: deltas is contiguous and we only read within bounds)
+    let ptr = deltas.as_ptr() as *const u16;
+
+    let mut i = 0;
+
+    // Unroll by 8 (16 symbols per iteration, matches C++)
+    while i + 8 <= num_pairs {
+        // SAFETY: i + 8 <= num_pairs ensures we read at most num_pairs u16 values
+        // which corresponds to 2*num_pairs bytes, all within the slice
+        unsafe {
+            let t0 = get_compress_table_entry(*ptr.add(i) as usize);
+            writer.write_packed(t0);
+
+            let t1 = get_compress_table_entry(*ptr.add(i + 1) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t1);
+
+            let t2 = get_compress_table_entry(*ptr.add(i + 2) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t2);
+
+            let t3 = get_compress_table_entry(*ptr.add(i + 3) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t3);
+
+            let t4 = get_compress_table_entry(*ptr.add(i + 4) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t4);
+
+            let t5 = get_compress_table_entry(*ptr.add(i + 5) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t5);
+
+            let t6 = get_compress_table_entry(*ptr.add(i + 6) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t6);
+
+            let t7 = get_compress_table_entry(*ptr.add(i + 7) as usize);
+            writer.flush_if_needed();
+            writer.write_packed(t7);
+            writer.flush_if_needed();
+        }
+
+        i += 8;
+    }
+
+    // Handle remaining pairs
+    while i < num_pairs {
+        // SAFETY: i < num_pairs ensures we're within bounds
+        let idx = unsafe { *ptr.add(i) as usize };
+        let entry = get_compress_table_entry(idx);
+        writer.write_packed(entry);
+        writer.flush_if_needed();
+        i += 1;
     }
 
     // Handle odd trailing symbol
-    if x < width {
-        encode_single(deltas[x], writer);
+    if (width & 1) != 0 {
+        encode_single(deltas[width - 1], writer);
     }
 }
 
-/// Encode a pair of symbols using the compression table.
-#[inline]
-fn encode_pair(sym1: u8, sym2: u8, writer: &mut BitWriter) {
-    // Table index: sym1 | (sym2 << 8)
-    let index = (sym1 as usize) | ((sym2 as usize) << 8);
-    let entry = get_compress_table_entry(index);
-    writer.write_packed(entry);
-}
-
-/// Encode a single symbol.
+/// Encode a single symbol at the end of a row.
 ///
-/// For single symbols, we use the compression table with sym2=0,
-/// but we need to handle this carefully to ensure correct decoding.
+/// Uses the same trick as C++: look up (sym, 0) pair and subtract 2 bits
+/// to remove the trailing zero encoding.
 #[inline]
 fn encode_single(sym: u8, writer: &mut BitWriter) {
-    // Use 13-bit escape code format for single symbols at end of row
-    // Format: 11111 + 8-bit symbol = 13 bits
-    // MSB-justified: 0xF800_0000 | (sym << 19)
-    let code = 0xF800_0000 | ((sym as u32) << 19);
-    writer.write_bits(code, 13);
+    // Look up symbol paired with 0
+    let entry = get_compress_table_entry(sym as usize);
+    // Subtract 2 bits (the encoding of the dummy zero)
+    let adjusted = entry - 2;
+    writer.write_packed(adjusted);
+    writer.flush_if_needed();
 }
 
 #[cfg(test)]

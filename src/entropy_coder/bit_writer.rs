@@ -1,12 +1,12 @@
 //! Bit writer for producing a byte stream from bits.
 //!
 //! Mirrors the BitReader interface for encoding. Bits are stored MSB-first
-//! and flushed to the output buffer in 16-bit little-endian words.
+//! and flushed to the output buffer in 32-bit chunks (as 2x 16-bit little-endian words).
 
 /// A bit writer that produces a byte stream from bits.
 ///
 /// Bits are accumulated MSB-first in a 64-bit container and flushed
-/// as 16-bit little-endian words when full.
+/// as 32-bit chunks (2x 16-bit LE words) when full.
 pub struct BitWriter {
     /// Output buffer
     output: Vec<u8>,
@@ -61,14 +61,33 @@ impl BitWriter {
 
     /// Write bits from a pre-packed entry (upper bits = code, lower 6 bits = length).
     /// This is optimized for the compression table format.
-    #[inline]
+    ///
+    /// This is the hot path for compression - inlined and optimized.
+    #[inline(always)]
     pub fn write_packed(&mut self, packed: u32) {
-        let num_bits = (packed & 0x3F) as u8;
-        let code = packed & !0x3F; // Clear the length bits, keep code MSB-justified
-        self.write_bits(code, num_bits);
+        // Left-justify to 64-bit and mask away the length bits (matches C++ exactly)
+        let symbol = ((packed & 0xFFFF_FFC0) as u64) << 32;
+        self.bits |= symbol >> self.count;
+        // Use the 6 least significant bits for the bit count
+        self.count += packed & 0x3F;
+    }
+
+    /// Flush if we have 32 or more bits accumulated.
+    /// Must be called after write_packed to maintain the invariant.
+    #[inline(always)]
+    pub fn flush_if_needed(&mut self) {
+        if self.count >= 32 {
+            self.count -= 32;
+            let a = (self.bits >> 32) as u32;
+            // Store as 2x uint16_t in LE format (matches C++ exactly)
+            let swapped = (a >> 16) | ((a & 0xFFFF) << 16);
+            self.output.extend_from_slice(&swapped.to_ne_bytes());
+            self.bits <<= 32;
+        }
     }
 
     /// Flush any complete 16-bit words to the output.
+    /// Used by write_bits for general bit writing.
     #[inline]
     fn flush_words(&mut self) {
         while self.count >= 16 {
@@ -83,13 +102,20 @@ impl BitWriter {
     /// Finalize the stream, flushing any remaining bits.
     /// Pads with zeros to complete the final byte(s).
     pub fn finish(mut self) -> Vec<u8> {
-        // Flush any remaining bits (pad to 16-bit boundary)
+        // Flush any remaining bits (matches C++ flushLastData behavior)
         if self.count > 0 {
-            // Pad to 16 bits
-            let word = (self.bits >> 48) as u16;
-            self.output.extend_from_slice(&word.to_le_bytes());
+            let a = (self.bits >> 32) as u32;
+            // Store as 2x uint16_t in LE format (same as flush_if_needed)
+            let swapped = (a >> 16) | ((a & 0xFFFF) << 16);
+            self.output.extend_from_slice(&swapped.to_ne_bytes());
         }
         self.output
+    }
+
+    /// Get current output length in bytes (not including unflushed bits).
+    #[allow(dead_code)]
+    pub fn output_len(&self) -> usize {
+        self.output.len()
     }
 
     /// Get current output length in bytes.
@@ -119,8 +145,12 @@ mod tests {
         // Write 8 bits: 0xAB (MSB-justified: 0xAB00_0000)
         writer.write_bits(0xAB00_0000, 8);
         let output = writer.finish();
-        // Output should be 0xAB padded to 16 bits: [0xAB, 0x00] in LE
-        assert_eq!(output, vec![0x00, 0xAB]);
+        // Output is a 32-bit word with 0xAB00 in MSB position
+        // C++ format: (a >> 16) | ((a & 0xFFFF) << 16) where a = 0xAB000000 >> 32 = 0
+        // But our bits are: 0xAB00_0000_0000_0000 >> 32 = 0xAB00_0000
+        // swapped = (0xAB00_0000 >> 16) | ((0xAB00_0000 & 0xFFFF) << 16) = 0xAB00 | 0 = 0x0000_AB00
+        // In native endian bytes: depends on platform, but content test shows [0x00, 0xAB, 0x00, 0x00]
+        assert_eq!(output, vec![0x00, 0xAB, 0x00, 0x00]);
     }
 
     #[test]
@@ -129,7 +159,8 @@ mod tests {
         // Write 16 bits: 0xABCD (MSB-justified: 0xABCD_0000)
         writer.write_bits(0xABCD_0000, 16);
         let output = writer.finish();
-        // Output: LE 16-bit word 0xABCD -> [0xCD, 0xAB]
+        // 16 bits triggers immediate flush via flush_words -> [0xCD, 0xAB]
+        // finish() sees count=0 so no additional output
         assert_eq!(output, vec![0xCD, 0xAB]);
     }
 
@@ -143,7 +174,7 @@ mod tests {
         // Write 8 bits: 0xBC (MSB-justified: 0xBC00_0000)
         writer.write_bits(0xBC00_0000, 8);
         let output = writer.finish();
-        // Combined: 0xFABC -> LE: [0xBC, 0xFA]
+        // Total 16 bits, triggers immediate flush -> [0xBC, 0xFA]
         assert_eq!(output, vec![0xBC, 0xFA]);
     }
 
@@ -152,7 +183,9 @@ mod tests {
         let mut writer = BitWriter::new();
         writer.write_bits(0x1234_5678, 32);
         let output = writer.finish();
-        // Two 16-bit words: 0x1234, 0x5678 -> LE: [0x34, 0x12, 0x78, 0x56]
+        // After flush_words: bits shifted out as 16-bit LE words
+        // This writes two complete 16-bit words during flush_words
+        // 0x1234 -> [0x34, 0x12], 0x5678 -> [0x78, 0x56]
         assert_eq!(output, vec![0x34, 0x12, 0x78, 0x56]);
     }
 
@@ -162,7 +195,9 @@ mod tests {
         // Packed: upper bits = 0xABCD_0000, lower 6 bits = 16
         let packed = 0xABCD_0000 | 16;
         writer.write_packed(packed);
+        writer.flush_if_needed(); // No flush since only 16 bits
         let output = writer.finish();
-        assert_eq!(output, vec![0xCD, 0xAB]);
+        // 16 bits of 0xABCD, padded to 32-bit word
+        assert_eq!(output, vec![0xCD, 0xAB, 0x00, 0x00]);
     }
 }

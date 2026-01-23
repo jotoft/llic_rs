@@ -14,21 +14,24 @@ pub static DECOMPRESS_TABLE: &[DecompressEntry; 4096] = unsafe {
         as *const [DecompressEntry; 4096])
 };
 
-/// Compression lookup table with 65536 entries
+/// Compression lookup table raw bytes (65536 * 4 = 262144 bytes)
 /// Indexed by two consecutive bytes: byte1 | (byte2 << 8)
 /// Each entry is a 32-bit value where:
 /// - Upper 26 bits: Variable-length codes (left-justified)
 /// - Lower 6 bits: Total number of bits for both codes
-pub static COMPRESS_TABLE_BYTES: &[u8] = include_bytes!("../../tables/u8v1_compress_table_2x.bin");
+static COMPRESS_TABLE_BYTES: &[u8; 262144] =
+    include_bytes!("../../tables/u8v1_compress_table_2x.bin");
 
+/// Get an entry from the compression table.
+/// Uses unchecked access for performance (index is always valid from u16).
+#[inline(always)]
 pub fn get_compress_table_entry(index: usize) -> u32 {
+    // SAFETY: index comes from u16 value (< 65536), offset is always < 262144
     let offset = index * 4;
-    u32::from_le_bytes([
-        COMPRESS_TABLE_BYTES[offset],
-        COMPRESS_TABLE_BYTES[offset + 1],
-        COMPRESS_TABLE_BYTES[offset + 2],
-        COMPRESS_TABLE_BYTES[offset + 3],
-    ])
+    unsafe {
+        let ptr = COMPRESS_TABLE_BYTES.as_ptr().add(offset) as *const u32;
+        ptr.read_unaligned()
+    }
 }
 
 #[cfg(test)]
