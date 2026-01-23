@@ -22,8 +22,21 @@ description = "Generate flamegraph + perf.data for Rust 256x256 decompression"
 run = "cargo flamegraph --bench llic_benchmark -- --bench 'rust/256x256'"
 
 [tasks."profile:report"]
-description = "Show perf report from existing perf.data (run 'profile' first)"
+description = "Show perf report from existing perf.data"
 run = "perf report --stdio -g none --percent-limit 1 2>/dev/null | head -60"
+
+[tasks."profile:compress"]
+env = { RUSTFLAGS = "-C target-cpu=native" }
+description = "Profile compression with perf (uses profile_compress binary)"
+run = """
+cargo build --release --bin profile_compress
+perf record -g target/release/profile_compress
+perf report --stdio -g none --percent-limit 1 2>/dev/null | head -60
+"""
+
+[tasks."profile:annotate"]
+description = "Annotate hot function from perf.data (default: compress_tile_block)"
+run = "perf annotate --stdio -s llic::lossy::compress_tile_block 2>/dev/null | head -150"
 
 [tasks."profile:open"]
 description = "Open flamegraph.svg in browser (run 'profile' first)"
