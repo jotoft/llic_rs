@@ -548,11 +548,114 @@ unsafe fn pack_pixels_4bit_ssse3(indices: &[u8; 16], dst: &mut [u8]) {
     _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, packed);
 }
 
+/// BMI2-optimized pack using PEXT for bit extraction.
+/// PEXT extracts bits at mask positions and compacts them.
+/// This is very efficient on Zen 3+ (3 cycles) but slow on older AMD (18+ cycles).
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn pack_pixels_bmi2(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
+    match bits {
+        0 => 0,
+        2 => {
+            // 2-bit packing: 16 indices → 4 bytes
+            // Pattern: dst[0] = (r[12] << 6) | (r[8] << 4) | (r[4] << 2) | r[0]
+            // Gather indices with stride 4 into u32, then PEXT extracts low 2 bits from each byte
+
+            // Gather first 4 values (indices 0,4,8,12) into bytes of a u32
+            let v0 = (result[0] as u8 as u32)
+                | ((result[4] as u8 as u32) << 8)
+                | ((result[8] as u8 as u32) << 16)
+                | ((result[12] as u8 as u32) << 24);
+            // PEXT extracts bits 0-1 from each byte position and packs them
+            dst[0] = _pext_u32(v0, 0x03030303) as u8;
+
+            let v1 = (result[1] as u8 as u32)
+                | ((result[5] as u8 as u32) << 8)
+                | ((result[9] as u8 as u32) << 16)
+                | ((result[13] as u8 as u32) << 24);
+            dst[1] = _pext_u32(v1, 0x03030303) as u8;
+
+            let v2 = (result[2] as u8 as u32)
+                | ((result[6] as u8 as u32) << 8)
+                | ((result[10] as u8 as u32) << 16)
+                | ((result[14] as u8 as u32) << 24);
+            dst[2] = _pext_u32(v2, 0x03030303) as u8;
+
+            let v3 = (result[3] as u8 as u32)
+                | ((result[7] as u8 as u32) << 8)
+                | ((result[11] as u8 as u32) << 16)
+                | ((result[15] as u8 as u32) << 24);
+            dst[3] = _pext_u32(v3, 0x03030303) as u8;
+
+            4
+        }
+        4 => {
+            // 4-bit packing: 16 indices → 8 bytes
+            // Pattern: dst[i] = (r[i+8] << 4) | r[i]
+            // Use PEXT to extract low 4 bits from pairs
+
+            // Process 2 indices at a time into one byte
+            let v0 = (result[0] as u8 as u64)
+                | ((result[8] as u8 as u64) << 8)
+                | ((result[1] as u8 as u64) << 16)
+                | ((result[9] as u8 as u64) << 24)
+                | ((result[2] as u8 as u64) << 32)
+                | ((result[10] as u8 as u64) << 40)
+                | ((result[3] as u8 as u64) << 48)
+                | ((result[11] as u8 as u64) << 56);
+            // PEXT with mask 0x0F0F0F0F0F0F0F0F extracts low 4 bits from each byte
+            let packed0 = _pext_u64(v0, 0x0F0F0F0F0F0F0F0F);
+            *(dst.as_mut_ptr() as *mut u32) = packed0 as u32;
+
+            let v1 = (result[4] as u8 as u64)
+                | ((result[12] as u8 as u64) << 8)
+                | ((result[5] as u8 as u64) << 16)
+                | ((result[13] as u8 as u64) << 24)
+                | ((result[6] as u8 as u64) << 32)
+                | ((result[14] as u8 as u64) << 40)
+                | ((result[7] as u8 as u64) << 48)
+                | ((result[15] as u8 as u64) << 56);
+            let packed1 = _pext_u64(v1, 0x0F0F0F0F0F0F0F0F);
+            *(dst.as_mut_ptr().add(4) as *mut u32) = packed1 as u32;
+
+            8
+        }
+        // Fall back to SSE4.1 for other bit widths
+        _ => pack_pixels_u32_sse41(result, bits, dst),
+    }
+}
+
+/// Dispatch to BMI2 or SSE4.1 pack implementation
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
+    // Temporarily disable BMI2 to test
+    // #[cfg(target_feature = "bmi2")]
+    // {
+    //     pack_pixels_bmi2(result, bits, dst)
+    // }
+    // #[cfg(not(target_feature = "bmi2"))]
+    {
+        pack_pixels_u32_impl(result, bits, dst)
+    }
+}
+
+/// SSE4.1 pack implementation (called by BMI2 fallback)
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse4.1",
+    target_feature = "bmi2"
+))]
+#[inline(always)]
+unsafe fn pack_pixels_u32_sse41(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
+    pack_pixels_u32_impl(result, bits, dst)
+}
+
 /// SSE4.1-optimized pack for 32-bit result arrays (matches C++ addToCompressedStream).
 /// Much faster than scalar when indices are already in 32-bit lanes.
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
-unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
+unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
     match bits {
         0 => 0,
         1 => {
@@ -667,15 +770,12 @@ unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize
             10
         }
         6 => {
-            // 6-bit packing with SSSE3 shuffle
+            // 6-bit packing matching C++ approach - single shuffle
+            // Each 32-bit lane has 4 x 6-bit values packed, we extract 3 bytes (24 bits) from each
             #[repr(align(16))]
             struct Aligned([u8; 16]);
-            static MASK1: Aligned = Aligned([
-                0, 1, 2, 0x80, 8, 9, 10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-            ]);
-            static MASK2: Aligned = Aligned([
-                0x80, 0x80, 4, 5, 0x80, 0x80, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-                0x80,
+            static MASK: Aligned = Aligned([
+                0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0x80, 0x80, 0x80, 0x80,
             ]);
 
             let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
@@ -689,13 +789,8 @@ unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize
                 18,
             );
             let row0123 = _mm_or_si128(_mm_or_si128(row0, row1), _mm_or_si128(row2, row3));
-            let row0123a =
-                _mm_shuffle_epi8(row0123, _mm_load_si128(MASK1.0.as_ptr() as *const __m128i));
-            let row0123b = _mm_shuffle_epi8(
-                _mm_slli_epi32(row0123, 8),
-                _mm_load_si128(MASK2.0.as_ptr() as *const __m128i),
-            );
-            let row0123 = _mm_or_si128(row0123a, row0123b);
+            let row0123 =
+                _mm_shuffle_epi8(row0123, _mm_load_si128(MASK.0.as_ptr() as *const __m128i));
             _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, row0123);
             *(dst.as_mut_ptr().add(8) as *mut u32) = _mm_extract_epi32(row0123, 2) as u32;
             12
