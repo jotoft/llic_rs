@@ -518,6 +518,101 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
     }
 }
 
+/// BMI2-optimized unpack using PDEP for bit deposit.
+/// PDEP deposits low bits at mask positions - inverse of PEXT.
+/// This is very efficient on Zen 3+ (3 cycles) but slow on older AMD (18+ cycles).
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn unpack_pixels_bmi2(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
+    use core::arch::x86_64::_pdep_u32;
+
+    match bits {
+        0 => {
+            result.fill(0);
+            0
+        }
+        2 => {
+            // 4 bytes -> 16 pixels (2 bits each)
+            // PDEP spreads 8 packed bits to positions 0-1 of each byte in a u32
+            // byte0 contains indices for positions 0,4,8,12
+            let expanded0 = _pdep_u32(src[0] as u32, 0x03030303);
+            let expanded1 = _pdep_u32(src[1] as u32, 0x03030303);
+            let expanded2 = _pdep_u32(src[2] as u32, 0x03030303);
+            let expanded3 = _pdep_u32(src[3] as u32, 0x03030303);
+
+            // Extract bytes from u32 results
+            result[0] = expanded0 as u8;
+            result[4] = (expanded0 >> 8) as u8;
+            result[8] = (expanded0 >> 16) as u8;
+            result[12] = (expanded0 >> 24) as u8;
+
+            result[1] = expanded1 as u8;
+            result[5] = (expanded1 >> 8) as u8;
+            result[9] = (expanded1 >> 16) as u8;
+            result[13] = (expanded1 >> 24) as u8;
+
+            result[2] = expanded2 as u8;
+            result[6] = (expanded2 >> 8) as u8;
+            result[10] = (expanded2 >> 16) as u8;
+            result[14] = (expanded2 >> 24) as u8;
+
+            result[3] = expanded3 as u8;
+            result[7] = (expanded3 >> 8) as u8;
+            result[11] = (expanded3 >> 16) as u8;
+            result[15] = (expanded3 >> 24) as u8;
+
+            4
+        }
+        4 => {
+            // 8 bytes -> 16 pixels (4 bits each, nibbles)
+            // PDEP spreads 8 packed bits to positions 0-3 of each byte in a u16
+            use core::arch::x86_64::_pdep_u64;
+
+            // Process 4 bytes at a time using 64-bit PDEP
+            let packed0 = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            let expanded0 = _pdep_u64(packed0 as u64, 0x0F0F0F0F0F0F0F0F);
+
+            result[0] = expanded0 as u8;
+            result[8] = (expanded0 >> 8) as u8;
+            result[1] = (expanded0 >> 16) as u8;
+            result[9] = (expanded0 >> 24) as u8;
+            result[2] = (expanded0 >> 32) as u8;
+            result[10] = (expanded0 >> 40) as u8;
+            result[3] = (expanded0 >> 48) as u8;
+            result[11] = (expanded0 >> 56) as u8;
+
+            let packed1 = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+            let expanded1 = _pdep_u64(packed1 as u64, 0x0F0F0F0F0F0F0F0F);
+
+            result[4] = expanded1 as u8;
+            result[12] = (expanded1 >> 8) as u8;
+            result[5] = (expanded1 >> 16) as u8;
+            result[13] = (expanded1 >> 24) as u8;
+            result[6] = (expanded1 >> 32) as u8;
+            result[14] = (expanded1 >> 40) as u8;
+            result[7] = (expanded1 >> 48) as u8;
+            result[15] = (expanded1 >> 56) as u8;
+
+            8
+        }
+        // Fall back to scalar for other bit widths
+        _ => unpack_pixels(src, bits, result),
+    }
+}
+
+/// Dispatch to BMI2 or scalar unpack implementation
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn unpack_pixels_dispatch(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
+    unsafe { unpack_pixels_bmi2(src, bits, result) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+fn unpack_pixels_dispatch(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
+    unpack_pixels(src, bits, result)
+}
+
 /// SSSE3-optimized pack for 4-bit indices (nibble packing).
 /// Packs 16 indices into 8 bytes: dst[i] = (indices[i+8] << 4) | indices[i]
 #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
@@ -1507,7 +1602,8 @@ fn decompress_tiles(
                 }
             } else {
                 // Unpack pixel indices
-                let bytes_consumed = unpack_pixels(&pixel_stream[pixel_pos..], bits, &mut pixels);
+                let bytes_consumed =
+                    unpack_pixels_dispatch(&pixel_stream[pixel_pos..], bits, &mut pixels);
                 pixel_pos += bytes_consumed;
 
                 // Reconstruct pixel values
