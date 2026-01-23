@@ -27,11 +27,9 @@ impl BitWriter {
 
     /// Create a new BitWriter with the specified initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
-        let mut output = Vec::with_capacity(capacity);
         // Pre-fill to capacity so we can write without bounds checks
-        output.resize(capacity, 0);
         Self {
-            output,
+            output: vec![0; capacity],
             pos: 0,
             bits: 0,
             count: 0,

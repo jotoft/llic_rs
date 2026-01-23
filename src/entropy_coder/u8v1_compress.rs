@@ -197,6 +197,7 @@ fn compute_first_row_deltas_scalar(src_row: &[u8], delta_buffer: &mut [u8]) {
 /// SSSE3 optimized first row delta computation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
+#[allow(dead_code)]
 unsafe fn compute_first_row_deltas_ssse3(src_row: &[u8], delta_buffer: &mut [u8]) {
     use std::arch::x86_64::*;
 
@@ -281,6 +282,7 @@ fn compute_avg_predictor_deltas_scalar(src_row: &[u8], prev_row: &[u8], delta_bu
 /// Processes 16 bytes at a time using SIMD instructions.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
+#[allow(dead_code)]
 unsafe fn compute_avg_predictor_deltas_ssse3(
     src_row: &[u8],
     prev_row: &[u8],

@@ -95,9 +95,99 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
     lut
 }
 
-/// SIMD-optimized processing of a 4x4 tile: finds min/max and quantizes pixels.
-/// Returns (min_val, dist, indices) where indices contains quantized pixel values.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+/// SSE4.1-optimized processing of a 4x4 tile matching C++ approach:
+/// - Expands pixels to 32-bit integers
+/// - Uses float reciprocal for division (very fast on modern CPUs)
+/// - Outputs to 32-bit aligned result array for efficient packing
+/// Returns (min_val, dist, bits)
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn process_tile_sse41(
+    src_data: &[u8],
+    row0_start: usize,
+    row1_start: usize,
+    row2_start: usize,
+    row3_start: usize,
+    bucket_lut: &[BucketLutEntry; 256],
+    result: &mut [u32; 16],
+) -> (u8, u8, u8) {
+    // Load 4 bytes per row and expand to 4x32-bit integers (matches C++ _MM_CVTEPU8_EPI32)
+    let row0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
+        *(src_data.as_ptr().add(row0_start) as *const i32),
+    ));
+    let row1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
+        *(src_data.as_ptr().add(row1_start) as *const i32),
+    ));
+    let row2 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
+        *(src_data.as_ptr().add(row2_start) as *const i32),
+    ));
+    let row3 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
+        *(src_data.as_ptr().add(row3_start) as *const i32),
+    ));
+
+    // Find min/max using 32-bit comparisons
+    let min01 = _mm_min_epi32(row0, row1);
+    let min23 = _mm_min_epi32(row2, row3);
+    let max01 = _mm_max_epi32(row0, row1);
+    let max23 = _mm_max_epi32(row2, row3);
+
+    let min4 = _mm_min_epi32(min01, min23);
+    let max4 = _mm_max_epi32(max01, max23);
+
+    // Horizontal reduction for min
+    let min2 = _mm_min_epi32(min4, _mm_shuffle_epi32(min4, 0b00_00_11_10));
+    let min1 = _mm_min_epi32(min2, _mm_shuffle_epi32(min2, 0b00_00_00_01));
+
+    // Horizontal reduction for max
+    let max2 = _mm_max_epi32(max4, _mm_shuffle_epi32(max4, 0b00_00_11_10));
+    let max1 = _mm_max_epi32(max2, _mm_shuffle_epi32(max2, 0b00_00_00_01));
+
+    let min_val = _mm_cvtsi128_si32(min1) as u8;
+    let max_val = _mm_cvtsi128_si32(max1) as u8;
+    let dist = max_val - min_val;
+
+    let (bits, bucket_size) = bucket_lut[dist as usize];
+
+    if bits > 0 {
+        let v_min = _mm_set1_epi32(min_val as i32);
+
+        // Subtract min from all pixels
+        let res0 = _mm_sub_epi32(row0, v_min);
+        let res1 = _mm_sub_epi32(row1, v_min);
+        let res2 = _mm_sub_epi32(row2, v_min);
+        let res3 = _mm_sub_epi32(row3, v_min);
+
+        if bucket_size > 1 {
+            // Use float reciprocal like C++: int32 -> float -> multiply -> truncate
+            let v_rcp = _mm_set1_ps(1.0f32 / bucket_size as f32);
+
+            let res0 = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res0), v_rcp));
+            let res1 = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res1), v_rcp));
+            let res2 = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res2), v_rcp));
+            let res3 = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res3), v_rcp));
+
+            _mm_storeu_si128(result.as_mut_ptr().add(0) as *mut __m128i, res0);
+            _mm_storeu_si128(result.as_mut_ptr().add(4) as *mut __m128i, res1);
+            _mm_storeu_si128(result.as_mut_ptr().add(8) as *mut __m128i, res2);
+            _mm_storeu_si128(result.as_mut_ptr().add(12) as *mut __m128i, res3);
+        } else {
+            // bucket_size == 1, indices = diff directly
+            _mm_storeu_si128(result.as_mut_ptr().add(0) as *mut __m128i, res0);
+            _mm_storeu_si128(result.as_mut_ptr().add(4) as *mut __m128i, res1);
+            _mm_storeu_si128(result.as_mut_ptr().add(8) as *mut __m128i, res2);
+            _mm_storeu_si128(result.as_mut_ptr().add(12) as *mut __m128i, res3);
+        }
+    }
+
+    (min_val, dist, bits)
+}
+
+/// SSE2-only fallback (for systems without SSE4.1)
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse2",
+    not(target_feature = "sse4.1")
+))]
 #[inline(always)]
 unsafe fn process_tile_sse2(
     src_data: &[u8],
@@ -428,9 +518,208 @@ fn unpack_pixels(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize {
     }
 }
 
+/// SSSE3-optimized pack for 4-bit indices (nibble packing).
+/// Packs 16 indices into 8 bytes: dst[i] = (indices[i+8] << 4) | indices[i]
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+unsafe fn pack_pixels_4bit_ssse3(indices: &[u8; 16], dst: &mut [u8]) {
+    // Load all 16 indices
+    let v = _mm_loadu_si128(indices.as_ptr() as *const __m128i);
+
+    // Shuffle to interleave: [i0,i8, i1,i9, i2,i10, i3,i11, i4,i12, i5,i13, i6,i14, i7,i15]
+    let shuffle = _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+    let interleaved = _mm_shuffle_epi8(v, shuffle);
+
+    // Now we need to combine adjacent pairs: (lo, hi) -> (hi << 4) | lo
+    // Split into even (low nibbles) and odd (high nibbles) bytes
+    let lo_mask = _mm_set1_epi16(0x00FF_u16 as i16);
+    let lo = _mm_and_si128(interleaved, lo_mask);
+    let hi = _mm_srli_epi16(interleaved, 8);
+    let hi_shifted = _mm_slli_epi16(hi, 4);
+
+    // Combine and pack to 8 bytes
+    let combined = _mm_or_si128(lo, hi_shifted);
+
+    // Pack 16-bit values to 8-bit (only low byte of each 16-bit lane)
+    let pack_shuffle = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+    let packed = _mm_shuffle_epi8(combined, pack_shuffle);
+
+    // Store 8 bytes
+    _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, packed);
+}
+
+/// SSE4.1-optimized pack for 32-bit result arrays (matches C++ addToCompressedStream).
+/// Much faster than scalar when indices are already in 32-bit lanes.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn pack_pixels_u32(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usize {
+    match bits {
+        0 => 0,
+        1 => {
+            // Load 4 rows from 32-bit array
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(4) as *const __m128i), 1);
+            let row2 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(8) as *const __m128i), 2);
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                3,
+            );
+            let row0123 = _mm_or_si128(_mm_or_si128(row3, row2), _mm_or_si128(row1, row0));
+            let row0123 = _mm_packs_epi32(row0123, row0123);
+            let row0123 = _mm_packus_epi16(row0123, row0123);
+            let row0123 = _mm_or_si128(
+                _mm_and_si128(
+                    _mm_slli_epi16(row0123, 4),
+                    _mm_set1_epi32(0x00ff00ffu32 as i32),
+                ),
+                _mm_srli_epi16(row0123, 8),
+            );
+            let row0123 = _mm_or_si128(_mm_srli_si128(row0123, 1), row0123);
+            *(dst.as_mut_ptr() as *mut u16) = _mm_cvtsi128_si32(row0123) as u16;
+            2
+        }
+        2 => {
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(4) as *const __m128i), 2);
+            let row2 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(8) as *const __m128i), 4);
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                6,
+            );
+            let row0123 = _mm_or_si128(_mm_or_si128(row3, row2), _mm_or_si128(row1, row0));
+            let row0123 = _mm_packs_epi32(row0123, row0123);
+            let row0123 = _mm_packus_epi16(row0123, row0123);
+            *(dst.as_mut_ptr() as *mut u32) = _mm_cvtsi128_si32(row0123) as u32;
+            4
+        }
+        3 => {
+            // 3-bit packing with SSSE3 shuffle
+            #[repr(align(16))]
+            struct Aligned([u8; 16]);
+            static MASK: Aligned = Aligned([
+                0, 1, 2, 4, 5, 6, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            ]);
+
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(4) as *const __m128i), 3);
+            let row2 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(8) as *const __m128i), 6);
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                9,
+            );
+            let mut row0123 = _mm_or_si128(_mm_or_si128(row0, row1), _mm_or_si128(row2, row3));
+            row0123 = _mm_or_si128(
+                row0123,
+                _mm_shuffle_epi32(_mm_slli_epi32(row0123, 12), 0b00_00_11_10),
+            );
+            row0123 = _mm_shuffle_epi8(row0123, _mm_load_si128(MASK.0.as_ptr() as *const __m128i));
+            *(dst.as_mut_ptr() as *mut u32) = _mm_cvtsi128_si32(row0123) as u32;
+            *(dst.as_mut_ptr().add(4) as *mut u16) = _mm_extract_epi16(row0123, 2) as u16;
+            6
+        }
+        4 => {
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_loadu_si128(result.as_ptr().add(4) as *const __m128i);
+            let row2 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(8) as *const __m128i), 4);
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                4,
+            );
+            let row02 = _mm_or_si128(row0, row2);
+            let row13 = _mm_or_si128(row1, row3);
+            let row0213 = _mm_packs_epi32(row02, row13);
+            let row0213 = _mm_packus_epi16(row0213, row0213);
+            *(dst.as_mut_ptr() as *mut u32) = _mm_extract_epi32(row0213, 0) as u32;
+            *(dst.as_mut_ptr().add(4) as *mut u32) = _mm_extract_epi32(row0213, 1) as u32;
+            8
+        }
+        5 => {
+            // 5-bit packing with SSSE3 shuffle
+            #[repr(align(16))]
+            struct Aligned([u8; 16]);
+            static MASK1: Aligned = Aligned([
+                0, 1, 2, 0x80, 0x80, 8, 9, 10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            ]);
+            static MASK2: Aligned = Aligned([
+                0x80, 0x80, 4, 5, 6, 0x80, 0x80, 12, 13, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            ]);
+
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(4) as *const __m128i), 5);
+            let row2 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(8) as *const __m128i),
+                10,
+            );
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                15,
+            );
+            let row0123 = _mm_or_si128(_mm_or_si128(row0, row1), _mm_or_si128(row2, row3));
+            let row0123a =
+                _mm_shuffle_epi8(row0123, _mm_load_si128(MASK1.0.as_ptr() as *const __m128i));
+            let row0123b = _mm_shuffle_epi8(
+                _mm_slli_epi32(row0123, 4),
+                _mm_load_si128(MASK2.0.as_ptr() as *const __m128i),
+            );
+            let row0123 = _mm_or_si128(row0123a, row0123b);
+            _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, row0123);
+            *(dst.as_mut_ptr().add(8) as *mut u16) = _mm_extract_epi16(row0123, 4) as u16;
+            10
+        }
+        6 => {
+            // 6-bit packing with SSSE3 shuffle
+            #[repr(align(16))]
+            struct Aligned([u8; 16]);
+            static MASK1: Aligned = Aligned([
+                0, 1, 2, 0x80, 8, 9, 10, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            ]);
+            static MASK2: Aligned = Aligned([
+                0x80, 0x80, 4, 5, 0x80, 0x80, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                0x80,
+            ]);
+
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_slli_epi32(_mm_loadu_si128(result.as_ptr().add(4) as *const __m128i), 6);
+            let row2 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(8) as *const __m128i),
+                12,
+            );
+            let row3 = _mm_slli_epi32(
+                _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i),
+                18,
+            );
+            let row0123 = _mm_or_si128(_mm_or_si128(row0, row1), _mm_or_si128(row2, row3));
+            let row0123a =
+                _mm_shuffle_epi8(row0123, _mm_load_si128(MASK1.0.as_ptr() as *const __m128i));
+            let row0123b = _mm_shuffle_epi8(
+                _mm_slli_epi32(row0123, 8),
+                _mm_load_si128(MASK2.0.as_ptr() as *const __m128i),
+            );
+            let row0123 = _mm_or_si128(row0123a, row0123b);
+            _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, row0123);
+            *(dst.as_mut_ptr().add(8) as *mut u32) = _mm_extract_epi32(row0123, 2) as u32;
+            12
+        }
+        8 => {
+            // 8-bit: just pack down to bytes
+            let row0 = _mm_loadu_si128(result.as_ptr().add(0) as *const __m128i);
+            let row1 = _mm_loadu_si128(result.as_ptr().add(4) as *const __m128i);
+            let row2 = _mm_loadu_si128(result.as_ptr().add(8) as *const __m128i);
+            let row3 = _mm_loadu_si128(result.as_ptr().add(12) as *const __m128i);
+            let row01 = _mm_packs_epi32(row0, row1);
+            let row23 = _mm_packs_epi32(row2, row3);
+            let packed = _mm_packus_epi16(row01, row23);
+            _mm_storeu_si128(dst.as_mut_ptr() as *mut __m128i, packed);
+            16
+        }
+        _ => 0,
+    }
+}
+
 /// Pack 16 pixel indices into the compressed stream.
 ///
 /// This is the inverse of `unpack_pixels`. Returns the number of bytes written.
+#[inline(always)]
 fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
     match bits {
         0 => {
@@ -494,15 +783,23 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
         }
         4 => {
             // 16 pixels -> 8 bytes (4 bits each, nibbles)
-            dst[0] = (indices[8] << 4) | indices[0];
-            dst[1] = (indices[9] << 4) | indices[1];
-            dst[2] = (indices[10] << 4) | indices[2];
-            dst[3] = (indices[11] << 4) | indices[3];
-            dst[4] = (indices[12] << 4) | indices[4];
-            dst[5] = (indices[13] << 4) | indices[5];
-            dst[6] = (indices[14] << 4) | indices[6];
-            dst[7] = (indices[15] << 4) | indices[7];
-            8
+            #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+            {
+                unsafe { pack_pixels_4bit_ssse3(indices, dst) };
+                return 8;
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+            {
+                dst[0] = (indices[8] << 4) | indices[0];
+                dst[1] = (indices[9] << 4) | indices[1];
+                dst[2] = (indices[10] << 4) | indices[2];
+                dst[3] = (indices[11] << 4) | indices[3];
+                dst[4] = (indices[12] << 4) | indices[4];
+                dst[5] = (indices[13] << 4) | indices[5];
+                dst[6] = (indices[14] << 4) | indices[6];
+                dst[7] = (indices[15] << 4) | indices[7];
+                8
+            }
         }
         5 => {
             // 16 pixels -> 10 bytes (5 bits each)
@@ -627,12 +924,55 @@ pub fn compress_tile_block(
     let (min_stream, dist_stream) = header_and_streams.split_at_mut(num_tiles);
     let mut pixel_pos = 0usize;
 
-    // Temporary buffer for pixel indices
-    let mut indices = [0u8; 16];
-
-    // Process each 4x4 block
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    // Process each 4x4 block - use SSE4.1 optimized path if available
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
     {
+        // 32-bit aligned result buffer (matches C++ approach for efficient SIMD packing)
+        let mut result = [0u32; 16];
+
+        for y in (0..rows).step_by(4) {
+            for x in (0..width).step_by(4) {
+                let row0_start = (y * bytes_per_line + x) as usize;
+                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
+                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
+                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
+
+                // SAFETY: We've verified dimensions are multiples of 4
+                let (min_val, dist, bits) = unsafe {
+                    process_tile_sse41(
+                        src_data,
+                        row0_start,
+                        row1_start,
+                        row2_start,
+                        row3_start,
+                        &bucket_lut,
+                        &mut result,
+                    )
+                };
+
+                let block_idx = ((y * width) >> 4) + (x >> 2);
+                let block_idx = block_idx as usize;
+
+                min_stream[block_idx] = min_val;
+                dist_stream[block_idx] = dist;
+
+                if bits > 0 {
+                    let bytes_written =
+                        unsafe { pack_pixels_u32(&result, bits, &mut pixel_stream[pixel_pos..]) };
+                    pixel_pos += bytes_written;
+                }
+            }
+        }
+    }
+
+    // SSE2-only fallback (no SSE4.1)
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "sse2",
+        not(target_feature = "sse4.1")
+    ))]
+    {
+        let mut indices = [0u8; 16];
         for y in (0..rows).step_by(4) {
             for x in (0..width).step_by(4) {
                 let row0_start = (y * bytes_per_line + x) as usize;
@@ -653,15 +993,12 @@ pub fn compress_tile_block(
                     )
                 };
 
-                // Calculate block index (matches C++ indexing)
                 let block_idx = ((y * width) >> 4) + (x >> 2);
                 let block_idx = block_idx as usize;
 
-                // Store min and dist
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
-                // Pack indices into pixel stream if needed
                 if bits > 0 {
                     let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
                     pixel_pos += bytes_written;
@@ -670,8 +1007,10 @@ pub fn compress_tile_block(
         }
     }
 
+    // Scalar fallback (no SIMD)
     #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
     {
+        let mut indices = [0u8; 16];
         for y in (0..rows).step_by(4) {
             for x in (0..width).step_by(4) {
                 let row0_start = (y * bytes_per_line + x) as usize;
@@ -689,15 +1028,12 @@ pub fn compress_tile_block(
                     &mut indices,
                 );
 
-                // Calculate block index (matches C++ indexing)
                 let block_idx = ((y * width) >> 4) + (x >> 2);
                 let block_idx = block_idx as usize;
 
-                // Store min and dist
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
-                // Pack indices into pixel stream if needed
                 if bits > 0 {
                     let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
                     pixel_pos += bytes_written;
