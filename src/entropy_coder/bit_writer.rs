@@ -2,14 +2,17 @@
 //!
 //! Mirrors the BitReader interface for encoding. Bits are stored MSB-first
 //! and flushed to the output buffer in 32-bit chunks (as 2x 16-bit little-endian words).
+//!
+//! Optimized for high-throughput encoding using pointer-based writes.
 
 /// A bit writer that produces a byte stream from bits.
 ///
-/// Bits are accumulated MSB-first in a 64-bit container and flushed
-/// as 32-bit chunks (2x 16-bit LE words) when full.
+/// Uses a pre-allocated buffer with pointer-based writes for maximum performance.
 pub struct BitWriter {
-    /// Output buffer
+    /// Output buffer (pre-allocated to max size)
     output: Vec<u8>,
+    /// Current write position
+    pos: usize,
     /// Bits are packed at the MSB side
     bits: u64,
     /// Number of valid bits currently in the container
@@ -24,8 +27,12 @@ impl BitWriter {
 
     /// Create a new BitWriter with the specified initial capacity.
     pub fn with_capacity(capacity: usize) -> Self {
+        let mut output = Vec::with_capacity(capacity);
+        // Pre-fill to capacity so we can write without bounds checks
+        output.resize(capacity, 0);
         Self {
-            output: Vec::with_capacity(capacity),
+            output,
+            pos: 0,
             bits: 0,
             count: 0,
         }
@@ -50,7 +57,6 @@ impl BitWriter {
         }
 
         // Shift value to align with current bit position
-        // value is already MSB-justified (32-bit), extend to 64-bit and position
         let value64 = (value as u64) << 32;
         self.bits |= value64 >> self.count;
         self.count += num_bits as u32;
@@ -74,6 +80,7 @@ impl BitWriter {
 
     /// Flush if we have 32 or more bits accumulated.
     /// Must be called after write_packed to maintain the invariant.
+    /// Uses direct pointer writes for maximum performance.
     #[inline(always)]
     pub fn flush_if_needed(&mut self) {
         if self.count >= 32 {
@@ -81,7 +88,14 @@ impl BitWriter {
             let a = (self.bits >> 32) as u32;
             // Store as 2x uint16_t in LE format (matches C++ exactly)
             let swapped = (a >> 16) | ((a & 0xFFFF) << 16);
-            self.output.extend_from_slice(&swapped.to_ne_bytes());
+
+            // Direct pointer write - no bounds check since we pre-allocated
+            // SAFETY: pos is always within bounds due to pre-allocation
+            unsafe {
+                let ptr = self.output.as_mut_ptr().add(self.pos) as *mut u32;
+                ptr.write_unaligned(swapped);
+            }
+            self.pos += 4;
             self.bits <<= 32;
         }
     }
@@ -93,7 +107,12 @@ impl BitWriter {
         while self.count >= 16 {
             // Extract top 16 bits
             let word = (self.bits >> 48) as u16;
-            self.output.extend_from_slice(&word.to_le_bytes());
+            // SAFETY: pos is always within bounds due to pre-allocation
+            unsafe {
+                let ptr = self.output.as_mut_ptr().add(self.pos) as *mut u16;
+                ptr.write_unaligned(word.to_le());
+            }
+            self.pos += 2;
             self.bits <<= 16;
             self.count -= 16;
         }
@@ -105,27 +124,33 @@ impl BitWriter {
         // Flush any remaining bits (matches C++ flushLastData behavior)
         if self.count > 0 {
             let a = (self.bits >> 32) as u32;
-            // Store as 2x uint16_t in LE format (same as flush_if_needed)
+            // Store as 2x uint16_t in LE format
             let swapped = (a >> 16) | ((a & 0xFFFF) << 16);
-            self.output.extend_from_slice(&swapped.to_ne_bytes());
+            unsafe {
+                let ptr = self.output.as_mut_ptr().add(self.pos) as *mut u32;
+                ptr.write_unaligned(swapped);
+            }
+            self.pos += 4;
         }
+        // Truncate to actual size
+        self.output.truncate(self.pos);
         self.output
     }
 
     /// Get current output length in bytes (not including unflushed bits).
     #[allow(dead_code)]
     pub fn output_len(&self) -> usize {
-        self.output.len()
+        self.pos
     }
 
     /// Get current output length in bytes.
     pub fn len(&self) -> usize {
-        self.output.len()
+        self.pos
     }
 
     /// Check if writer is empty.
     pub fn is_empty(&self) -> bool {
-        self.output.is_empty() && self.count == 0
+        self.pos == 0 && self.count == 0
     }
 }
 

@@ -164,97 +164,190 @@ pub fn compress(
 }
 
 /// Compute delta values for the first row (horizontal differences).
-/// Uses unsafe unchecked access for performance.
+/// Uses SIMD when compiled with target features.
 #[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
 fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
-    let width = src_row.len();
-
-    // SAFETY: bounds already verified by caller
     unsafe {
-        *delta_buffer.get_unchecked_mut(0) = *src_row.get_unchecked(0);
+        compute_first_row_deltas_ssse3(src_row, delta_buffer);
+    }
+}
 
-        // Process in chunks of 4 (matches C++ non-SIMD path)
-        let mut x = 1;
-        let mut c0 = *src_row.get_unchecked(0);
+#[inline]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
+    compute_first_row_deltas_scalar(src_row, delta_buffer);
+}
 
-        while x + 3 < width {
-            let c1 = *src_row.get_unchecked(x);
-            let c2 = *src_row.get_unchecked(x + 1);
-            let c3 = *src_row.get_unchecked(x + 2);
-            let c4 = *src_row.get_unchecked(x + 3);
-            *delta_buffer.get_unchecked_mut(x) = c1.wrapping_sub(c0);
-            *delta_buffer.get_unchecked_mut(x + 1) = c2.wrapping_sub(c1);
-            *delta_buffer.get_unchecked_mut(x + 2) = c3.wrapping_sub(c2);
-            *delta_buffer.get_unchecked_mut(x + 3) = c4.wrapping_sub(c3);
-            c0 = c4;
-            x += 4;
+/// Scalar fallback for first row delta computation.
+#[inline]
+fn compute_first_row_deltas_scalar(src_row: &[u8], delta_buffer: &mut [u8]) {
+    let width = src_row.len();
+    if width == 0 {
+        return;
+    }
+
+    delta_buffer[0] = src_row[0];
+
+    for i in 1..width {
+        delta_buffer[i] = src_row[i].wrapping_sub(src_row[i - 1]);
+    }
+}
+
+/// SSSE3 optimized first row delta computation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn compute_first_row_deltas_ssse3(src_row: &[u8], delta_buffer: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let width = src_row.len();
+    if width == 0 {
+        return;
+    }
+
+    *delta_buffer.get_unchecked_mut(0) = *src_row.get_unchecked(0);
+
+    let mut x = 1;
+
+    // Process 16 bytes at a time
+    if width >= 17 {
+        let mut prev_curr = _mm_set1_epi8(*src_row.get_unchecked(0) as i8);
+
+        while x + 15 < width {
+            let curr = _mm_loadu_si128(src_row.as_ptr().add(x) as *const __m128i);
+            // Shift to get previous values: alignr(curr, prev, 15) gives [prev[15], curr[0..14]]
+            let behind = _mm_alignr_epi8::<15>(curr, prev_curr);
+            let delta = _mm_sub_epi8(curr, behind);
+            _mm_storeu_si128(delta_buffer.as_mut_ptr().add(x) as *mut __m128i, delta);
+            prev_curr = curr;
+            x += 16;
         }
+    }
 
-        // Handle remaining pixels
-        while x < width {
-            let c1 = *src_row.get_unchecked(x);
-            *delta_buffer.get_unchecked_mut(x) = c1.wrapping_sub(c0);
-            c0 = c1;
-            x += 1;
-        }
+    // Handle remaining pixels
+    let mut c0 = if x > 1 {
+        *src_row.get_unchecked(x - 1)
+    } else {
+        *src_row.get_unchecked(0)
+    };
+
+    while x < width {
+        let c1 = *src_row.get_unchecked(x);
+        *delta_buffer.get_unchecked_mut(x) = c1.wrapping_sub(c0);
+        c0 = c1;
+        x += 1;
     }
 }
 
 /// Compute delta values using average predictor (left + top) / 2.
-/// Uses unsafe unchecked access for performance.
+/// Uses SIMD when compiled with target features.
 #[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
 fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
-    let width = src_row.len();
-
-    // SAFETY: bounds already verified by caller
     unsafe {
-        // First pixel uses only top predictor
-        *delta_buffer.get_unchecked_mut(0) = src_row
-            .get_unchecked(0)
-            .wrapping_sub(*prev_row.get_unchecked(0));
+        compute_avg_predictor_deltas_ssse3(src_row, prev_row, delta_buffer);
+    }
+}
 
-        // Process remaining pixels - unrolled for better performance
-        let mut x = 1;
-        let mut left = *src_row.get_unchecked(0);
+#[inline]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
+    compute_avg_predictor_deltas_scalar(src_row, prev_row, delta_buffer);
+}
 
-        while x + 3 < width {
-            // Pixel x
-            let top0 = *prev_row.get_unchecked(x);
-            let val0 = *src_row.get_unchecked(x);
-            let avg0 = ((left as u16 + top0 as u16) >> 1) as u8;
-            *delta_buffer.get_unchecked_mut(x) = val0.wrapping_sub(avg0);
+/// Scalar fallback for average predictor computation.
+#[inline]
+fn compute_avg_predictor_deltas_scalar(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
+    let width = src_row.len();
+    if width == 0 {
+        return;
+    }
 
-            // Pixel x+1
-            let top1 = *prev_row.get_unchecked(x + 1);
-            let val1 = *src_row.get_unchecked(x + 1);
-            let avg1 = ((val0 as u16 + top1 as u16) >> 1) as u8;
-            *delta_buffer.get_unchecked_mut(x + 1) = val1.wrapping_sub(avg1);
+    // First pixel uses only top predictor
+    delta_buffer[0] = src_row[0].wrapping_sub(prev_row[0]);
 
-            // Pixel x+2
-            let top2 = *prev_row.get_unchecked(x + 2);
-            let val2 = *src_row.get_unchecked(x + 2);
-            let avg2 = ((val1 as u16 + top2 as u16) >> 1) as u8;
-            *delta_buffer.get_unchecked_mut(x + 2) = val2.wrapping_sub(avg2);
+    // Remaining pixels use average of left and top
+    let mut left = src_row[0];
+    for x in 1..width {
+        let top = prev_row[x];
+        let val = src_row[x];
+        let avg = ((left as u16 + top as u16) >> 1) as u8;
+        delta_buffer[x] = val.wrapping_sub(avg);
+        left = val;
+    }
+}
 
-            // Pixel x+3
-            let top3 = *prev_row.get_unchecked(x + 3);
-            let val3 = *src_row.get_unchecked(x + 3);
-            let avg3 = ((val2 as u16 + top3 as u16) >> 1) as u8;
-            *delta_buffer.get_unchecked_mut(x + 3) = val3.wrapping_sub(avg3);
+/// SSSE3 optimized average predictor computation.
+/// Processes 16 bytes at a time using SIMD instructions.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn compute_avg_predictor_deltas_ssse3(
+    src_row: &[u8],
+    prev_row: &[u8],
+    delta_buffer: &mut [u8],
+) {
+    use std::arch::x86_64::*;
 
-            left = val3;
-            x += 4;
+    let width = src_row.len();
+    if width == 0 {
+        return;
+    }
+
+    // First pixel uses only top predictor
+    *delta_buffer.get_unchecked_mut(0) = src_row
+        .get_unchecked(0)
+        .wrapping_sub(*prev_row.get_unchecked(0));
+
+    let mut x = 1;
+
+    // Process 16 bytes at a time with SIMD
+    if width >= 17 {
+        // Initialize "previous current" vector for shifted alignment
+        let mut prev_curr = _mm_set1_epi8(*src_row.get_unchecked(0) as i8);
+
+        while x + 15 < width {
+            // Load current row and top row (16 bytes each)
+            let curr_vec = _mm_loadu_si128(src_row.as_ptr().add(x) as *const __m128i);
+            let top_vec = _mm_loadu_si128(prev_row.as_ptr().add(x) as *const __m128i);
+
+            // Create "left" vector by shifting: take last byte of prev_curr, first 15 of curr
+            // alignr(a, b, n) = (a:b) >> (n*8), so alignr(curr, prev, 15) gives us shifted left
+            let left_vec = _mm_alignr_epi8::<15>(curr_vec, prev_curr);
+
+            // Compute average: (left + top) / 2
+            // Use the same trick as C++: avg_epu8 does (a+b+1)/2, we need to compensate
+            let c1 = _mm_set1_epi8(1);
+            let avg = _mm_avg_epu8(left_vec, top_vec); // (left + top + 1) / 2
+            let xor = _mm_xor_si128(left_vec, top_vec); // For rounding compensation
+            let and = _mm_and_si128(xor, c1);
+            let avg_correct = _mm_sub_epi8(avg, and); // Correct to floor division
+
+            // Compute residual: curr - avg
+            let residual = _mm_sub_epi8(curr_vec, avg_correct);
+
+            // Store result
+            _mm_storeu_si128(delta_buffer.as_mut_ptr().add(x) as *mut __m128i, residual);
+
+            // Save for next iteration
+            prev_curr = curr_vec;
+            x += 16;
         }
+    }
 
-        // Handle remaining pixels
-        while x < width {
-            let top = *prev_row.get_unchecked(x);
-            let val = *src_row.get_unchecked(x);
-            let avg = ((left as u16 + top as u16) >> 1) as u8;
-            *delta_buffer.get_unchecked_mut(x) = val.wrapping_sub(avg);
-            left = val;
-            x += 1;
-        }
+    // Handle remaining pixels with scalar code
+    let mut left = if x > 1 {
+        *src_row.get_unchecked(x - 1)
+    } else {
+        *src_row.get_unchecked(0)
+    };
+
+    while x < width {
+        let top = *prev_row.get_unchecked(x);
+        let val = *src_row.get_unchecked(x);
+        let avg = ((left as u16 + top as u16) >> 1) as u8;
+        *delta_buffer.get_unchecked_mut(x) = val.wrapping_sub(avg);
+        left = val;
+        x += 1;
     }
 }
 

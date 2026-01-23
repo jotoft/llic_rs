@@ -5,10 +5,29 @@
 
 use crate::{LlicError, Result};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 /// Bucket LUT entry: (bits, bucket_size)
 /// - bits: number of bits per pixel index (0, 1, 2, 3, 4, 5, 6, or 8)
 /// - bucket_size: quantization step size
 type BucketLutEntry = (u8, u8);
+
+/// Precomputed reciprocals for fast division: x / d ≈ (x * RECIP[d]) >> 16
+/// For bucket_size d in [1, 256], RECIP[d] = min(65536 / d, 65535)
+/// Using u32 to avoid overflow in computation
+static RECIPROCAL_TABLE: [u32; 257] = {
+    let mut table = [0u32; 257];
+    table[0] = 0; // unused, avoid div by zero
+    let mut i = 1usize;
+    while i <= 256 {
+        let recip = 65536u32 / i as u32;
+        // Cap at 65535 to fit in mulhi_epu16 range (though we use u32 here)
+        table[i] = if recip > 65535 { 65535 } else { recip };
+        i += 1;
+    }
+    table
+};
 
 /// Generate bucket lookup table for a given error limit (quality level).
 ///
@@ -74,6 +93,149 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
     }
 
     lut
+}
+
+/// SIMD-optimized processing of a 4x4 tile: finds min/max and quantizes pixels.
+/// Returns (min_val, dist, indices) where indices contains quantized pixel values.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+unsafe fn process_tile_sse2(
+    src_data: &[u8],
+    row0_start: usize,
+    row1_start: usize,
+    row2_start: usize,
+    row3_start: usize,
+    bucket_lut: &[BucketLutEntry; 256],
+    indices: &mut [u8; 16],
+) -> (u8, u8, u8) {
+    // Load 4 bytes from each row into a single 128-bit register
+    // We use u32 loads and combine them
+    let r0 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row0_start) as *const i32));
+    let r1 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row1_start) as *const i32));
+    let r2 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row2_start) as *const i32));
+    let r3 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row3_start) as *const i32));
+
+    // Combine: [r0 | r1 | r2 | r3] in low 16 bytes
+    let r01 = _mm_unpacklo_epi32(r0, r1);
+    let r23 = _mm_unpacklo_epi32(r2, r3);
+    let pixels = _mm_unpacklo_epi64(r01, r23);
+
+    // Find min and max using horizontal operations
+    // SSE2 approach: compare and reduce
+    let mut min_vec = pixels;
+    let mut max_vec = pixels;
+
+    // Fold 16 -> 8
+    let shifted = _mm_srli_si128(pixels, 8);
+    min_vec = _mm_min_epu8(min_vec, shifted);
+    max_vec = _mm_max_epu8(max_vec, shifted);
+
+    // Fold 8 -> 4
+    let shifted = _mm_srli_si128(min_vec, 4);
+    min_vec = _mm_min_epu8(min_vec, shifted);
+    let shifted = _mm_srli_si128(max_vec, 4);
+    max_vec = _mm_max_epu8(max_vec, shifted);
+
+    // Fold 4 -> 2
+    let shifted = _mm_srli_si128(min_vec, 2);
+    min_vec = _mm_min_epu8(min_vec, shifted);
+    let shifted = _mm_srli_si128(max_vec, 2);
+    max_vec = _mm_max_epu8(max_vec, shifted);
+
+    // Fold 2 -> 1
+    let shifted = _mm_srli_si128(min_vec, 1);
+    min_vec = _mm_min_epu8(min_vec, shifted);
+    let shifted = _mm_srli_si128(max_vec, 1);
+    max_vec = _mm_max_epu8(max_vec, shifted);
+
+    let min_val = _mm_cvtsi128_si32(min_vec) as u8;
+    let max_val = _mm_cvtsi128_si32(max_vec) as u8;
+    let dist = max_val - min_val;
+
+    let (bits, bucket_size) = bucket_lut[dist as usize];
+
+    if bits > 0 {
+        let min_vec = _mm_set1_epi8(min_val as i8);
+
+        // Subtract min from all pixels (saturating to handle underflow)
+        let diff = _mm_subs_epu8(pixels, min_vec);
+
+        if bucket_size == 1 {
+            // For bucket_size = 1, indices = diff directly (no division needed)
+            _mm_storeu_si128(indices.as_mut_ptr() as *mut __m128i, diff);
+        } else {
+            // Quantize using reciprocal multiplication: (pixel - min) / bucket_size
+            // We unpack to 16-bit for the multiply
+            let zero = _mm_setzero_si128();
+            let diff_lo = _mm_unpacklo_epi8(diff, zero); // 8 x u16
+            let diff_hi = _mm_unpackhi_epi8(diff, zero); // 8 x u16
+
+            // Multiply by reciprocal and shift: (val * recip) >> 16
+            let recip = RECIPROCAL_TABLE[bucket_size as usize];
+            let recip_vec = _mm_set1_epi16(recip as i16);
+
+            let idx_lo = _mm_mulhi_epu16(diff_lo, recip_vec);
+            let idx_hi = _mm_mulhi_epu16(diff_hi, recip_vec);
+
+            // Pack back to 8-bit
+            let idx_packed = _mm_packus_epi16(idx_lo, idx_hi);
+
+            // Store to indices array
+            _mm_storeu_si128(indices.as_mut_ptr() as *mut __m128i, idx_packed);
+        }
+    }
+
+    (min_val, dist, bits)
+}
+
+/// Scalar fallback for tile processing
+#[allow(dead_code)]
+#[inline(always)]
+fn process_tile_scalar(
+    src_data: &[u8],
+    row0_start: usize,
+    row1_start: usize,
+    row2_start: usize,
+    row3_start: usize,
+    bucket_lut: &[BucketLutEntry; 256],
+    indices: &mut [u8; 16],
+) -> (u8, u8, u8) {
+    // Find min and max
+    let mut min_val = 255u8;
+    let mut max_val = 0u8;
+
+    for (i, &start) in [row0_start, row1_start, row2_start, row3_start]
+        .iter()
+        .enumerate()
+    {
+        for xx in 0..4 {
+            let pixel = src_data[start + xx];
+            min_val = min_val.min(pixel);
+            max_val = max_val.max(pixel);
+            indices[i * 4 + xx] = pixel; // Store for later quantization
+        }
+    }
+
+    let dist = max_val - min_val;
+    let (bits, bucket_size) = bucket_lut[dist as usize];
+
+    if bits > 0 {
+        if bucket_size == 1 {
+            // For bucket_size = 1, indices = pixel - min directly
+            for idx in indices.iter_mut() {
+                *idx = idx.wrapping_sub(min_val);
+            }
+        } else {
+            // Quantize using reciprocal multiplication
+            let recip = RECIPROCAL_TABLE[bucket_size as usize];
+            for idx in indices.iter_mut() {
+                let diff = (*idx).wrapping_sub(min_val) as u32;
+                *idx = ((diff * recip) >> 16) as u8;
+            }
+        }
+    }
+
+    (min_val, dist, bits)
 }
 
 /// Unpack 16 pixel indices from the compressed stream.
@@ -469,49 +631,77 @@ pub fn compress_tile_block(
     let mut indices = [0u8; 16];
 
     // Process each 4x4 block
-    for y in (0..rows).step_by(4) {
-        for x in (0..width).step_by(4) {
-            // Find min and max in this block
-            let mut min_val = 255u8;
-            let mut max_val = 0u8;
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    {
+        for y in (0..rows).step_by(4) {
+            for x in (0..width).step_by(4) {
+                let row0_start = (y * bytes_per_line + x) as usize;
+                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
+                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
+                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
 
-            for yy in 0..4u32 {
-                let row_start = ((y + yy) * bytes_per_line + x) as usize;
-                for xx in 0..4u32 {
-                    let pixel = src_data[row_start + xx as usize];
-                    min_val = min_val.min(pixel);
-                    max_val = max_val.max(pixel);
+                // SAFETY: We've verified dimensions are multiples of 4
+                let (min_val, dist, bits) = unsafe {
+                    process_tile_sse2(
+                        src_data,
+                        row0_start,
+                        row1_start,
+                        row2_start,
+                        row3_start,
+                        &bucket_lut,
+                        &mut indices,
+                    )
+                };
+
+                // Calculate block index (matches C++ indexing)
+                let block_idx = ((y * width) >> 4) + (x >> 2);
+                let block_idx = block_idx as usize;
+
+                // Store min and dist
+                min_stream[block_idx] = min_val;
+                dist_stream[block_idx] = dist;
+
+                // Pack indices into pixel stream if needed
+                if bits > 0 {
+                    let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
+                    pixel_pos += bytes_written;
                 }
             }
+        }
+    }
 
-            let dist = max_val - min_val;
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+    {
+        for y in (0..rows).step_by(4) {
+            for x in (0..width).step_by(4) {
+                let row0_start = (y * bytes_per_line + x) as usize;
+                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
+                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
+                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
 
-            // Look up quantization parameters
-            let (bits, bucket_size) = bucket_lut[dist as usize];
+                let (min_val, dist, bits) = process_tile_scalar(
+                    src_data,
+                    row0_start,
+                    row1_start,
+                    row2_start,
+                    row3_start,
+                    &bucket_lut,
+                    &mut indices,
+                );
 
-            // Calculate block index (matches C++ indexing)
-            let block_idx = ((y * width) >> 4) + (x >> 2);
-            let block_idx = block_idx as usize;
+                // Calculate block index (matches C++ indexing)
+                let block_idx = ((y * width) >> 4) + (x >> 2);
+                let block_idx = block_idx as usize;
 
-            // Store min and dist
-            min_stream[block_idx] = min_val;
-            dist_stream[block_idx] = dist;
+                // Store min and dist
+                min_stream[block_idx] = min_val;
+                dist_stream[block_idx] = dist;
 
-            // Quantize and pack pixels if needed
-            if bits > 0 {
-                // Quantize each pixel
-                for yy in 0..4u32 {
-                    let row_start = ((y + yy) * bytes_per_line + x) as usize;
-                    for xx in 0..4u32 {
-                        let pixel = src_data[row_start + xx as usize];
-                        let idx = (yy * 4 + xx) as usize;
-                        indices[idx] = (pixel - min_val) / bucket_size;
-                    }
+                // Pack indices into pixel stream if needed
+                if bits > 0 {
+                    let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
+                    pixel_pos += bytes_written;
                 }
-
-                // Pack indices into pixel stream
-                let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
-                pixel_pos += bytes_written;
             }
         }
     }
