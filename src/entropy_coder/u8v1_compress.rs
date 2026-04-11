@@ -181,6 +181,7 @@ fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
 
 /// Scalar fallback for first row delta computation.
 #[inline]
+#[allow(dead_code)] // Used only when SSSE3 is not available
 fn compute_first_row_deltas_scalar(src_row: &[u8], delta_buffer: &mut [u8]) {
     let width = src_row.len();
     if width == 0 {
@@ -258,6 +259,7 @@ fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &
 
 /// Scalar fallback for average predictor computation.
 #[inline]
+#[allow(dead_code)] // Used only when SSSE3 is not available
 fn compute_avg_predictor_deltas_scalar(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
     let width = src_row.len();
     if width == 0 {

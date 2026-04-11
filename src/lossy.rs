@@ -99,6 +99,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
 /// - Expands pixels to 32-bit integers
 /// - Uses float reciprocal for division (very fast on modern CPUs)
 /// - Outputs to 32-bit aligned result array for efficient packing
+///
 /// Returns (min_val, dist, bits)
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
@@ -188,6 +189,7 @@ unsafe fn process_tile_sse41(
 /// Returns ((min_a, dist_a, bits_a), (min_b, dist_b, bits_b))
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn process_dual_tiles_avx2(
     src_data: &[u8],
     row0_start: usize,
@@ -793,6 +795,7 @@ fn unpack_pixels_dispatch(src: &[u8], bits: u8, result: &mut [u8; 16]) -> usize 
 /// Packs 16 indices into 8 bytes: dst[i] = (indices[i+8] << 4) | indices[i]
 #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
 #[inline(always)]
+#[allow(dead_code)] // Used only when AVX2 is not available (SSE2/scalar path)
 unsafe fn pack_pixels_4bit_ssse3(indices: &[u8; 16], dst: &mut [u8]) {
     // Load all 16 indices
     let v = _mm_loadu_si128(indices.as_ptr() as *const __m128i);
@@ -1085,6 +1088,7 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
 ///
 /// This is the inverse of `unpack_pixels`. Returns the number of bytes written.
 #[inline(always)]
+#[allow(dead_code)] // Used only when AVX2 is not available (SSE2/scalar path)
 fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
     match bits {
         0 => {
@@ -1151,7 +1155,7 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
             #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
             {
                 unsafe { pack_pixels_4bit_ssse3(indices, dst) };
-                return 8;
+                8
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
             {
