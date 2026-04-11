@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] - 2026-04-11
 
+### Fixed
+
+- Skip midpoint brightening for lossless tile decompression, matching C++ v3.3.0
+  fix. Previously lossless tiles could have slightly shifted pixel values.
+- CI clippy job no longer fails due to C++ submodule compilation or benchmark
+  targets requiring the cpp-reference feature.
+
 ### Changed
 
+- Updated C++ reference submodule from v3.2.2 to v3.3.0.
 - Optimized lossless entropy encoder with 8x unrolled encode loop, pipelined
   row processing, and pointer-based BitWriter for higher throughput.
 - Added SSE4.1 SIMD tile processing for lossy compression using float

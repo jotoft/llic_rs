@@ -1627,6 +1627,7 @@ fn decompress_tile_block_impl(
 
     // Generate bucket LUT for the actual error_limit from the block
     let bucket_lut = generate_bucket_lut(error_limit);
+    let is_lossless = error_limit == 0;
 
     if compressed_header {
         // Compressed header - decompress min/dist streams using entropy coder
@@ -1682,6 +1683,7 @@ fn decompress_tile_block_impl(
             rows,
             bytes_per_line,
             &bucket_lut,
+            is_lossless,
             dst_graymap,
         )
     } else {
@@ -1702,6 +1704,7 @@ fn decompress_tile_block_impl(
             rows,
             bytes_per_line,
             &bucket_lut,
+            is_lossless,
             dst_graymap,
         )
     }
@@ -1709,7 +1712,7 @@ fn decompress_tile_block_impl(
 
 /// Helper for decompressing with a pre-decompressed header buffer.
 /// Reserved for future compressed header support.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn decompress_tile_block_with_header(
     header_buffer: &[u8],
     pixel_stream: &[u8],
@@ -1717,6 +1720,7 @@ fn decompress_tile_block_with_header(
     rows: u32,
     bytes_per_line: u32,
     bucket_lut: &[BucketLutEntry; 256],
+    is_lossless: bool,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     let num_blocks = ((width / 4) * (rows / 4)) as usize;
@@ -1732,6 +1736,7 @@ fn decompress_tile_block_with_header(
         rows,
         bytes_per_line,
         bucket_lut,
+        is_lossless,
         dst_graymap,
     )
 }
@@ -1846,6 +1851,7 @@ fn decompress_tiles(
     rows: u32,
     bytes_per_line: u32,
     bucket_lut: &[BucketLutEntry; 256],
+    is_lossless: bool,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     let mut pixel_pos = 0usize;
@@ -1862,8 +1868,9 @@ fn decompress_tiles(
             // Look up bits and bucket_size from LUT
             let (bits, bucket_size) = bucket_lut[dist as usize];
 
-            // Add back light lost during quantization
-            let min_adjusted = min_val.saturating_add(bucket_size >> 1);
+            // Add back light lost during quantization (skip for lossless)
+            let midpoint = if is_lossless { 0 } else { bucket_size >> 1 };
+            let min_adjusted = min_val.saturating_add(midpoint);
 
             if bits == 0 {
                 // All pixels in this block are the same value

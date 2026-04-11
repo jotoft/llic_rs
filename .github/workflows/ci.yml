@@ -38,7 +38,7 @@ jobs:
           components: clippy
 
       - name: Clippy
-        run: cargo clippy --all-targets --features std -- -D warnings
+        run: cargo clippy --lib --tests --bins --features std -- -D warnings
 
   test:
     name: Tests
