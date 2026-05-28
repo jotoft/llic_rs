@@ -104,8 +104,16 @@ impl LlicContext {
         let version = src_data[0];
         let num_blocks = src_data[1];
 
-        // Support format versions 3 and 4
-        if version != 3 && version != 4 {
+        // Support format versions 1, 3 and 4.
+        //
+        // Experimental: v1 has the same on-disk layout as v3 entropy-coded
+        // lossless at the header level (version, num_blocks, type_byte, then
+        // a u32-LE block-sizes table), so we accept it via the v3 path and
+        // let the per-block entropy decoder run as-is. If the per-block
+        // payload turns out to have changed between v1 and v3 the decoder
+        // will fail with a regular entropy_coder error rather than
+        // UnsupportedFormat — we want to know either way.
+        if version != 1 && version != 3 && version != 4 {
             return Err(LlicError::UnsupportedFormat);
         }
 
@@ -121,7 +129,7 @@ impl LlicContext {
             };
             (tile_based, mode, 4usize)
         } else {
-            // Format v3: [version][num_blocks][quality_or_block_size_byte...]
+            // Format v1 / v3: [version][num_blocks][quality_or_block_size_byte...]
             // If byte 2 is 0, it's entropy-coded lossless (tile_based = false)
             // If byte 2 is non-0, it's tile-based (byte 2 is first byte of block sizes)
             let is_entropy_lossless = src_data[2] == 0;
@@ -278,21 +286,10 @@ impl LlicContext {
         Ok((quality, mode))
     }
 
-    /// Compress grayscale image data.
+    /// Compress grayscale image data using the current format version (v4).
     ///
-    /// # Arguments
-    /// * `src_graymap` - Source pixel data (row-major, 8-bit grayscale)
-    /// * `quality` - Compression quality level
-    /// * `mode` - Compression mode (Default or Fast)
-    /// * `dst_data` - Output buffer for compressed data
-    ///
-    /// # Returns
-    /// Number of bytes written to dst_data, or error.
-    ///
-    /// # Format
-    /// Uses format v4: `[version=4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]`
-    /// - `tile_based=1` for all qualities except LosslessEntropy
-    /// - `tile_based=0` for LosslessEntropy (legacy entropy-coded path)
+    /// Equivalent to calling [`compress_gray8_versioned`](Self::compress_gray8_versioned)
+    /// with `format_version = FORMAT_VERSION`.
     pub fn compress_gray8(
         &self,
         src_graymap: &[u8],
@@ -300,16 +297,53 @@ impl LlicContext {
         mode: Mode,
         dst_data: &mut [u8],
     ) -> Result<usize> {
-        // Verify source buffer size
+        self.compress_gray8_versioned(src_graymap, quality, mode, FORMAT_VERSION, dst_data)
+    }
+
+    /// Compress grayscale image data with an explicit format version.
+    ///
+    /// # Arguments
+    /// * `src_graymap` - Source pixel data (row-major, 8-bit grayscale)
+    /// * `quality` - Compression quality level
+    /// * `mode` - Compression mode (Default, Fast, Dynamic)
+    /// * `format_version` - LLIC container format version: 3 or 4
+    /// * `dst_data` - Output buffer for compressed data
+    ///
+    /// # Returns
+    /// Number of bytes written to dst_data, or error.
+    ///
+    /// # Format
+    /// - v4: `[version=4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]`
+    /// - v3 entropy-coded: `[version=3][num_blocks=1][0x00][block_size:u32 LE][data]`
+    /// - v3 tile-based: `[version=3][num_blocks=1][block_size:u32 LE][data]`
+    ///
+    /// In v3 the entropy-vs-tile discriminator is "byte 2 == 0", so for v3
+    /// tile-based the least-significant byte of `block_size` must be non-zero;
+    /// the call returns `UnsupportedFormat` in the rare case it lands on 0.
+    ///
+    /// v3 has no mode field, so only `Mode::Default` is accepted; `Fast` and
+    /// `Dynamic` return `UnsupportedFormat`.
+    pub fn compress_gray8_versioned(
+        &self,
+        src_graymap: &[u8],
+        quality: Quality,
+        mode: Mode,
+        format_version: u8,
+        dst_data: &mut [u8],
+    ) -> Result<usize> {
+        if format_version != 3 && format_version != 4 {
+            return Err(LlicError::UnsupportedFormat);
+        }
+        if format_version == 3 && mode != Mode::Default {
+            return Err(LlicError::UnsupportedFormat);
+        }
+
         let expected_size = self.height as usize * self.bytes_per_line as usize;
         if src_graymap.len() < expected_size {
             return Err(LlicError::InvalidArgument);
         }
 
-        // Determine if using entropy-coded path (legacy) or tile-based path
         let use_entropy = quality == Quality::LosslessEntropy;
-
-        // Get error_limit for tile-based compression
         let error_limit = match quality {
             Quality::Lossless | Quality::LosslessEntropy => 0,
             Quality::VeryHigh => 2,
@@ -319,10 +353,9 @@ impl LlicContext {
             Quality::VeryLow => 32,
         };
 
-        if use_entropy {
-            // Legacy entropy-coded lossless path
-            // Use dynamic predictor when mode is Dynamic
-            let compressed = if mode == Mode::Dynamic {
+        // Run the chosen algorithm — block payload is identical across versions.
+        let compressed: Vec<u8> = if use_entropy {
+            if mode == Mode::Dynamic {
                 entropy_coder::compress_dynamic(
                     src_graymap,
                     self.width,
@@ -331,40 +364,11 @@ impl LlicContext {
                 )?
             } else {
                 entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?
-            };
-
-            // Build LLIC v4 format header for entropy-coded
-            // Format: [version=4][num_blocks=1][tile_based=0][mode][block_size:u32 LE][data]
-            let header_size = 4 + 4; // 4 header bytes + 1 block size
-            let total_size = header_size + compressed.len();
-
-            if dst_data.len() < total_size {
-                return Err(LlicError::InvalidArgument);
             }
-
-            // Write header
-            dst_data[0] = FORMAT_VERSION;
-            dst_data[1] = 1; // num_blocks
-            dst_data[2] = 0; // tile_based = false
-            dst_data[3] = mode as u8;
-
-            // Block size (little-endian u32)
-            let block_size = compressed.len() as u32;
-            dst_data[4..8].copy_from_slice(&block_size.to_le_bytes());
-
-            // Copy compressed data
-            dst_data[8..total_size].copy_from_slice(&compressed);
-
-            Ok(total_size)
         } else {
-            // Tile-based compression (all qualities including lossless)
-            // Determine if we should compress headers based on mode
-            // Fast mode: no header compression
-            // Default/Dynamic: compress headers (Dynamic uses adaptive predictor in entropy coder)
             let compress_header = mode != Mode::Fast;
             let use_dynamic_predictor = mode == Mode::Dynamic;
-
-            let compressed = lossy::compress_tile_block(
+            lossy::compress_tile_block(
                 src_graymap,
                 self.width,
                 self.height,
@@ -372,31 +376,62 @@ impl LlicContext {
                 error_limit,
                 compress_header,
                 use_dynamic_predictor,
-            )?;
+            )?
+        };
 
-            // Build LLIC v4 format header for tile-based
-            // Format: [version=4][num_blocks=1][tile_based=1][mode][block_size:u32 LE][data]
-            let header_size = 4 + 4; // 4 header bytes + 1 block size
-            let total_size = header_size + compressed.len();
+        let block_size_u32 = compressed.len() as u32;
+        let block_size_bytes = block_size_u32.to_le_bytes();
 
-            if dst_data.len() < total_size {
-                return Err(LlicError::InvalidArgument);
+        match format_version {
+            4 => {
+                // [4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]
+                let header_size = 4 + 4;
+                let total = header_size + compressed.len();
+                if dst_data.len() < total {
+                    return Err(LlicError::InvalidArgument);
+                }
+                dst_data[0] = 4;
+                dst_data[1] = 1;
+                dst_data[2] = if use_entropy { 0 } else { 1 };
+                dst_data[3] = mode as u8;
+                dst_data[4..8].copy_from_slice(&block_size_bytes);
+                dst_data[8..total].copy_from_slice(&compressed);
+                Ok(total)
             }
-
-            // Write header
-            dst_data[0] = FORMAT_VERSION;
-            dst_data[1] = 1; // num_blocks
-            dst_data[2] = 1; // tile_based = true
-            dst_data[3] = mode as u8;
-
-            // Block size (little-endian u32)
-            let block_size = compressed.len() as u32;
-            dst_data[4..8].copy_from_slice(&block_size.to_le_bytes());
-
-            // Copy compressed data
-            dst_data[8..total_size].copy_from_slice(&compressed);
-
-            Ok(total_size)
+            3 => {
+                if use_entropy {
+                    // [3][1][0x00][block_size:u32 LE][data]
+                    let header_size = 3 + 4;
+                    let total = header_size + compressed.len();
+                    if dst_data.len() < total {
+                        return Err(LlicError::InvalidArgument);
+                    }
+                    dst_data[0] = 3;
+                    dst_data[1] = 1;
+                    dst_data[2] = 0;
+                    dst_data[3..7].copy_from_slice(&block_size_bytes);
+                    dst_data[7..total].copy_from_slice(&compressed);
+                    Ok(total)
+                } else {
+                    // [3][1][block_size:u32 LE][data]
+                    // Decoder uses (byte 2 == 0) to mean entropy-coded, so the
+                    // first byte of block_size (its LSB) must be non-zero.
+                    if (block_size_u32 & 0xFF) == 0 {
+                        return Err(LlicError::UnsupportedFormat);
+                    }
+                    let header_size = 2 + 4;
+                    let total = header_size + compressed.len();
+                    if dst_data.len() < total {
+                        return Err(LlicError::InvalidArgument);
+                    }
+                    dst_data[0] = 3;
+                    dst_data[1] = 1;
+                    dst_data[2..6].copy_from_slice(&block_size_bytes);
+                    dst_data[6..total].copy_from_slice(&compressed);
+                    Ok(total)
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }
@@ -910,5 +945,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn gradient_image(width: u32, height: u32) -> Vec<u8> {
+        let mut img = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                img.push(((x * 7 + y * 13) & 0xFF) as u8);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn v3_entropy_roundtrip() {
+        let width = 32;
+        let height = 16;
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        let n = ctx
+            .compress_gray8_versioned(
+                &src,
+                Quality::LosslessEntropy,
+                Mode::Default,
+                3,
+                &mut buf,
+            )
+            .expect("v3 entropy compress");
+        assert_eq!(buf[0], 3, "version byte");
+        assert_eq!(buf[1], 1, "num_blocks");
+        assert_eq!(buf[2], 0, "type byte for entropy-coded");
+
+        let mut decoded = vec![0u8; (width * height) as usize];
+        let (q, m) = ctx
+            .decompress_gray8(&buf[..n], &mut decoded)
+            .expect("v3 entropy decompress");
+        assert_eq!(q, Quality::LosslessEntropy);
+        assert_eq!(m, Mode::Default);
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn v3_tile_lossless_roundtrip() {
+        let width = 32;
+        let height = 16;
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        let res = ctx.compress_gray8_versioned(
+            &src,
+            Quality::Lossless,
+            Mode::Default,
+            3,
+            &mut buf,
+        );
+        // Tile-based v3 can sporadically reject when the block-size LSB is 0;
+        // for this fixture the size is well-defined and non-zero. If a future
+        // codec change collides on this fixture, regenerate with a different
+        // image rather than expanding the assertion.
+        let n = res.expect("v3 tile-based compress");
+        assert_eq!(buf[0], 3, "version byte");
+        assert_eq!(buf[1], 1, "num_blocks");
+        assert_ne!(buf[2], 0, "byte 2 must be non-zero (LSB of block_size)");
+
+        let mut decoded = vec![0u8; (width * height) as usize];
+        let (q, _m) = ctx
+            .decompress_gray8(&buf[..n], &mut decoded)
+            .expect("v3 tile-based decompress");
+        assert_eq!(q, Quality::Lossless);
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn v3_rejects_fast_and_dynamic() {
+        let width = 16;
+        let height = 16;
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        assert!(matches!(
+            ctx.compress_gray8_versioned(&src, Quality::LosslessEntropy, Mode::Fast, 3, &mut buf),
+            Err(LlicError::UnsupportedFormat)
+        ));
+        assert!(matches!(
+            ctx.compress_gray8_versioned(&src, Quality::Lossless, Mode::Dynamic, 3, &mut buf),
+            Err(LlicError::UnsupportedFormat)
+        ));
+    }
+
+    #[test]
+    fn v3_rejects_unknown_version() {
+        let width = 16;
+        let height = 16;
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        assert!(matches!(
+            ctx.compress_gray8_versioned(
+                &src,
+                Quality::LosslessEntropy,
+                Mode::Default,
+                2,
+                &mut buf
+            ),
+            Err(LlicError::UnsupportedFormat)
+        ));
+    }
+
+    #[test]
+    fn compress_gray8_still_defaults_to_v4() {
+        let width = 16;
+        let height = 16;
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        let n = ctx
+            .compress_gray8(&src, Quality::LosslessEntropy, Mode::Default, &mut buf)
+            .expect("v4 compress");
+        assert_eq!(buf[0], FORMAT_VERSION);
+        assert_eq!(buf[0], 4);
+        // Sanity round-trip
+        let mut decoded = vec![0u8; (width * height) as usize];
+        ctx.decompress_gray8(&buf[..n], &mut decoded).unwrap();
+        assert_eq!(decoded, src);
     }
 }
