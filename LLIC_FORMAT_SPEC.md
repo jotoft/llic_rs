@@ -17,42 +17,73 @@ LLIC files have two distinct structures:
 This is a simple text header followed by binary data:
 
 ```
+LLSC\n
 <width> <height>\n
 <compressed_size>\n
 <binary_compressed_data>
 ```
 
+- **LLSC**: Magic identifier. Parsers also accept legacy files without it.
 - **width, height**: ASCII decimal numbers representing image dimensions
 - **compressed_size**: ASCII decimal number of compressed data bytes
 - **binary_compressed_data**: Raw compressed stream (see below)
 
 ### 2. Raw Compressed Stream Format
 
-The actual compressed data stream has the following structure:
+Byte 0 of the stream is the format version. Two versions are emitted and
+decoded by this implementation: v4 (current) and v3 (legacy). They differ only
+in the fixed header; the block-size table and per-block payloads are identical.
 
-#### Header (3 bytes)
+#### Format v4 Header (4 bytes)
 
-| Offset | Size | Description                         |
-|--------|------|-------------------------------------|
-| 0      | 1    | Format version (currently 3)        |
-| 1      | 1    | Number of compressed blocks/threads |
-| 2      | 1    | Quality/mode byte (see below)       |
+| Offset | Size | Description                                          |
+|--------|------|------------------------------------------------------|
+| 0      | 1    | Format version = 4                                   |
+| 1      | 1    | Number of compressed blocks/threads                  |
+| 2      | 1    | Stream type: 0 = entropy-coded lossless, 1 = tile-based |
+| 3      | 1    | Mode: 0 = Default, 1 = Fast, 2 = Dynamic             |
 
-#### Quality/Mode Byte (offset 2)
+The block-size table starts at offset 4.
 
-For lossless compression with default mode:
+#### Format v3 Header (variable)
 
-- Value: 0x00
+v3 has no stream-type or mode byte. The decoder discriminates on byte 2:
 
-For lossy/tile-based compression:
+- **Entropy-coded lossless**: byte 2 is a `0x00` marker; the block-size table
+  starts at offset 3.
 
-- Contains the quality value (0, 2, 4, 8, 16) and is written by the tile-based compressor
+  | Offset | Size | Description                         |
+  |--------|------|-------------------------------------|
+  | 0      | 1    | Format version = 3                  |
+  | 1      | 1    | Number of compressed blocks/threads |
+  | 2      | 1    | 0x00 (entropy-coded marker)         |
+
+- **Tile-based**: the block-size table starts directly at offset 2, so byte 2
+  is the least-significant byte of the first block size and **must be
+  non-zero**. There is no quality byte in the header — the quality (error
+  limit) lives in bits 0–6 of the first payload byte, and the mode in bit 7
+  (1 = compressed tile headers = Default, 0 = Fast). Dynamic mode is not
+  representable in v3.
+
+  | Offset | Size | Description                         |
+  |--------|------|-------------------------------------|
+  | 0      | 1    | Format version = 3                  |
+  | 1      | 1    | Number of compressed blocks/threads |
+  | 2      | ...  | Block-size table (LSB must be ≠ 0)  |
+
+  **Writer rule (padding)**: if a tile-based payload length is a multiple of
+  256, the writer must append one zero pad byte and count it in the block
+  size, so that the size's LSB stays non-zero. Decoders use block sizes only
+  to locate the next block and read tile streams by need, so the pad byte is
+  never read. In practice the current encoders always produce odd payload
+  lengths (the entropy coder flushes 16-bit words and pixel data is an even
+  byte count per tile), so the pad is defensive.
 
 #### Block Size Table
 
-Following the header:
+Following the fixed header:
 
-- Array of `uint32_t` values (4 bytes each)
+- Array of `uint32_t` values (4 bytes each, little-endian)
 - Number of entries = number of blocks (from header byte 1)
 - Each entry contains the compressed size of that block
 
@@ -158,12 +189,13 @@ Quantized indices are packed efficiently based on bit count:
 | HIGH      | 4     | 4           | High quality           |
 | MEDIUM    | 8     | 8           | Medium quality         |
 | LOW       | 16    | 16          | Low quality            |
+| VERY_LOW  | 32    | 32          | Very low quality       |
 
 ## Constraints
 
 1. Image dimensions must be non-zero multiples of 4
 2. Only 8-bit grayscale images are supported
-3. Maximum supported format version is 3
+3. Maximum supported format version is 4; the decoder accepts versions 3 and 4
 4. Multi-threaded compression splits image into horizontal strips
 
 ## Implementation Notes
@@ -185,9 +217,11 @@ For multi-threaded processing:
 ### Decoding Process
 
 1. Read format version and validate
-2. Read number of blocks and quality/mode
-3. Read block size table
-4. For each block:
+2. Read number of blocks
+3. Determine stream type and mode: from header bytes 2 and 3 (v4), or from
+   the byte-2 discriminator and the first payload byte (v3)
+4. Read block size table
+5. For each block:
     - Decompress using appropriate algorithm
     - Write to correct position in output image
 
@@ -202,21 +236,30 @@ For each 4x4 block:
 
 ## Example File Analysis
 
-A lossless 8x8 image compressed file:
+A v3 entropy-coded lossless 8x8 image:
 
 ```
-Header: 03 01 00  (version=3, blocks=1, quality=lossless)
+Header: 03 01 00  (version=3, blocks=1, entropy-coded marker)
 Block size: 10 00 00 00  (16 bytes)
 Compressed data: [entropy coded data]
 ```
 
-A lossy 8x8 image with quality=4:
+A v3 tile-based 8x8 image with quality=4 (note: no quality byte in the
+header — the block-size table follows the version and block count directly):
 
 ```
-Header: 03 01 04  (version=3, blocks=1, quality=4)
-Block size: [size]
-General header: 04  (error_limit=4, no header compression)
-Min stream: [4 bytes for 4 blocks]
-Dist stream: [4 bytes for 4 blocks]
+Header: 03 01  (version=3, blocks=1)
+Block size: [size, LSB must be non-zero]
+General header: 04  (error_limit=4, bit 7 clear = uncompressed header = Fast)
+Min stream: [4 bytes for 4 tiles]
+Dist stream: [4 bytes for 4 tiles]
 Pixel stream: [variable packed data]
+```
+
+The same image in v4:
+
+```
+Header: 04 01 01 00  (version=4, blocks=1, tile-based, mode=Default)
+Block size: [size]
+General header + streams: [as above]
 ```
