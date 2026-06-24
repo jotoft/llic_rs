@@ -1,7 +1,6 @@
 //! FFI bindings to the C++ llic library for benchmarking comparisons.
 
 use std::ffi::c_char;
-use std::os::raw::c_int;
 
 /// Compression quality levels (matches C++ llic_quality_t)
 #[repr(C)]
