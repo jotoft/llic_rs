@@ -957,13 +957,7 @@ mod tests {
         let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
         let mut buf = vec![0u8; ctx.compressed_buffer_size()];
         let n = ctx
-            .compress_gray8_versioned(
-                &src,
-                Quality::LosslessEntropy,
-                Mode::Default,
-                3,
-                &mut buf,
-            )
+            .compress_gray8_versioned(&src, Quality::LosslessEntropy, Mode::Default, 3, &mut buf)
             .expect("v3 entropy compress");
         assert_eq!(buf[0], 3, "version byte");
         assert_eq!(buf[1], 1, "num_blocks");
@@ -985,13 +979,7 @@ mod tests {
         let src = gradient_image(width, height);
         let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
         let mut buf = vec![0u8; ctx.compressed_buffer_size()];
-        let res = ctx.compress_gray8_versioned(
-            &src,
-            Quality::Lossless,
-            Mode::Default,
-            3,
-            &mut buf,
-        );
+        let res = ctx.compress_gray8_versioned(&src, Quality::Lossless, Mode::Default, 3, &mut buf);
         // Tile-based v3 can sporadically reject when the block-size LSB is 0;
         // for this fixture the size is well-defined and non-zero. If a future
         // codec change collides on this fixture, regenerate with a different
