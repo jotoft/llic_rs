@@ -1,10 +1,11 @@
-//! Criterion benchmarks comparing Rust and C++ LLIC implementations.
+//! Criterion benchmarks for the Rust LLIC implementation.
+//!
+//! These benchmarks are self-contained (no C++ dependency). For a head-to-head
+//! comparison against the C++ reference, see the `llic-cpp-bench` crate
+//! (`cargo bench -p llic-cpp-bench`), which requires the `llic` git submodule.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use llic::{
-    ffi::{CppLlicContext, LlicMode, LlicQuality},
-    LlicContext, Quality,
-};
+use llic::{LlicContext, Quality};
 
 /// Generate a gradient test image of the specified size
 fn generate_gradient_image(width: u32, height: u32) -> Vec<u8> {
@@ -42,6 +43,16 @@ fn generate_noise_image(width: u32, height: u32) -> Vec<u8> {
         *pixel = (seed >> 33) as u8;
     }
     data
+}
+
+/// Compress an image losslessly with the Rust codec (helper for decompression benches).
+fn rust_compress_lossless(ctx: &LlicContext, image: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+    let size = ctx
+        .compress_gray8(image, Quality::Lossless, llic::Mode::Default, &mut buf)
+        .unwrap();
+    buf.truncate(size);
+    buf
 }
 
 /// Read test data from the actual llic file format
@@ -86,29 +97,9 @@ fn benchmark_decompression(c: &mut Criterion) {
         let pixel_count = (width * height) as usize;
         group.throughput(Throughput::Bytes(pixel_count as u64));
 
-        // Generate test image and compress with C++
         let original = generate_gradient_image(width, height);
-
-        // Use C++ to compress (so we have valid compressed data)
-        let mut cpp_ctx: CppLlicContext = match CppLlicContext::new(width, height, 1) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!("Failed to create C++ context for {}: {:?}", label, e);
-                continue;
-            }
-        };
-
-        let compressed = match cpp_ctx.compress(&original, LlicQuality::Lossless, LlicMode::Default)
-        {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("Failed to compress with C++ for {}: {:?}", label, e);
-                continue;
-            }
-        };
-
-        // Benchmark Rust decompression
         let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let compressed = rust_compress_lossless(&rust_ctx, &original);
 
         group.bench_with_input(
             BenchmarkId::new("rust", label),
@@ -119,17 +110,6 @@ fn benchmark_decompression(c: &mut Criterion) {
                     rust_ctx
                         .decompress_gray8(black_box(compressed), black_box(&mut output))
                         .unwrap();
-                });
-            },
-        );
-
-        // Benchmark C++ decompression
-        group.bench_with_input(
-            BenchmarkId::new("cpp", label),
-            &compressed,
-            |b, compressed| {
-                b.iter(|| {
-                    cpp_ctx.decompress(black_box(compressed)).unwrap();
                 });
             },
         );
@@ -154,7 +134,6 @@ fn benchmark_compression(c: &mut Criterion) {
 
         let image = generate_gradient_image(width, height);
 
-        // Benchmark Rust lossless compression
         let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
         let mut rust_output = vec![0u8; rust_ctx.compressed_buffer_size()];
 
@@ -171,40 +150,6 @@ fn benchmark_compression(c: &mut Criterion) {
                             black_box(&mut rust_output),
                         )
                         .unwrap()
-                });
-            },
-        );
-
-        // Benchmark C++ lossless compression
-        let mut cpp_ctx: CppLlicContext = match CppLlicContext::new(width, height, 1) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!("Failed to create C++ context for {}: {:?}", label, e);
-                continue;
-            }
-        };
-
-        group.bench_with_input(
-            BenchmarkId::new("cpp_lossless", label),
-            &image,
-            |b, image| {
-                b.iter(|| {
-                    cpp_ctx
-                        .compress(black_box(image), LlicQuality::Lossless, LlicMode::Default)
-                        .unwrap();
-                });
-            },
-        );
-
-        // Also benchmark lossy compression (C++ only, Rust doesn't support lossy yet)
-        group.bench_with_input(
-            BenchmarkId::new("cpp_lossy_high", label),
-            &image,
-            |b, image| {
-                b.iter(|| {
-                    cpp_ctx
-                        .compress(black_box(image), LlicQuality::High, LlicMode::Default)
-                        .unwrap();
                 });
             },
         );
@@ -229,7 +174,6 @@ fn benchmark_roundtrip(c: &mut Criterion) {
 
         let image = generate_pattern_image(width, height);
 
-        // Benchmark Rust roundtrip
         let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
         let mut compressed_buf = vec![0u8; rust_ctx.compressed_buffer_size()];
         let mut decompressed = vec![0u8; pixel_count];
@@ -250,24 +194,6 @@ fn benchmark_roundtrip(c: &mut Criterion) {
                         black_box(&mut decompressed),
                     )
                     .unwrap()
-            });
-        });
-
-        // Benchmark C++ roundtrip
-        let mut cpp_ctx: CppLlicContext = match CppLlicContext::new(width, height, 1) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!("Failed to create C++ context for {}: {:?}", label, e);
-                continue;
-            }
-        };
-
-        group.bench_with_input(BenchmarkId::new("cpp", label), &image, |b, image| {
-            b.iter(|| {
-                let compressed = cpp_ctx
-                    .compress(black_box(image), LlicQuality::Lossless, LlicMode::Default)
-                    .unwrap();
-                cpp_ctx.decompress(black_box(&compressed)).unwrap()
             });
         });
     }
@@ -320,13 +246,12 @@ fn read_pgm_file(path: &str) -> Option<(u32, u32, Vec<u8>)> {
 fn benchmark_real_file(c: &mut Criterion) {
     let mut group = c.benchmark_group("real_file");
 
-    // Test decompression with the actual 64x64 pattern file
+    // Test decompression with the actual 64x64 pattern file (skipped if absent)
     if let Some((width, height, compressed)) = read_llic_file("test_data/patterns_64x64_q0.llic") {
         let pixel_count = (width * height) as usize;
         group.throughput(Throughput::Bytes(pixel_count as u64));
 
         let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
-        let mut cpp_ctx = CppLlicContext::new(width, height, 1).unwrap();
 
         group.bench_function("rust_decompress_patterns_64x64", |b| {
             let mut output = vec![0u8; pixel_count];
@@ -336,22 +261,15 @@ fn benchmark_real_file(c: &mut Criterion) {
                     .unwrap();
             });
         });
-
-        group.bench_function("cpp_decompress_patterns_64x64", |b| {
-            b.iter(|| {
-                cpp_ctx.decompress(black_box(&compressed)).unwrap();
-            });
-        });
     }
 
-    // Test compression with actual PGM file
+    // Test compression with actual PGM file (skipped if absent)
     if let Some((width, height, image_data)) = read_pgm_file("test_data/patterns_64x64.pgm") {
         let pixel_count = (width * height) as usize;
         group.throughput(Throughput::Bytes(pixel_count as u64));
 
         let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
         let mut rust_output = vec![0u8; rust_ctx.compressed_buffer_size()];
-        let mut cpp_ctx = CppLlicContext::new(width, height, 1).unwrap();
 
         group.bench_function("rust_compress_patterns_64x64", |b| {
             b.iter(|| {
@@ -363,18 +281,6 @@ fn benchmark_real_file(c: &mut Criterion) {
                         black_box(&mut rust_output),
                     )
                     .unwrap()
-            });
-        });
-
-        group.bench_function("cpp_compress_patterns_64x64", |b| {
-            b.iter(|| {
-                cpp_ctx
-                    .compress(
-                        black_box(&image_data),
-                        LlicQuality::Lossless,
-                        LlicMode::Default,
-                    )
-                    .unwrap();
             });
         });
     }
@@ -389,24 +295,25 @@ fn benchmark_modes(c: &mut Criterion) {
 
     let image = generate_gradient_image(width, height);
 
-    // Modes to test (Rust enum, C++ enum, name)
-    let modes: &[(llic::Mode, LlicMode, &str)] = &[
-        (llic::Mode::Default, LlicMode::Default, "default"),
-        (llic::Mode::Fast, LlicMode::Fast, "fast"),
-        (llic::Mode::Dynamic, LlicMode::Dynamic, "dynamic"),
+    // Modes to test (Rust enum, name)
+    let modes: &[(llic::Mode, &str)] = &[
+        (llic::Mode::Default, "default"),
+        (llic::Mode::Fast, "fast"),
+        (llic::Mode::Dynamic, "dynamic"),
     ];
 
     let rust_ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
-    let mut cpp_ctx = CppLlicContext::new(width, height, 1).unwrap();
 
-    // Pre-compress with each mode using C++ (for decompression benchmarks)
+    // Pre-compress with each mode (for decompression benchmarks)
     let compressed_data: Vec<(&str, Vec<u8>)> = modes
         .iter()
-        .map(|(_, cpp_mode, name)| {
-            let compressed = cpp_ctx
-                .compress(&image, LlicQuality::Lossless, *cpp_mode)
+        .map(|(mode, name)| {
+            let mut buf = vec![0u8; rust_ctx.compressed_buffer_size()];
+            let size = rust_ctx
+                .compress_gray8(&image, Quality::Lossless, *mode, &mut buf)
                 .unwrap();
-            (*name, compressed)
+            buf.truncate(size);
+            (*name, buf)
         })
         .collect();
 
@@ -417,8 +324,8 @@ fn benchmark_modes(c: &mut Criterion) {
 
         let mut rust_output = vec![0u8; rust_ctx.compressed_buffer_size()];
 
-        for &(rust_mode, _, mode_name) in modes {
-            group.bench_function(&format!("rust_{}", mode_name), |b| {
+        for &(rust_mode, mode_name) in modes {
+            group.bench_function(format!("rust_{}", mode_name), |b| {
                 b.iter(|| {
                     rust_ctx
                         .compress_gray8(
@@ -432,16 +339,6 @@ fn benchmark_modes(c: &mut Criterion) {
             });
         }
 
-        for &(_, cpp_mode, mode_name) in modes {
-            group.bench_function(&format!("cpp_{}", mode_name), |b| {
-                b.iter(|| {
-                    cpp_ctx
-                        .compress(black_box(&image), LlicQuality::Lossless, cpp_mode)
-                        .unwrap();
-                });
-            });
-        }
-
         group.finish();
     }
 
@@ -451,20 +348,12 @@ fn benchmark_modes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(pixel_count as u64));
 
         for (mode_name, compressed) in &compressed_data {
-            // Rust decompression
-            group.bench_function(&format!("rust_{}", mode_name), |b| {
+            group.bench_function(format!("rust_{}", mode_name), |b| {
                 let mut output = vec![0u8; pixel_count];
                 b.iter(|| {
                     rust_ctx
                         .decompress_gray8(black_box(compressed), black_box(&mut output))
                         .unwrap();
-                });
-            });
-
-            // C++ decompression
-            group.bench_function(&format!("cpp_{}", mode_name), |b| {
-                b.iter(|| {
-                    cpp_ctx.decompress(black_box(compressed)).unwrap();
                 });
             });
         }

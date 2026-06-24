@@ -402,8 +402,6 @@ impl LlicContext {
 }
 
 pub mod entropy_coder;
-#[cfg(feature = "cpp-reference")]
-pub mod ffi;
 pub mod lossy;
 #[cfg(feature = "std")]
 pub mod pgm;

@@ -2,17 +2,42 @@
 name = "llic_rs"
 version = "0.3.1"
 edition = "2021"
+rust-version = "1.87"
+authors = ["Johan Toft <johan@jatoft.se>"]
 description = "LLIC - Low Latency Image Codec for grayscale images"
 repository = "https://github.com/jotoft/llic_rs"
 license = "Zlib"
 keywords = ["compression", "image", "lossless", "wasm"]
 categories = ["compression", "wasm"]
+# Keep the published package small: ship only what's needed to build and use the
+# crate. `tables/*.bin` are required (included via include_bytes!) and must stay.
+exclude = [
+    "test_data/",
+    "demo/",
+    "scripts/",
+    "cpp-bench/",
+    "llic/",
+    ".github/",
+    ".claude/",
+    "*.zsh",
+    "convert_table.py",
+    "mise.toml",
+    "CLAUDE.md",
+    "LLIC_FORMAT_SPEC.md",
+    "COMPRESSION_TABLES_GUIDE.md",
+]
+
+[workspace]
+members = [".", "cpp-bench"]
+# Plain `cargo build`/`test`/`clippy` operate on the library only; the C++
+# comparison crate is built explicitly with `-p llic-cpp-bench` and needs the
+# `llic` git submodule checked out.
+default-members = ["."]
 
 [features]
 default = ["std"]
 std = ["dep:num_cpus", "dep:image", "dep:clap"]
 wasm = ["dep:wasm-bindgen"]
-cpp-reference = []  # Enable C++ reference build for benchmarking
 
 [dependencies]
 thiserror = "1.0"
@@ -24,9 +49,6 @@ clap = { version = "4", features = ["derive"], optional = true }
 
 # Optional: only for WASM builds
 wasm-bindgen = { version = "0.2", optional = true }
-
-[build-dependencies]
-cc = "1.0"
 
 [dev-dependencies]
 criterion = "0.5"

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Prepared the crate for a crates.io release. The published package no longer
+  ships test fixtures, the demo, scripts, or docs that consumers don't need
+  (`tables/*.bin` lookup data is still included, as it is compiled in via
+  `include_bytes!`). Added `authors`, `rust-version`, and an `exclude` list to
+  the manifest.
+
+### Removed
+
+- Removed the `cpp-reference` cargo feature and the in-crate `ffi` module. The
+  C++ reference FFI, its `cc`/`build.rs` compilation, and the Rust-vs-C++
+  comparison benchmarks now live in a separate, unpublished workspace member
+  (`cpp-bench/`, crate `llic-cpp-bench`). The published crate is pure Rust with
+  no features that depend on the C++ submodule. Rust-only benchmarks remain in
+  the main crate (`cargo bench -p llic_rs`).
+
 ## [0.3.1] - 2026-04-11
 
 ### Fixed

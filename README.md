@@ -158,7 +158,8 @@ production use without further testing and optimization.
 
 ```
 .
-├── src/                    # Rust implementation
+├── src/                    # Rust implementation (the published `llic_rs` crate)
+├── cpp-bench/              # Dev-only C++ comparison benchmarks (not published)
 ├── llic/                   # C++ implementation (git submodule)
 ├── demo/                   # Interactive WASM demo
 ├── pkg/                    # WASM package (web/ES modules)
