@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `LlicContext::compress_gray8_versioned`, which compresses with an explicit
+  container format version (3 or 4). `compress_gray8` is now a thin wrapper that
+  always emits the current version (v4), so existing callers are unaffected.
+  Version 3 output supports entropy-coded lossless and tile-based blocks; it has
+  no mode field, so only `Mode::Default` is accepted. Note: v3 tile-based output
+  returns `UnsupportedFormat` in the rare case the compressed block size is a
+  multiple of 256 (a limitation inherent to the v3 header, which has no explicit
+  tile flag) — callers that need a guarantee should use v4.
+
 ### Changed
 
 - Prepared the crate for a crates.io release. The published package no longer

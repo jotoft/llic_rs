@@ -104,16 +104,8 @@ impl LlicContext {
         let version = src_data[0];
         let num_blocks = src_data[1];
 
-        // Support format versions 1, 3 and 4.
-        //
-        // Experimental: v1 has the same on-disk layout as v3 entropy-coded
-        // lossless at the header level (version, num_blocks, type_byte, then
-        // a u32-LE block-sizes table), so we accept it via the v3 path and
-        // let the per-block entropy decoder run as-is. If the per-block
-        // payload turns out to have changed between v1 and v3 the decoder
-        // will fail with a regular entropy_coder error rather than
-        // UnsupportedFormat — we want to know either way.
-        if version != 1 && version != 3 && version != 4 {
+        // Support format versions 3 and 4.
+        if version != 3 && version != 4 {
             return Err(LlicError::UnsupportedFormat);
         }
 
@@ -129,7 +121,7 @@ impl LlicContext {
             };
             (tile_based, mode, 4usize)
         } else {
-            // Format v1 / v3: [version][num_blocks][quality_or_block_size_byte...]
+            // Format v3: [version][num_blocks][quality_or_block_size_byte...]
             // If byte 2 is 0, it's entropy-coded lossless (tile_based = false)
             // If byte 2 is non-0, it's tile-based (byte 2 is first byte of block sizes)
             let is_entropy_lossless = src_data[2] == 0;
