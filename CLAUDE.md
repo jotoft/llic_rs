@@ -65,8 +65,12 @@ src/
 │   ├── bit_writer.rs      # Bit stream writer
 │   └── tables.rs          # Huffman-like lookup tables
 ├── wasm.rs          # WebAssembly bindings
-├── pgm.rs           # PGM image format I/O
-└── ffi.rs           # FFI bindings to C++ reference (benchmarking)
+└── pgm.rs           # PGM image format I/O
+
+cpp-bench/           # Dev-only workspace member (not published)
+├── src/lib.rs       # FFI bindings to the C++ reference
+├── build.rs         # Compiles the C++ llic submodule via cc
+└── benches/comparison.rs  # Rust vs C++ comparison benchmarks
 ```
 
 ### Compression Algorithms
@@ -119,7 +123,12 @@ cargo test -- --nocapture
 
 - `default` / `std`: CLI and native features (num_cpus, image, clap)
 - `wasm`: WebAssembly bindings
-- `cpp-reference`: Enable C++ FFI for benchmarking (requires submodule)
+
+C++ reference comparison lives in the separate, unpublished `cpp-bench/` workspace
+member (the `llic-cpp-bench` crate). It holds the FFI bindings, the C++ `cc` build
+script, and the comparison benchmarks. It requires the `llic` git submodule
+(`git submodule update --init`) and is built explicitly with `cargo bench -p
+llic-cpp-bench`; plain `cargo build`/`test` ignore it (see `default-members`).
 
 ## Key Documentation
 

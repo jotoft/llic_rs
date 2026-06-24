@@ -3,18 +3,18 @@
 
 [tasks.bench]
 env = { RUSTFLAGS = "-C target-cpu=native" }
-description = "Run all benchmarks"
-run = "cargo bench --features cpp-reference"
+description = "Run all benchmarks (Rust vs C++; requires the llic submodule)"
+run = "cargo bench -p llic-cpp-bench"
 
 [tasks."bench:256"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
-description = "Run 256x256 benchmarks only"
-run = "cargo bench --features cpp-reference -- '256x256'"
+description = "Run 256x256 benchmarks only (Rust vs C++)"
+run = "cargo bench -p llic-cpp-bench -- '256x256'"
 
 [tasks."bench:rust"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
-description = "Run Rust-only benchmarks"
-run = "cargo bench -- 'rust'"
+description = "Run Rust-only benchmarks (no C++ submodule needed)"
+run = "cargo bench -p llic_rs"
 
 [tasks.profile]
 env = { RUSTFLAGS = "-C target-cpu=native" }
@@ -154,7 +154,7 @@ run = "./scripts/setup-hooks.sh"
 [tasks."bench:modes"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
 description = "Run mode comparison benchmarks (compress + decompress, 512x512)"
-run = "cargo bench --features cpp-reference -- 'modes_'"
+run = "cargo bench -p llic-cpp-bench -- 'modes_'"
 
 [tasks."bench:summary"]
 env = { RUSTFLAGS = "-C target-cpu=native" }
@@ -163,7 +163,7 @@ run = """
 echo "=== LLIC Performance Comparison: Rust vs C++ ==="
 echo ""
 echo "Running benchmarks..."
-cargo bench --features cpp-reference 2>&1 | grep -E '^(compression|decompression|roundtrip|modes)/|time:|thrpt:'
+cargo bench -p llic-cpp-bench 2>&1 | grep -E '^(compression|decompression|roundtrip|modes)/|time:|thrpt:'
 """
 
 [tasks.lint]

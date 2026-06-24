@@ -396,10 +396,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
+name = "llic-cpp-bench"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "criterion",
+ "llic_rs",
+]
+
+[[package]]
 name = "llic_rs"
 version = "0.3.1"
 dependencies = [
- "cc",
  "clap",
  "criterion",
  "image",

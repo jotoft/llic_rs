@@ -2,23 +2,18 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Only build C++ if cpp-reference feature is enabled
-    if env::var("CARGO_FEATURE_CPP_REFERENCE").is_err() {
-        return;
-    }
+    // The C++ reference lives in the `llic` git submodule at the workspace root.
+    // Build scripts run with the cwd set to this crate's manifest dir (cpp-bench/),
+    // so the submodule is one directory up.
+    let llic_src = PathBuf::from("../llic/src/llic");
 
-    // Skip C++ build for WASM targets
-    let target = env::var("TARGET").unwrap_or_default();
-    if target.contains("wasm") {
-        println!("cargo:warning=Skipping C++ build for WASM target");
-        return;
-    }
-
-    let llic_src = PathBuf::from("llic/src/llic");
-
-    // Only build C++ library if the submodule exists
+    // Only build the C++ library if the submodule has been checked out.
+    // Run `git submodule update --init` to populate it.
     if !llic_src.exists() {
-        println!("cargo:warning=C++ llic submodule not found, skipping C++ build");
+        println!(
+            "cargo:warning=C++ llic submodule not found at ../llic; \
+             run `git submodule update --init` to enable comparison benchmarks"
+        );
         return;
     }
 
@@ -26,7 +21,7 @@ fn main() {
     let mut build = cc::Build::new();
 
     // The CMake build generates llic_export.h - include that directory
-    let llic_build = PathBuf::from("llic/build/src/llic");
+    let llic_build = PathBuf::from("../llic/build/src/llic");
 
     build
         .cpp(true)
@@ -59,9 +54,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=llic_cpp");
 
     // Re-run build if C++ sources change
-    println!("cargo:rerun-if-changed=llic/src/llic/llic.cpp");
-    println!("cargo:rerun-if-changed=llic/src/llic/llic.h");
-    println!("cargo:rerun-if-changed=llic/src/llic/entropycoder/u8v1_compress.cpp");
-    println!("cargo:rerun-if-changed=llic/src/llic/entropycoder/u8v1_decompress.cpp");
+    println!("cargo:rerun-if-changed=../llic/src/llic/llic.cpp");
+    println!("cargo:rerun-if-changed=../llic/src/llic/llic.h");
+    println!("cargo:rerun-if-changed=../llic/src/llic/entropycoder/u8v1_compress.cpp");
+    println!("cargo:rerun-if-changed=../llic/src/llic/entropycoder/u8v1_decompress.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 }
