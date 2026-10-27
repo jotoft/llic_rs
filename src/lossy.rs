@@ -879,7 +879,7 @@ unsafe fn pack_pixels_bmi2(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usiz
                 | ((result[11] as u8 as u64) << 56);
             // PEXT with mask 0x0F0F0F0F0F0F0F0F extracts low 4 bits from each byte
             let packed0 = _pext_u64(v0, 0x0F0F0F0F0F0F0F0F);
-            *(dst.as_mut_ptr() as *mut u32) = packed0 as u32;
+            (dst.as_mut_ptr() as *mut u32).write_unaligned(packed0 as u32);
 
             let v1 = (result[4] as u8 as u64)
                 | ((result[12] as u8 as u64) << 8)
@@ -890,7 +890,7 @@ unsafe fn pack_pixels_bmi2(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> usiz
                 | ((result[7] as u8 as u64) << 48)
                 | ((result[15] as u8 as u64) << 56);
             let packed1 = _pext_u64(v1, 0x0F0F0F0F0F0F0F0F);
-            *(dst.as_mut_ptr().add(4) as *mut u32) = packed1 as u32;
+            (dst.as_mut_ptr().add(4) as *mut u32).write_unaligned(packed1 as u32);
 
             8
         }
@@ -951,7 +951,7 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
                 _mm_srli_epi16(row0123, 8),
             );
             let row0123 = _mm_or_si128(_mm_srli_si128(row0123, 1), row0123);
-            *(dst.as_mut_ptr() as *mut u16) = _mm_cvtsi128_si32(row0123) as u16;
+            (dst.as_mut_ptr() as *mut u16).write_unaligned(_mm_cvtsi128_si32(row0123) as u16);
             2
         }
         2 => {
@@ -965,7 +965,7 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
             let row0123 = _mm_or_si128(_mm_or_si128(row3, row2), _mm_or_si128(row1, row0));
             let row0123 = _mm_packs_epi32(row0123, row0123);
             let row0123 = _mm_packus_epi16(row0123, row0123);
-            *(dst.as_mut_ptr() as *mut u32) = _mm_cvtsi128_si32(row0123) as u32;
+            (dst.as_mut_ptr() as *mut u32).write_unaligned(_mm_cvtsi128_si32(row0123) as u32);
             4
         }
         3 => {
@@ -989,8 +989,9 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
                 _mm_shuffle_epi32(_mm_slli_epi32(row0123, 12), 0b00_00_11_10),
             );
             row0123 = _mm_shuffle_epi8(row0123, _mm_load_si128(MASK.0.as_ptr() as *const __m128i));
-            *(dst.as_mut_ptr() as *mut u32) = _mm_cvtsi128_si32(row0123) as u32;
-            *(dst.as_mut_ptr().add(4) as *mut u16) = _mm_extract_epi16(row0123, 2) as u16;
+            (dst.as_mut_ptr() as *mut u32).write_unaligned(_mm_cvtsi128_si32(row0123) as u32);
+            (dst.as_mut_ptr().add(4) as *mut u16)
+                .write_unaligned(_mm_extract_epi16(row0123, 2) as u16);
             6
         }
         4 => {
@@ -1005,8 +1006,9 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
             let row13 = _mm_or_si128(row1, row3);
             let row0213 = _mm_packs_epi32(row02, row13);
             let row0213 = _mm_packus_epi16(row0213, row0213);
-            *(dst.as_mut_ptr() as *mut u32) = _mm_extract_epi32(row0213, 0) as u32;
-            *(dst.as_mut_ptr().add(4) as *mut u32) = _mm_extract_epi32(row0213, 1) as u32;
+            (dst.as_mut_ptr() as *mut u32).write_unaligned(_mm_extract_epi32(row0213, 0) as u32);
+            (dst.as_mut_ptr().add(4) as *mut u32)
+                .write_unaligned(_mm_extract_epi32(row0213, 1) as u32);
             8
         }
         5 => {
@@ -1039,7 +1041,8 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
             );
             let row0123 = _mm_or_si128(row0123a, row0123b);
             _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, row0123);
-            *(dst.as_mut_ptr().add(8) as *mut u16) = _mm_extract_epi16(row0123, 4) as u16;
+            (dst.as_mut_ptr().add(8) as *mut u16)
+                .write_unaligned(_mm_extract_epi16(row0123, 4) as u16);
             10
         }
         6 => {
@@ -1065,7 +1068,8 @@ unsafe fn pack_pixels_u32_impl(result: &[u32; 16], bits: u8, dst: &mut [u8]) -> 
             let row0123 =
                 _mm_shuffle_epi8(row0123, _mm_load_si128(MASK.0.as_ptr() as *const __m128i));
             _mm_storel_epi64(dst.as_mut_ptr() as *mut __m128i, row0123);
-            *(dst.as_mut_ptr().add(8) as *mut u32) = _mm_extract_epi32(row0123, 2) as u32;
+            (dst.as_mut_ptr().add(8) as *mut u32)
+                .write_unaligned(_mm_extract_epi32(row0123, 2) as u32);
             12
         }
         8 => {
