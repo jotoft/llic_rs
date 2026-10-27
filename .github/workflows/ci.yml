@@ -53,3 +53,10 @@ jobs:
 
       - name: Run tests
         run: cargo test --release
+
+      # The x86 SIMD paths only compile with these target features, and the
+      # debug build checks pointer alignment (UB the release build hides).
+      - name: Run tests (debug, BMI2 + SSE4.1 paths)
+        run: cargo test
+        env:
+          RUSTFLAGS: "-C target-feature=+bmi2,+sse4.1"
