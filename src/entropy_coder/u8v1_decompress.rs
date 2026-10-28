@@ -2,6 +2,9 @@ use super::bit_reader::BitReader64;
 use super::tables::DECOMPRESS_TABLE;
 use crate::{LlicError, Result};
 
+#[cfg(target_arch = "x86_64")]
+mod wavefront_sse;
+
 /// MED (Median Edge Detector) predictor used in JPEG-LS and Dynamic mode.
 #[inline]
 fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
@@ -26,7 +29,7 @@ fn align_to_4(value: usize) -> usize {
     (value + 3) & !3
 }
 
-/// Decompresses data encoded with the u8v1 entropy coder (optimized path)
+/// Decompresses data encoded with the u8v1 entropy coder.
 pub fn decompress(
     src_data: &[u8],
     width: u32,
@@ -34,74 +37,7 @@ pub fn decompress(
     bytes_per_line: u32,
     dst_image: &mut [u8],
 ) -> Result<()> {
-    decompress_fast(src_data, width, height, bytes_per_line, dst_image)
-}
-
-/// Fast decompression without any debug overhead
-#[inline(never)] // Prevent inlining to help with profiling
-fn decompress_fast(
-    src_data: &[u8],
-    width: u32,
-    height: u32,
-    bytes_per_line: u32,
-    dst_image: &mut [u8],
-) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(LlicError::InvalidArgument);
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let bytes_per_line = bytes_per_line as usize;
-
-    // Assert bounds upfront so compiler can elide checks in loops
-    assert!(dst_image.len() >= height * bytes_per_line);
-    assert!(bytes_per_line >= width);
-
-    let mut decoder = FastDecoder::new(src_data);
-    let mut row_buffer = vec![0u8; width + 256];
-
-    // Decompress first row
-    let mut num_filled = decoder.decompress_row(&mut row_buffer, 0, width);
-
-    // First row: Horizontal delta only
-    {
-        let dst = &mut dst_image[..width];
-        let buf = &row_buffer[..width];
-        dst[0] = buf[0];
-        for x in 1..width {
-            dst[x] = buf[x].wrapping_add(dst[x - 1]);
-        }
-    }
-
-    // Remaining rows: Combined predictor
-    for y in 1..height {
-        let row_offset = y * bytes_per_line;
-        let prev_row_offset = (y - 1) * bytes_per_line;
-
-        num_filled = decoder.decompress_row(&mut row_buffer, num_filled, width);
-
-        // Get slices for current and previous row
-        let buf = &row_buffer[..width];
-
-        // Use split_at_mut to get non-overlapping mutable access
-        let (prev_rows, curr_row_and_rest) = dst_image.split_at_mut(row_offset);
-        let p0 = &prev_rows[prev_row_offset..prev_row_offset + width];
-        let p1 = &mut curr_row_and_rest[..width];
-
-        // First pixel uses only top predictor
-        p1[0] = buf[0].wrapping_add(p0[0]);
-
-        // Remaining pixels use average of left and top
-        for x in 1..width {
-            let left = p1[x - 1];
-            let top = p0[x];
-            let avg = ((left as u16 + top as u16) >> 1) as u8;
-            p1[x] = buf[x].wrapping_add(avg);
-        }
-    }
-
-    Ok(())
+    decode_image(src_data, None, width, height, bytes_per_line, dst_image)
 }
 
 /// Decompresses data encoded with the u8v1 entropy coder with dynamic predictor.
@@ -121,90 +57,142 @@ pub fn decompress_dynamic(
     bytes_per_line: u32,
     dst_image: &mut [u8],
 ) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(LlicError::InvalidArgument);
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let bytes_per_line = bytes_per_line as usize;
-
-    // Assert bounds upfront
-    assert!(dst_image.len() >= height * bytes_per_line);
-    assert!(bytes_per_line >= width);
-
-    // Calculate predictor bitmap size
-    let predictor_bytes = height.div_ceil(8);
-    let predictor_storage_bytes = align_to_4(predictor_bytes);
-
+    let predictor_storage_bytes = align_to_4((height as usize).div_ceil(8));
     if src_data.len() < predictor_storage_bytes {
         return Err(LlicError::InvalidData);
     }
+    let (predictor_bits, stream) = src_data.split_at(predictor_storage_bytes);
+    decode_image(
+        stream,
+        Some(predictor_bits),
+        width,
+        height,
+        bytes_per_line,
+        dst_image,
+    )
+}
 
-    // Extract predictor bitmap
-    let predictor_bits = &src_data[..predictor_storage_bytes];
+/// Whether row `y` uses the MED predictor (dynamic mode) instead of the average.
+#[inline]
+fn row_uses_med(predictor_bits: Option<&[u8]>, y: usize) -> bool {
+    predictor_bits.is_some_and(|bits| (bits[y / 8] >> (y % 8)) & 1 != 0)
+}
 
-    // Compressed data starts after predictor bitmap
-    let compressed_data = &src_data[predictor_storage_bytes..];
-
-    let mut decoder = FastDecoder::new(compressed_data);
-    let mut row_buffer = vec![0u8; width + 256];
-
-    // Decompress first row
-    let mut num_filled = decoder.decompress_row(&mut row_buffer, 0, width);
-
-    // First row: Horizontal delta only (same as non-dynamic)
-    {
-        let dst = &mut dst_image[..width];
-        let buf = &row_buffer[..width];
-        dst[0] = buf[0];
+/// Reconstructs `row` from `residuals`: pixel 0 predicts from `top` only, the
+/// rest from the left and top pixels (rounded-down average, or MED).
+#[inline(always)]
+fn reconstruct_row(top: &[u8], residuals: &[u8], row: &mut [u8], width: usize, use_med: bool) {
+    let (top, residuals, row) = (&top[..width], &residuals[..width], &mut row[..width]);
+    row[0] = residuals[0].wrapping_add(top[0]);
+    if use_med {
         for x in 1..width {
-            dst[x] = buf[x].wrapping_add(dst[x - 1]);
+            row[x] = residuals[x].wrapping_add(med_predictor(row[x - 1], top[x], top[x - 1]));
+        }
+    } else {
+        for x in 1..width {
+            let average = ((u16::from(row[x - 1]) + u16::from(top[x])) >> 1) as u8;
+            row[x] = residuals[x].wrapping_add(average);
         }
     }
+}
 
-    // Remaining rows: Use predictor based on bitmap
-    for y in 1..height {
-        let row_offset = y * bytes_per_line;
-        let prev_row_offset = (y - 1) * bytes_per_line;
-
-        num_filled = decoder.decompress_row(&mut row_buffer, num_filled, width);
-
-        // Check if this row uses MED predictor
-        let use_med = (predictor_bits[y / 8] >> (y % 8)) & 1 != 0;
-
-        let buf = &row_buffer[..width];
-
-        // Use split_at_mut to get non-overlapping mutable access
-        let (prev_rows, curr_row_and_rest) = dst_image.split_at_mut(row_offset);
-        let p0 = &prev_rows[prev_row_offset..prev_row_offset + width];
-        let p1 = &mut curr_row_and_rest[..width];
-
-        // First pixel uses only top predictor (same for both modes)
-        p1[0] = buf[0].wrapping_add(p0[0]);
-
-        if use_med {
-            // MED predictor for remaining pixels
-            for x in 1..width {
-                let left = p1[x - 1];
-                let top = p0[x];
-                let top_left = p0[x - 1];
-                let predictor = med_predictor(left, top, top_left);
-                p1[x] = buf[x].wrapping_add(predictor);
-            }
-        } else {
-            // Average predictor for remaining pixels
-            for x in 1..width {
-                let left = p1[x - 1];
-                let top = p0[x];
-                let avg = ((left as u16 + top as u16) >> 1) as u8;
-                p1[x] = buf[x].wrapping_add(avg);
-            }
+/// Like [`reconstruct_row`] for pixels `[x0, x1)`, with `row` holding the
+/// residuals on entry (pixel `x` is replaced after pixel `x - 1`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn reconstruct_row_in_place(top: &[u8], row: &mut [u8], x0: usize, x1: usize, use_med: bool) {
+    let mut x = x0;
+    if x == 0 && x < x1 {
+        row[0] = row[0].wrapping_add(top[0]);
+        x = 1;
+    }
+    if use_med {
+        for x in x..x1 {
+            row[x] = row[x].wrapping_add(med_predictor(row[x - 1], top[x], top[x - 1]));
         }
+    } else {
+        for x in x..x1 {
+            let average = ((u16::from(row[x - 1]) + u16::from(top[x])) >> 1) as u8;
+            row[x] = row[x].wrapping_add(average);
+        }
+    }
+}
+
+/// Decodes an image: the first row by horizontal delta, the others from the
+/// left and top pixels (dynamic mode chooses per row from `predictor_bits`).
+fn decode_image(
+    stream: &[u8],
+    predictor_bits: Option<&[u8]>,
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst_image: &mut [u8],
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(LlicError::InvalidArgument);
+    }
+    let (width, height, stride) = (width as usize, height as usize, bytes_per_line as usize);
+    if stride < width || dst_image.len() < (height - 1) * stride + width {
+        return Err(LlicError::InvalidArgument);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let wave = width >= 2 * WAVE_ROWS && wavefront_sse::available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let wave = false;
+    let mut decoder = FastDecoder::new(stream);
+    // Residuals for a wavefront of rows, plus room for a symbol pair beyond.
+    let mut residuals = vec![0u8; if wave { WAVE_ROWS } else { 1 } * width + 256];
+
+    let mut num_filled = decoder.decompress_row(&mut residuals, 0, 0, width);
+    let mut prev_count = width;
+    dst_image[0] = residuals[0];
+    for x in 1..width {
+        dst_image[x] = residuals[x].wrapping_add(dst_image[x - 1]);
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut y = 1;
+    #[cfg(target_arch = "x86_64")]
+    if wave {
+        let count = WAVE_ROWS * width;
+        while y + WAVE_ROWS <= height {
+            num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, count);
+            prev_count = count;
+            let med_rows = (0..WAVE_ROWS)
+                .filter(|&k| row_uses_med(predictor_bits, y + k))
+                .fold(0u32, |rows, k| rows | (1 << k));
+            let (done, rest) = dst_image.split_at_mut(y * stride);
+            let prev = &done[(y - 1) * stride..(y - 1) * stride + width];
+            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`wavefront_sse::available`).
+            unsafe { wavefront_sse::reconstruct(prev, &mut residuals[..count], width, med_rows) };
+            // Sixteen interleaved row streams write back slowly, so the rows are
+            // reconstructed in the buffer and copied one after another.
+            for (k, row) in residuals[..count].chunks_exact(width).enumerate() {
+                rest[k * stride..k * stride + width].copy_from_slice(row);
+            }
+            y += WAVE_ROWS;
+        }
+    }
+    for y in y..height {
+        num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, width);
+        prev_count = width;
+        let (done, rest) = dst_image.split_at_mut(y * stride);
+        let top = &done[(y - 1) * stride..];
+        reconstruct_row(
+            top,
+            &residuals,
+            rest,
+            width,
+            row_uses_med(predictor_bits, y),
+        );
     }
 
     Ok(())
 }
+
+/// Rows reconstructed together by the wavefront; lane k holds row k.
+const WAVE_ROWS: usize = 16;
 
 /// Entropy decoder using BitReader for bit consumption
 struct FastDecoder<'a> {
@@ -243,17 +231,27 @@ impl<'a> FastDecoder<'a> {
         }
     }
 
+    /// Decodes symbols into `buf` until it holds at least `width` of them, and
+    /// returns how many it holds (a symbol pair can end one past `width`).
+    /// `num_elems` and `prev_count` are the previous call's return value and
+    /// `width`: symbols it decoded past its `width` move to the front first.
     #[inline(always)]
-    fn decompress_row(&mut self, buf: &mut [u8], num_elems: usize, width: usize) -> usize {
-        debug_assert!(buf.len() >= width + 4);
+    fn decompress_row(
+        &mut self,
+        buf: &mut [u8],
+        num_elems: usize,
+        prev_count: usize,
+        width: usize,
+    ) -> usize {
+        assert!(buf.len() >= width + 4);
 
         let mut elem = num_elems;
 
         // Handle carryover from previous row
-        if elem > width {
-            buf.copy_within(width..elem, 0);
+        if elem > prev_count {
+            buf.copy_within(prev_count..elem, 0);
         }
-        elem = elem.saturating_sub(width);
+        elem = elem.saturating_sub(prev_count);
 
         // Unrolled loop: decode 2 symbols at a time when possible
         while elem + 4 <= width {

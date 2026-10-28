@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the worst case (as `compressed_buffer_size` does) instead of zeroing a
   scratch buffer and copying the stream twice: about 15% faster. Added
   `lossy::compress_tile_block_into` and `lossy::tile_block_scratch_size`.
+- Entropy decoding reconstructs sixteen rows at once as an SSE wavefront on
+  x86-64 (SSSE3/SSE4.1, detected at run time), as the C++ reference does: about
+  1.5x for lossless entropy streams (2.5x in dynamic mode) and 1.2-1.6x for tile
+  streams with compressed headers. Output is unchanged.
 
 ### Fixed
 
