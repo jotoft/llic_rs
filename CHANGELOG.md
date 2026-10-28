@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `helpers` module, a port of the C++ reference's color helpers
+  (`llic_helpers.h`, API 4.0): `deinterleave_rgb` / `interleave_rgb`,
+  `deinterleave_rgba` / `interleave_rgba`, reversible YCoCg-R
+  (`deinterleave_rgb_to_ycocg_r` / `interleave_ycocg_r_to_rgb`) for lossless
+  coding, YCoCg with a saturating inverse (`deinterleave_rgb_to_ycocg` /
+  `interleave_ycocg_to_rgb`) for lossy coding, and `plane_sizes`. Outputs equal
+  the C++ helpers byte for byte, checked on every 24-bit color. SSSE3 kernels
+  are selected at run time and SIMD128 kernels serve WebAssembly; single-threaded,
+  they split RGB 1.15-1.9x faster than C++ 4.1.1 and merge at the same speed.
+- `helpers::BufferError`, naming the buffer that is too small or has too
+  short a stride, and `helpers::DimensionsError`, for sizes that do not fit a
+  layout. `LlicError` is unchanged.
+
 ## [0.5.1] - 2026-10-28
 
 Performance release: the C++ reference's 3.4-4.1 x86 work is ported, with

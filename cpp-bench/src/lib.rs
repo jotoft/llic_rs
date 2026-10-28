@@ -184,3 +184,227 @@ impl Drop for CppLlicContext {
 
 // Safety: The C++ context is thread-safe when using separate contexts per thread
 unsafe impl Send for CppLlicContext {}
+
+/// The C++ color helpers (`llic_helpers.h`), run without a helper context:
+/// single-threaded and unstaged, which gives the same bytes as with one.
+pub mod helpers {
+    use super::LlicError;
+
+    #[repr(C)]
+    struct ChannelBuffer {
+        data: *mut u8,
+        stride: isize,
+    }
+
+    #[repr(C)]
+    struct ConstChannelBuffer {
+        data: *const u8,
+        stride: isize,
+    }
+
+    type Split = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *const u8,
+        isize,
+        u32,
+        u32,
+        *mut ChannelBuffer,
+    ) -> LlicError;
+    type Merge = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *const ConstChannelBuffer,
+        u32,
+        u32,
+        *mut u8,
+        isize,
+    ) -> LlicError;
+
+    extern "C" {
+        fn llic_deinterleaveRGB(
+            helpers: *mut std::ffi::c_void,
+            src: *const u8,
+            src_stride: isize,
+            width: u32,
+            height: u32,
+            channels: *mut ChannelBuffer,
+        ) -> LlicError;
+        fn llic_deinterleaveRGBA(
+            helpers: *mut std::ffi::c_void,
+            src: *const u8,
+            src_stride: isize,
+            width: u32,
+            height: u32,
+            channels: *mut ChannelBuffer,
+        ) -> LlicError;
+        fn llic_deinterleaveRGBToYCoCgR(
+            helpers: *mut std::ffi::c_void,
+            src: *const u8,
+            src_stride: isize,
+            width: u32,
+            height: u32,
+            channels: *mut ChannelBuffer,
+        ) -> LlicError;
+        fn llic_deinterleaveRGBToYCoCg(
+            helpers: *mut std::ffi::c_void,
+            src: *const u8,
+            src_stride: isize,
+            width: u32,
+            height: u32,
+            channels: *mut ChannelBuffer,
+        ) -> LlicError;
+        fn llic_interleaveRGB(
+            helpers: *mut std::ffi::c_void,
+            channels: *const ConstChannelBuffer,
+            width: u32,
+            height: u32,
+            dst: *mut u8,
+            dst_stride: isize,
+        ) -> LlicError;
+        fn llic_interleaveRGBA(
+            helpers: *mut std::ffi::c_void,
+            channels: *const ConstChannelBuffer,
+            width: u32,
+            height: u32,
+            dst: *mut u8,
+            dst_stride: isize,
+        ) -> LlicError;
+        fn llic_interleaveYCoCgRToRGB(
+            helpers: *mut std::ffi::c_void,
+            channels: *const ConstChannelBuffer,
+            width: u32,
+            height: u32,
+            dst: *mut u8,
+            dst_stride: isize,
+        ) -> LlicError;
+        fn llic_interleaveYCoCgToRGB(
+            helpers: *mut std::ffi::c_void,
+            channels: *const ConstChannelBuffer,
+            width: u32,
+            height: u32,
+            dst: *mut u8,
+            dst_stride: isize,
+        ) -> LlicError;
+    }
+
+    /// A color helper pair: interleaved pixels to planes and back.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ColorHelper {
+        Rgb,
+        Rgba,
+        YCoCgR,
+        YCoCg,
+    }
+
+    impl ColorHelper {
+        /// Channels per pixel, and planes.
+        pub fn channels(self) -> usize {
+            match self {
+                Self::Rgba => 4,
+                Self::Rgb | Self::YCoCgR | Self::YCoCg => 3,
+            }
+        }
+
+        fn functions(self) -> (Split, Merge) {
+            match self {
+                Self::Rgb => (llic_deinterleaveRGB, llic_interleaveRGB),
+                Self::Rgba => (llic_deinterleaveRGBA, llic_interleaveRGBA),
+                Self::YCoCgR => (llic_deinterleaveRGBToYCoCgR, llic_interleaveYCoCgRToRGB),
+                Self::YCoCg => (llic_deinterleaveRGBToYCoCg, llic_interleaveYCoCgToRGB),
+            }
+        }
+
+        /// Splits packed pixels into packed planes.
+        pub fn split(self, src: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u8>>, LlicError> {
+            let size = width as usize * height as usize;
+            let mut planes = vec![vec![0u8; size]; self.channels()];
+            self.split_into(src, width, height, &mut planes)?;
+            Ok(planes)
+        }
+
+        /// Splits packed pixels into existing packed planes.
+        pub fn split_into(
+            self,
+            src: &[u8],
+            width: u32,
+            height: u32,
+            planes: &mut [Vec<u8>],
+        ) -> Result<(), LlicError> {
+            let size = width as usize * height as usize;
+            assert_eq!(src.len(), size * self.channels());
+            assert_eq!(planes.len(), self.channels());
+            assert!(planes.iter().all(|plane| plane.len() == size));
+            let mut buffers: Vec<ChannelBuffer> = planes
+                .iter_mut()
+                .map(|plane| ChannelBuffer {
+                    data: plane.as_mut_ptr(),
+                    stride: 0,
+                })
+                .collect();
+            let (split, _) = self.functions();
+            // SAFETY: the source and planes hold width x height packed pixels.
+            let result = unsafe {
+                split(
+                    std::ptr::null_mut(),
+                    src.as_ptr(),
+                    0,
+                    width,
+                    height,
+                    buffers.as_mut_ptr(),
+                )
+            };
+            match result {
+                LlicError::None => Ok(()),
+                error => Err(error),
+            }
+        }
+
+        /// Merges packed planes into packed pixels.
+        pub fn merge(
+            self,
+            planes: &[Vec<u8>],
+            width: u32,
+            height: u32,
+        ) -> Result<Vec<u8>, LlicError> {
+            let mut dst = vec![0u8; width as usize * height as usize * self.channels()];
+            self.merge_into(planes, width, height, &mut dst)?;
+            Ok(dst)
+        }
+
+        /// Merges packed planes into an existing buffer of packed pixels.
+        pub fn merge_into(
+            self,
+            planes: &[Vec<u8>],
+            width: u32,
+            height: u32,
+            dst: &mut [u8],
+        ) -> Result<(), LlicError> {
+            let size = width as usize * height as usize;
+            assert_eq!(planes.len(), self.channels());
+            assert!(planes.iter().all(|plane| plane.len() == size));
+            assert_eq!(dst.len(), size * self.channels());
+            let buffers: Vec<ConstChannelBuffer> = planes
+                .iter()
+                .map(|plane| ConstChannelBuffer {
+                    data: plane.as_ptr(),
+                    stride: 0,
+                })
+                .collect();
+            let (_, merge) = self.functions();
+            // SAFETY: the planes and destination hold width x height packed pixels.
+            let result = unsafe {
+                merge(
+                    std::ptr::null_mut(),
+                    buffers.as_ptr(),
+                    width,
+                    height,
+                    dst.as_mut_ptr(),
+                    0,
+                )
+            };
+            match result {
+                LlicError::None => Ok(()),
+                error => Err(error),
+            }
+        }
+    }
+}

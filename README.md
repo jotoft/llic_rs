@@ -110,6 +110,27 @@ let mut output = vec![0u8; width * height];
 let (quality, mode) = ctx.decompress_gray8(&compressed, &mut output)?;
 ```
 
+### Color Images
+
+The codec compresses 8-bit planes. The `helpers` module, a port of the C++
+`llic_helpers.h`, splits color images into planes and merges them back, with
+the same bytes as the C++ helpers:
+
+- `deinterleave_rgb_to_ycocg_r` / `interleave_ycocg_r_to_rgb`: reversible
+  YCoCg-R, for lossless coding.
+- `deinterleave_rgb_to_ycocg` / `interleave_ycocg_to_rgb`: YCoCg with a
+  saturating inverse, for lossy coding.
+- `deinterleave_rgb`, `deinterleave_rgba` and their inverses: plain channels.
+
+```rust
+use llic::helpers::{self, Rows, RowsMut};
+
+let [y, co, cg] = planes.get_disjoint_mut([0, 1, 2]).unwrap();
+let planes_out = [y, co, cg].map(|plane| RowsMut::packed(plane));
+helpers::deinterleave_rgb_to_ycocg_r(Rows::packed(&rgb), width, height, planes_out)?;
+// Compress each plane with a width x height LlicContext.
+```
+
 ## Technical Details
 
 LLIC uses a custom entropy coding scheme with pre-computed compression tables optimized for image data patterns. The

@@ -551,6 +551,7 @@ fn write_v3_block(payload: &[u8], entropy: bool, dst_data: &mut [u8]) -> Result<
 }
 
 pub mod entropy_coder;
+pub mod helpers;
 pub mod lossy;
 #[cfg(feature = "std")]
 pub mod pgm;

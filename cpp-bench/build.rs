@@ -2,9 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Sources of the C++ codec (llic 4.x), relative to `llic/src/llic`.
-const SOURCES: [&str; 7] = [
+/// Sources of the C++ codec and helpers (llic 4.x), relative to `llic/src/llic`.
+const SOURCES: [&str; 8] = [
     "llic.cpp",
+    "llic_helpers.cpp",
     "llic_cpu.cpp",
     "llic_version.cpp",
     "entropycoder/u8v1_compress.cpp",
@@ -71,5 +72,6 @@ fn main() {
     println!("cargo:rustc-link-lib=static=llic_cpp");
 
     println!("cargo:rerun-if-changed=../llic/src/llic/llic.h");
+    println!("cargo:rerun-if-changed=../llic/src/llic/llic_helpers.h");
     println!("cargo:rerun-if-changed=build.rs");
 }

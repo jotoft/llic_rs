@@ -49,6 +49,11 @@ node scripts/wasm_bench.mjs target/wasm32-wasip1/release/examples/wasm_bench.was
 # Rust vs C++ speed on the test photos (single thread)
 cargo build --release -p llic-cpp-bench --example photo_matrix
 taskset -c 2 target/release/examples/photo_matrix 1920 300
+cargo build --release -p llic-cpp-bench --example helper_bench   # color helpers
+taskset -c 2 target/release/examples/helper_bench 1920 300
+
+# Color helpers byte-exact against the C++ helpers
+cargo test --release -p llic-cpp-bench --test helpers
 
 # Setup git hooks (runs tests/lint on commit when Rust files change)
 mise run setup:hooks
@@ -69,6 +74,8 @@ cargo run --release --features cli --bin llic_compress -- decompress input.llic 
 src/
 ├── lib.rs           # Main API: LlicContext, Quality, Mode, file format parsing
 ├── lossy.rs         # Tile-based lossy compression (4x4 blocks)
+├── helpers.rs       # Color helpers (C++ llic_helpers.h): RGB/RGBA, YCoCg-R, YCoCg planes
+├── helpers/         # color.rs (scalar), color_sse.rs (SSSE3), color_simd128.rs
 ├── entropy_coder/   # Lossless compression engine
 │   ├── u8v1_compress.rs   # Encoder
 │   ├── u8v1_decompress.rs # Decoder with two-symbol optimization
@@ -81,7 +88,9 @@ src/
 cpp-bench/           # Dev-only workspace member (not published)
 ├── src/lib.rs       # FFI bindings to the C++ reference
 ├── build.rs         # Compiles the C++ llic submodule via cc
-└── benches/comparison.rs  # Rust vs C++ comparison benchmarks
+├── benches/comparison.rs  # Rust vs C++ comparison benchmarks
+├── tests/helpers.rs       # Color helpers byte-exact against C++
+└── examples/helper_bench.rs  # Color helper speed, Rust vs C++
 ```
 
 ### Compression Algorithms
