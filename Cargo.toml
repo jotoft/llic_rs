@@ -15,6 +15,7 @@ exclude = [
     "test_data/",
     "demo/",
     "scripts/",
+    "examples/",
     "cpp-bench/",
     "llic/",
     ".github/",
