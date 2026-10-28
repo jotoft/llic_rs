@@ -18,6 +18,7 @@ cc = "1.0"
 
 [dev-dependencies]
 criterion = "0.5"
+image = { version = "0.25", default-features = false, features = ["webp"] }
 
 [[bench]]
 name = "comparison"

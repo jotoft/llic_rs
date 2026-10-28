@@ -1,4 +1,4 @@
-//! FFI bindings to the C++ llic library for benchmarking comparisons.
+//! FFI bindings to the C++ llic library (4.x C API) for benchmarking comparisons.
 
 use std::ffi::c_char;
 
@@ -11,6 +11,8 @@ pub enum LlicQuality {
     High = 4,
     Medium = 8,
     Low = 16,
+    VeryLow = 32,
+    LosslessEntropy = 64,
 }
 
 /// Compression mode (matches C++ llic_mode_t)
@@ -31,6 +33,9 @@ pub enum LlicError {
     ImageDimensions = 3,
     UnsupportedFormat = 4,
     InvalidArgument = 5,
+    CorruptData = 6,
+    EntropyDisabled = 7,
+    HelperDimensions = 8,
 }
 
 /// Opaque context handle
@@ -54,6 +59,9 @@ extern "C" {
 
     pub fn llic_getErrorString(error: LlicError) -> *const c_char;
 
+    /// Version of the C++ source the library was built from (API 4.1).
+    pub fn llic_version() -> *const c_char;
+
     pub fn llic_compressedBufferSize(ctx: *mut LlicContext) -> usize;
 
     pub fn llic_compressGray8(
@@ -67,10 +75,20 @@ extern "C" {
     pub fn llic_decompressGray8(
         ctx: *mut LlicContext,
         src_data: *const u8,
+        src_size: usize,
         dst_graymap: *mut u8,
+        dst_size: usize,
         quality: *mut LlicQuality,
         mode: *mut LlicMode,
     ) -> usize;
+}
+
+/// Version of the linked C++ library, such as "4.1".
+pub fn cpp_version() -> String {
+    // SAFETY: llic_version returns a static NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(llic_version()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Safe wrapper around the C++ llic context
@@ -138,7 +156,9 @@ impl CppLlicContext {
             llic_decompressGray8(
                 self.ctx,
                 src.as_ptr(),
+                src.len(),
                 dst.as_mut_ptr(),
+                dst.len(),
                 &mut quality,
                 &mut mode,
             )
