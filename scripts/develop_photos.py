@@ -10,6 +10,12 @@ WebP. See test_data/photos/README.md for where the originals come from.
 
     uv run scripts/develop_photos.py                         # committed sizes
     uv run scripts/develop_photos.py --sizes full --out test_data/out
+    uv run scripts/develop_photos.py --demo                  # web demo images
+
+With --demo it also writes the web demo's images: 1920x1280 grayscale
+(BT.601 luma, as the C++ tools convert) lossless WebP in demo/, a third the
+size of the colour files. The demo converts to luma anyway, and its weights
+sum to one, so it sees exactly these pixels.
 """
 
 import argparse
@@ -21,6 +27,7 @@ from pathlib import Path
 # set before LibRaw loads its OpenMP runtime.
 os.environ["OMP_NUM_THREADS"] = "1"
 
+import numpy as np  # noqa: E402
 import rawpy  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -48,12 +55,21 @@ def crop_3_2(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + width, top + height))
 
 
+def to_luma(img: Image.Image) -> Image.Image:
+    """BT.601 luma with the C++ image_io weights: (77R + 150G + 29B + 128) >> 8."""
+    rgb = np.asarray(img, dtype=np.uint32)
+    luma = (77 * rgb[..., 0] + 150 * rgb[..., 1] + 29 * rgb[..., 2] + 128) >> 8
+    return Image.fromarray(luma.astype(np.uint8), mode="L")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--sizes", nargs="+", default=["1920", "960"],
                         help="output widths in pixels, or 'full' (default: 1920 960)")
     parser.add_argument("--out", type=Path, default=ROOT / "test_data/photos")
     parser.add_argument("--raw", type=Path, default=ROOT / "test_data/raw")
+    parser.add_argument("--demo", action="store_true",
+                        help="also write the web demo's grayscale images to demo/")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -70,6 +86,11 @@ def main() -> None:
                 out = img.resize((width, width * 2 // 3), Image.LANCZOS)
             path = args.out / f"{name}_{out.width}x{out.height}.webp"
             out.save(path, lossless=True, quality=100, method=6)
+            print(f"{path}  {path.stat().st_size / 1e6:.2f} MB")
+        if args.demo:
+            demo = to_luma(img.resize((1920, 1280), Image.LANCZOS))
+            path = ROOT / f"demo/demo_image_{name}.webp"
+            demo.save(path, lossless=True, quality=100, method=6)
             print(f"{path}  {path.stat().st_size / 1e6:.2f} MB")
 
 

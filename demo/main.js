@@ -1076,7 +1076,7 @@ function getCanvasPixelCoords(canvas, clientX, clientY) {
 
 // Initialize and load first demo image
 initWasm().then(async () => {
-  await loadDemoImage('demo_image2.webp');
+  await loadDemoImage('demo_image_rattan.webp');
   // Ensure transform is applied after initial load
   updateTransform();
 }).catch(console.error);

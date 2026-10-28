@@ -21,7 +21,13 @@ The originals are not in git. Keep them in `test_data/raw/` (gitignored), then:
 ```bash
 uv run scripts/develop_photos.py                                  # these files
 uv run scripts/develop_photos.py --sizes full --out test_data/out # full size, not committed
+uv run scripts/develop_photos.py --demo                           # also the web demo's images
 ```
+
+The web demo uses `demo/demo_image_{rattan,rock}.webp`: the 1920x1280 photos
+as grayscale (BT.601 luma, as the C++ tools convert) lossless WebP, a third
+the size of the colour files. The demo converts to luma anyway and gets
+exactly these pixels.
 
 The script pins rawpy 0.27.1 (LibRaw 0.22.1), Pillow and numpy, and runs LibRaw
 single-threaded, so it reproduces these files byte for byte.
