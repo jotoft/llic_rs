@@ -416,7 +416,7 @@ fn benchmark_modes(c: &mut Criterion) {
         let mut rust_output = vec![0u8; rust_ctx.compressed_buffer_size()];
 
         for &(rust_mode, _, mode_name) in modes {
-            group.bench_function(&format!("rust_{}", mode_name), |b| {
+            group.bench_function(format!("rust_{mode_name}"), |b| {
                 b.iter(|| {
                     rust_ctx
                         .compress_gray8(
@@ -431,7 +431,7 @@ fn benchmark_modes(c: &mut Criterion) {
         }
 
         for &(_, cpp_mode, mode_name) in modes {
-            group.bench_function(&format!("cpp_{}", mode_name), |b| {
+            group.bench_function(format!("cpp_{mode_name}"), |b| {
                 b.iter(|| {
                     cpp_ctx
                         .compress(black_box(&image), LlicQuality::Lossless, cpp_mode)
@@ -450,7 +450,7 @@ fn benchmark_modes(c: &mut Criterion) {
 
         for (mode_name, compressed) in &compressed_data {
             // Rust decompression
-            group.bench_function(&format!("rust_{}", mode_name), |b| {
+            group.bench_function(format!("rust_{mode_name}"), |b| {
                 let mut output = vec![0u8; pixel_count];
                 b.iter(|| {
                     rust_ctx
@@ -460,7 +460,7 @@ fn benchmark_modes(c: &mut Criterion) {
             });
 
             // C++ decompression
-            group.bench_function(&format!("cpp_{}", mode_name), |b| {
+            group.bench_function(format!("cpp_{mode_name}"), |b| {
                 b.iter(|| {
                     cpp_ctx.decompress(black_box(compressed)).unwrap();
                 });
