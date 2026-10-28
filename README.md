@@ -61,13 +61,16 @@ make -j$(nproc)
 
 ```bash
 # Compress an image to LLIC (lossless)
-cargo run --release --bin llic_compress -- compress input.png output.llic
+cargo run --release --features cli --bin llic_compress -- compress input.png output.llic
 
 # Decompress an LLIC file (supports both lossless and lossy)
-cargo run --release --bin llic_compress -- decompress input.llic output.png
+cargo run --release --features cli --bin llic_compress -- decompress input.llic output.png
 ```
 
 Output format (PNG or PGM) is determined by the file extension.
+
+The tool is behind the `cli` feature, so library users don't pull in its
+dependencies. Install it with `cargo install llic_rs --features cli`.
 
 ### Quality Levels
 

@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `compress_gray8` writes format v5, like the C++ reference.
   Decoders older than llic_rs 0.5.0 or C++ 3.5.0 cannot read it; use
   `compress_gray8_versioned` with `FormatVersion::V4` for them.
+- **Breaking:** the `llic_compress` tool needs the new `cli` feature
+  (`cargo install llic_rs --features cli`). `image` and `clap` moved from the
+  default `std` feature to `cli`, so the library itself depends only on
+  `thiserror` and, with `std`, `num_cpus`.
 - **Breaking:** `lossy::compress_tile_block`, `decompress_tile_block`,
   `decompress_tile_block_dynamic` and `extract_tile_metadata` take a
   `TileHeaderLayout`.

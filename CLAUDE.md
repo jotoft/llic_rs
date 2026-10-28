@@ -46,8 +46,8 @@ mise run setup:hooks
 ### CLI Tool
 
 ```bash
-cargo run --release --bin llic_compress -- compress input.png output.llic
-cargo run --release --bin llic_compress -- decompress input.llic output.png
+cargo run --release --features cli --bin llic_compress -- compress input.png output.llic
+cargo run --release --features cli --bin llic_compress -- decompress input.llic output.png
 ```
 
 ## Architecture
@@ -121,7 +121,10 @@ cargo test -- --nocapture
 
 ## Features
 
-- `default` / `std`: CLI and native features (num_cpus, image, clap)
+- `default` / `std`: native features (num_cpus for the default thread count)
+- `cli`: the `llic_compress` tool (adds image, clap); not in the default set, so
+  library users don't pull them in. `image` is also a dev-dependency (png, webp)
+  for tests and benches
 - `wasm`: WebAssembly bindings
 
 C++ reference comparison lives in the separate, unpublished `cpp-bench/` workspace

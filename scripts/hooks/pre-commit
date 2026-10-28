@@ -19,7 +19,7 @@ cargo fmt --all -- --check
 
 # Run clippy (exclude benchmarks)
 echo "Running clippy..."
-cargo clippy --lib --bins --tests -- -D warnings
+cargo clippy --lib --bins --tests --features cli -- -D warnings
 
 # Run tests (exclude benchmarks)
 echo "Running tests..."
