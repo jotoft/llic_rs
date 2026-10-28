@@ -53,8 +53,9 @@ async function initWasm() {
   document.getElementById('version').textContent = build_info();
 }
 
-// Some browsers (Safari) round performance.now() to whole milliseconds, so a
-// fast single run can measure 0 ms; the Benchmark button averages many runs.
+// Browsers coarsen performance.now() (Safari and Firefox to whole
+// milliseconds), so a single fast run can measure 0 ms or be off by a
+// millisecond. Stats are refined with timePerCall shortly after each change.
 function formatThroughput(bytes, ms) {
   if (ms <= 0) return '–';
   const mbps = (bytes / 1024 / 1024) / (ms / 1000);
@@ -63,6 +64,38 @@ function formatThroughput(bytes, ms) {
 
 function formatTime(ms) {
   return ms <= 0 ? '< 1 ms' : `${ms.toFixed(2)} ms`;
+}
+
+// Mean time per call of fn, repeating it until at least minMs have passed, so
+// the result is accurate to about 1 ms / minMs whatever the timer resolution.
+function timePerCall(fn, minMs) {
+  let calls = 0;
+  let elapsed;
+  const start = performance.now();
+  do {
+    fn();
+    calls++;
+    elapsed = performance.now() - start;
+  } while (elapsed < minMs);
+  return elapsed / calls;
+}
+
+// After the image or settings stop changing for a moment, replace the
+// single-run timings with averages over repeated runs.
+let refineTimer = null;
+function scheduleRefinedTiming() {
+  clearTimeout(refineTimer);
+  refineTimer = setTimeout(() => {
+    if (!currentGrayData) return;
+    const [gray, compressed, w, h] = [currentGrayData, currentCompressed, currentWidth, currentHeight];
+    const [quality, mode] = [currentQuality, currentMode];
+    const compressTime = timePerCall(() => compress(gray, w, h, quality, mode), 60);
+    const decompressTime = timePerCall(() => decompress(compressed, w, h), 60);
+    if (gray !== currentGrayData || compressed !== currentCompressed) return; // changed meanwhile
+    updateStat('compressTime', formatTime(compressTime));
+    updateStat('decompressTime', formatTime(decompressTime));
+    updateStat('throughput', `${formatThroughput(gray.length, compressTime)} / ${formatThroughput(gray.length, decompressTime)}`);
+  }, 300);
 }
 
 function updateStat(id, value) {
@@ -188,6 +221,7 @@ async function processImage(file, blur = currentBlur) {
     currentHeight = height;
     currentCompressed = compressed;
     document.getElementById('benchBtn').style.display = 'block';
+    scheduleRefinedTiming();
 
     // Store for compare view
     currentDecompressed = decompressed;
@@ -275,17 +309,16 @@ function runBenchmark() {
 
   // Use setTimeout to allow UI update
   setTimeout(() => {
-    // Warmup + benchmark
+    // Warmup + benchmark. Each sample averages calls over at least 20 ms, so
+    // samples stay accurate where the timer is coarsened to 1 ms.
+    const [gray, w, h] = [currentGrayData, currentWidth, currentHeight];
+    const compressed = compress(gray, w, h, currentQuality, currentMode);
     for (let i = 0; i < warmup + iterations; i++) {
-      const t0 = performance.now();
-      const compressed = compress(currentGrayData, currentWidth, currentHeight, currentQuality);
-      const t1 = performance.now();
-      decompress(compressed, currentWidth, currentHeight);
-      const t2 = performance.now();
-
+      const c = timePerCall(() => compress(gray, w, h, currentQuality, currentMode), 20);
+      const d = timePerCall(() => decompress(compressed, w, h), 20);
       if (i >= warmup) {
-        compressTimes.push(t1 - t0);
-        decompressTimes.push(t2 - t1);
+        compressTimes.push(c);
+        decompressTimes.push(d);
       }
     }
 
