@@ -106,10 +106,10 @@ impl LlicContext {
     /// `compress_gray8_versioned` can write for this context, as the C++
     /// `llic_compressedBufferSize` computes it for one chunk: the container
     /// header and the larger of the entropy-coded worst case (13 bits per
-    /// pixel plus the dynamic predictor bitmap) and the tile-based one.
+    /// pixel plus the dynamic predictor bitmap, and 4 bytes the in-place
+    /// encoder may write past it) and the tile-based one.
     pub fn compressed_buffer_size(&self) -> usize {
-        let (width, height) = (self.width as usize, self.height as usize);
-        let entropy = (width * height * 13).div_ceil(32) * 4 + height.div_ceil(8).div_ceil(4) * 4;
+        let entropy = entropy_coder::max_compressed_size(self.width, self.height, true);
         let tile = lossy::tile_block_scratch_size(self.width, self.height);
         V4_HEADER_LEN + entropy.max(tile)
     }
@@ -339,7 +339,31 @@ impl LlicContext {
         // Block payloads are identical across versions, apart from where a tile
         // block keeps a compressed header (see `TileHeaderLayout`).
         if use_entropy {
-            let compressed = if mode == Mode::Dynamic {
+            let dynamic = mode == Mode::Dynamic;
+            let offset = match format_version {
+                FormatVersion::V3 => V3_ENTROPY_HEADER_LEN,
+                FormatVersion::V4 | FormatVersion::V5 => V4_HEADER_LEN,
+            };
+            // Encode in place behind the container header when the buffer has
+            // room for the worst case (compressed_buffer_size always does).
+            let max_size = entropy_coder::max_compressed_size(self.width, self.height, dynamic);
+            if dst_data.len() >= offset + max_size {
+                let (w, h, bpl) = (self.width, self.height, self.bytes_per_line);
+                let out = &mut dst_data[offset..];
+                let size = if dynamic {
+                    entropy_coder::compress_dynamic_into(src_graymap, w, h, bpl, out)?
+                } else {
+                    entropy_coder::compress_into(src_graymap, w, h, bpl, out)?
+                };
+                match format_version {
+                    FormatVersion::V4 | FormatVersion::V5 => {
+                        write_v4_header(dst_data, format_version, false, mode, size);
+                    }
+                    FormatVersion::V3 => write_v3_entropy_header(dst_data, size),
+                }
+                return Ok(offset + size);
+            }
+            let compressed = if dynamic {
                 entropy_coder::compress_dynamic(
                     src_graymap,
                     self.width,
@@ -431,6 +455,18 @@ fn chunk_rows(version: u8, height: usize, num_chunks: usize, index: usize) -> us
 const V4_HEADER_LEN: usize = 8;
 /// Container header length before a single tile-based block's payload in v3.
 const V3_TILE_HEADER_LEN: usize = 6;
+/// Container header length before a single entropy-coded block's payload in v3.
+const V3_ENTROPY_HEADER_LEN: usize = 7;
+
+/// Write the v3 header of a single entropy-coded block whose payload of
+/// `payload_len` bytes is already in place: `[3][1][0x00][block_size:u32 LE]`.
+fn write_v3_entropy_header(dst_data: &mut [u8], payload_len: usize) {
+    dst_data[0] = FormatVersion::V3 as u8;
+    dst_data[1] = 1;
+    dst_data[2] = 0;
+    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
+    dst_data[3..7].copy_from_slice(&(payload_len as u32).to_le_bytes());
+}
 
 /// Write the v4/v5 header of a single-block container whose payload of
 /// `payload_len` bytes is already in place:
@@ -497,15 +533,12 @@ fn write_v4_block(
 /// an even byte count per tile), so the padding is defensive.
 fn write_v3_block(payload: &[u8], entropy: bool, dst_data: &mut [u8]) -> Result<usize> {
     if entropy {
-        let total = 7 + payload.len();
+        let total = V3_ENTROPY_HEADER_LEN + payload.len();
         if dst_data.len() < total {
             return Err(LlicError::InvalidArgument);
         }
-        dst_data[0] = FormatVersion::V3 as u8;
-        dst_data[1] = 1;
-        dst_data[2] = 0;
-        dst_data[3..7].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        dst_data[7..total].copy_from_slice(payload);
+        dst_data[V3_ENTROPY_HEADER_LEN..total].copy_from_slice(payload);
+        write_v3_entropy_header(dst_data, payload.len());
         Ok(total)
     } else {
         let padding = usize::from(payload.len().is_multiple_of(256));

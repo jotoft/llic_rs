@@ -13,6 +13,8 @@
 //! - Stores a bitmap indicating which predictor was used for each row
 //! - Improves compression for images with edges/sharp transitions
 
+use std::mem::MaybeUninit;
+
 use super::tables::get_compress_table_entry;
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -93,7 +95,69 @@ pub fn compress(
     height: u32,
     bytes_per_line: u32,
 ) -> crate::Result<Vec<u8>> {
-    encode(src_image, width, height, bytes_per_line, false)
+    encode_vec(src_image, width, height, bytes_per_line, false)
+}
+
+/// Like [`compress`], writing into `dst`, which needs
+/// [`max_compressed_size`]`(width, height, false)` bytes. Returns the bytes
+/// written.
+pub fn compress_into(
+    src_image: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst: &mut [u8],
+) -> crate::Result<usize> {
+    encode(
+        src_image,
+        width,
+        height,
+        bytes_per_line,
+        false,
+        as_uninit(dst),
+    )
+}
+
+/// Upper bound on the size of a [`compress`] (or, with `dynamic`,
+/// [`compress_dynamic`]) stream: 13 bits per pixel, the predictor bitmap, and
+/// 4 bytes of slack for the speculative word store of the branch-free flush.
+pub fn max_compressed_size(width: u32, height: u32, dynamic: bool) -> usize {
+    let (width, height) = (width as usize, height as usize);
+    let predictor_bytes = if dynamic {
+        align_to_4(height.div_ceil(8))
+    } else {
+        0
+    };
+    predictor_bytes + (13 * width * height).div_ceil(32) * 4 + 4
+}
+
+/// Views an initialised buffer as possibly uninitialised for the encoder.
+fn as_uninit(bytes: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: same layout; the encoder only ever writes initialised bytes, so
+    // `bytes` stays initialised.
+    unsafe { &mut *(std::ptr::from_mut::<[u8]>(bytes) as *mut [MaybeUninit<u8>]) }
+}
+
+/// Encodes into a new vector, writing its capacity without zeroing it first.
+fn encode_vec(
+    src_image: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dynamic: bool,
+) -> crate::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(max_compressed_size(width, height, dynamic));
+    let size = encode(
+        src_image,
+        width,
+        height,
+        bytes_per_line,
+        dynamic,
+        out.spare_capacity_mut(),
+    )?;
+    // SAFETY: the encoder wrote every byte below `size`.
+    unsafe { out.set_len(size) };
+    Ok(out)
 }
 
 /// Compute delta values for the first row (horizontal differences).
@@ -321,7 +385,27 @@ pub fn compress_dynamic(
     height: u32,
     bytes_per_line: u32,
 ) -> crate::Result<Vec<u8>> {
-    encode(src_image, width, height, bytes_per_line, true)
+    encode_vec(src_image, width, height, bytes_per_line, true)
+}
+
+/// Like [`compress_dynamic`], writing into `dst`, which needs
+/// [`max_compressed_size`]`(width, height, true)` bytes. Returns the bytes
+/// written.
+pub fn compress_dynamic_into(
+    src_image: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dst: &mut [u8],
+) -> crate::Result<usize> {
+    encode(
+        src_image,
+        width,
+        height,
+        bytes_per_line,
+        true,
+        as_uninit(dst),
+    )
 }
 
 /// Checks the arguments and runs the image encoder, on x86-64 the build with
@@ -333,8 +417,9 @@ fn encode(
     height: u32,
     bytes_per_line: u32,
     dynamic: bool,
-) -> crate::Result<Vec<u8>> {
-    if width == 0 || height == 0 {
+    out: &mut [MaybeUninit<u8>],
+) -> crate::Result<usize> {
+    if width == 0 || height == 0 || out.len() < max_compressed_size(width, height, dynamic) {
         return Err(crate::LlicError::InvalidArgument);
     }
     let (width, height, stride) = (width as usize, height as usize, bytes_per_line as usize);
@@ -344,10 +429,10 @@ fn encode(
     #[cfg(target_arch = "x86_64")]
     if simd_encoder_available() {
         // SAFETY: the CPU supports BMI2, SSSE3 and SSE4.1.
-        return Ok(unsafe { encode_image_x86(src_image, width, height, stride, dynamic) });
+        return Ok(unsafe { encode_image_x86(src_image, width, height, stride, dynamic, out) });
     }
     Ok(encode_image::<false>(
-        src_image, width, height, stride, dynamic,
+        src_image, width, height, stride, dynamic, out,
     ))
 }
 
@@ -373,12 +458,14 @@ unsafe fn encode_image_x86(
     height: usize,
     stride: usize,
     dynamic: bool,
-) -> Vec<u8> {
-    encode_image::<true>(src, width, height, stride, dynamic)
+    out: &mut [MaybeUninit<u8>],
+) -> usize {
+    encode_image::<true>(src, width, height, stride, dynamic, out)
 }
 
-/// Encodes an image (arguments checked by [`encode`]). `SIMD` selects the
-/// x86-64 SSE residual code, for callers that enabled its target features.
+/// Encodes an image into `out` (arguments checked by [`encode`]) and returns
+/// the bytes written. `SIMD` selects the x86-64 SSE residual code, for callers
+/// that enabled its target features.
 #[inline(always)]
 fn encode_image<const SIMD: bool>(
     src: &[u8],
@@ -386,13 +473,14 @@ fn encode_image<const SIMD: bool>(
     height: usize,
     stride: usize,
     dynamic: bool,
-) -> Vec<u8> {
+    out: &mut [MaybeUninit<u8>],
+) -> usize {
     let predictor_bytes = if dynamic {
         align_to_4(height.div_ceil(8))
     } else {
         0
     };
-    let mut stream = Stream::new(predictor_bytes, width, height);
+    let mut stream = Stream::new(out, predictor_bytes);
     let mut residuals = vec![0u8; width];
     let mut med_residuals = vec![0u8; if dynamic { width } else { 0 }];
 
@@ -402,7 +490,7 @@ fn encode_image<const SIMD: bool>(
     for y in 1..height {
         // Code the previous row while this one is predicted.
         let row = if use_med { &med_residuals } else { &residuals };
-        let row_bits = stream.encode_row(row, false, branch_free);
+        let row_bits = encode_row::<SIMD>(&mut stream, row, false, branch_free);
         // Above 5.5 bits per pair, flush timing is irregular enough that the
         // branch mispredicts more than storing every pair costs.
         branch_free = row_bits * 4 > 11 * width as u64;
@@ -421,7 +509,7 @@ fn encode_image<const SIMD: bool>(
         }
     }
     let row = if use_med { &med_residuals } else { &residuals };
-    stream.encode_row(row, true, branch_free);
+    encode_row::<SIMD>(&mut stream, row, true, branch_free);
     stream.finish()
 }
 
@@ -573,45 +661,85 @@ unsafe fn dynamic_residual_rows_sse(
     (avg_bits, med_bits)
 }
 
+/// Codes a row with [`Stream::encode_row`], kept out of line: inlined into the
+/// image loop, the row loops lost registers (the output base was reloaded
+/// for every store and table indices went through SSE registers), which cost
+/// about 10%. `SIMD` callers get the BMI2 build.
+#[inline(always)]
+fn encode_row<const SIMD: bool>(
+    stream: &mut Stream<'_>,
+    row: &[u8],
+    final_row: bool,
+    branch_free: bool,
+) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if SIMD {
+        // SAFETY: SIMD callers run on a CPU with BMI2.
+        return unsafe { encode_row_bmi2(stream, row, final_row, branch_free) };
+    }
+    encode_row_portable(stream, row, final_row, branch_free)
+}
+
+#[inline(never)]
+fn encode_row_portable(
+    stream: &mut Stream<'_>,
+    row: &[u8],
+    final_row: bool,
+    branch_free: bool,
+) -> u64 {
+    stream.encode_row(row, final_row, branch_free)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "bmi2")]
+unsafe fn encode_row_bmi2(
+    stream: &mut Stream<'_>,
+    row: &[u8],
+    final_row: bool,
+    branch_free: bool,
+) -> u64 {
+    stream.encode_row(row, final_row, branch_free)
+}
+
 /// Bit stream output. Codes are packed MSB-first into a 64-bit container;
 /// each full 32-bit word is stored as two 16-bit little-endian halves, high
-/// half first (the C++ `storeWord`).
-struct Stream {
-    /// Written bytes are `[0, pos)`; the rest of the capacity is unwritten.
-    out: Vec<u8>,
+/// half first (the C++ `storeWord`). The predictor bitmap, if any, goes in
+/// front when the stream is finished.
+struct Stream<'a> {
+    /// Bytes `[predictor bitmap, pos)` are written; the rest is unwritten.
+    out: &'a mut [MaybeUninit<u8>],
     pos: usize,
     bits: u64,
     num_bits: u32,
+    predictor_bits: Vec<u8>,
 }
 
-impl Stream {
-    /// A stream after a zeroed predictor bitmap of `predictor_bytes`, with
-    /// capacity for the worst case of a `width` x `height` image.
-    fn new(predictor_bytes: usize, width: usize, height: usize) -> Self {
-        let mut out = Vec::with_capacity(predictor_bytes + height * max_row_bytes(width) + 4);
-        out.resize(predictor_bytes, 0);
+impl<'a> Stream<'a> {
+    /// A stream into `out` after a predictor bitmap of `predictor_bytes`.
+    fn new(out: &'a mut [MaybeUninit<u8>], predictor_bytes: usize) -> Self {
         Self {
             out,
             pos: predictor_bytes,
             bits: 0,
             num_bits: 0,
+            predictor_bits: vec![0; predictor_bytes],
         }
     }
 
     fn set_predictor_bit(&mut self, y: usize) {
-        self.out[y / 8] |= 1 << (y % 8);
+        self.predictor_bits[y / 8] |= 1 << (y % 8);
     }
 
     /// Stores the container's top word at `pos` (without advancing).
     ///
     /// # Safety
-    /// `pos + 4` must be within the capacity.
+    /// `pos + 4` must be within `out`.
     #[inline(always)]
-    unsafe fn store_word(out: &mut Vec<u8>, pos: usize, bits: u64) {
+    unsafe fn store_word(out: *mut MaybeUninit<u8>, pos: usize, bits: u64) {
         #[allow(clippy::cast_possible_truncation)] // the top word
         let word = ((bits >> 32) as u32).rotate_left(16);
-        out.as_mut_ptr()
-            .add(pos)
+        out.add(pos)
             .cast::<[u8; 4]>()
             .write_unaligned(word.to_le_bytes());
     }
@@ -625,8 +753,14 @@ impl Stream {
     /// and both loops are unrolled by eight like the C++ `compressRow`.
     #[inline(always)]
     fn encode_row(&mut self, residuals: &[u8], final_row: bool, branch_free: bool) -> u64 {
-        assert!(self.pos + max_row_bytes(residuals.len()) <= self.out.capacity());
-        let out = &mut self.out;
+        // At most 13 bits per residual on top of the pending bits, plus the
+        // branch-free flush's speculative word. Rows before this one took at
+        // most 13 bits per pixel, so this stays within `max_compressed_size`.
+        let row_bytes = (self.num_bits as usize + 13 * residuals.len()).div_ceil(32) * 4 + 4;
+        assert!(self.pos + row_bytes <= self.out.len());
+        // A raw pointer keeps the output base in a register (a borrowed slice
+        // was spilled and reloaded for every store).
+        let out = self.out.as_mut_ptr();
         let (mut bits, mut num_bits, mut pos) = (self.bits, u64::from(self.num_bits), self.pos);
         let start = (pos, num_bits);
         let num_pairs = residuals.len() / 2;
@@ -717,24 +851,19 @@ impl Stream {
         ((pos - start.0) * 8) as u64 + num_bits - start.1
     }
 
-    /// Stores the last, partial word and returns the stream.
-    fn finish(mut self) -> Vec<u8> {
+    /// Stores the last, partial word and the predictor bitmap, and returns
+    /// the bytes written.
+    fn finish(mut self) -> usize {
         if self.num_bits > 0 {
-            // SAFETY: the capacity includes a final word.
-            unsafe { Self::store_word(&mut self.out, self.pos, self.bits) };
+            // SAFETY: the last row's capacity check included this word.
+            unsafe { Self::store_word(self.out.as_mut_ptr(), self.pos, self.bits) };
             self.pos += 4;
         }
-        // SAFETY: every byte below pos was written.
-        unsafe { self.out.set_len(self.pos) };
-        self.out
+        for (slot, &byte) in self.out.iter_mut().zip(&self.predictor_bits) {
+            slot.write(byte);
+        }
+        self.pos
     }
-}
-
-/// Upper bound on the bytes one row of `width` residuals adds, including the
-/// branch-free flush's speculative store: at most 13 bits per residual on top
-/// of up to 31 pending bits.
-fn max_row_bytes(width: usize) -> usize {
-    (13 * width + 31).div_ceil(32) * 4 + 4
 }
 
 #[cfg(test)]
@@ -770,7 +899,8 @@ mod tests {
                     })
                     .collect();
                 for dynamic in [false, true] {
-                    let run = || encode(&image, width, height, stride, dynamic).expect("encode");
+                    let run =
+                        || encode_vec(&image, width, height, stride, dynamic).expect("encode");
                     let simd = run();
                     PORTABLE.with(|p| p.set(true));
                     let portable = run();

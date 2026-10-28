@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-C target-cpu=native`) was 13-23% slower than in default builds: LLVM turned
   the quantization's `PMULHUW` into 256-bit widening 32-bit multiplies. It is
   now pinned with inline assembly; native builds encode at 0.99x of C++ 4.1.1.
+- Entropy-coded streams are encoded straight into the caller's buffer when it
+  has room for the worst case (as `compressed_buffer_size` does), like tile
+  streams, instead of into a vector that is then copied. Added
+  `entropy_coder::compress_into`, `compress_dynamic_into` and
+  `max_compressed_size`; `compressed_buffer_size` grows by 4 bytes. Lossless
+  entropy encoding about 2% faster.
 - Near the end of a tile stream, groups of blocks without payload kept the
   SIMD tile decoder's 16-byte reads from going past the stream end by falling
   back to per-block code for the rest of the image; they read nothing, so they

@@ -4,5 +4,7 @@ pub mod tables;
 pub mod u8v1_compress;
 pub mod u8v1_decompress;
 
-pub use u8v1_compress::{compress, compress_dynamic};
+pub use u8v1_compress::{
+    compress, compress_dynamic, compress_dynamic_into, compress_into, max_compressed_size,
+};
 pub use u8v1_decompress::{decompress, decompress_dynamic};
