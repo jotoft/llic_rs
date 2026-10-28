@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unpacks four blocks at once. Fast-mode decoding now matches or beats C++
   4.1.1; streams are unchanged. The AVX2 two-tile encoder path is gone, as it
   was no faster.
+- Tile-based encoding writes straight into the caller's buffer when it has room
+  for the worst case (as `compressed_buffer_size` does) instead of zeroing a
+  scratch buffer and copying the stream twice: about 15% faster. Added
+  `lossy::compress_tile_block_into` and `lossy::tile_block_scratch_size`.
 
 ### Fixed
 

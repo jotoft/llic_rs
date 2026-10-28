@@ -1273,19 +1273,17 @@ fn encode_single_tile(
     (min, dist, written)
 }
 
+/// Buffer size [`compress_tile_block_into`] needs for a block of `width` x
+/// `rows` pixels: the chunk with a raw header and up to 16 bytes per block of
+/// pixel data, or the compressed-header layout plus scratch for the raw header.
+pub fn tile_block_scratch_size(width: u32, rows: u32) -> usize {
+    5 + 18 * ((width / 4) * (rows / 4)) as usize
+}
+
 /// Compress a single block of grayscale image data using tile-based lossy compression.
 ///
 /// This produces the same format as the C++ encoder's `doCompressTileBased` function.
-///
-/// # Arguments
-/// * `src_data` - Source grayscale image data
-/// * `width` - Image width in pixels (must be multiple of 4)
-/// * `rows` - Number of rows to compress (must be multiple of 4)
-/// * `bytes_per_line` - Stride of the source image
-/// * `error_limit` - Quality level (2, 4, 8, or 16)
-/// * `compress_header` - Whether to attempt header compression
-/// * `use_dynamic_predictor` - Whether to use dynamic predictor for header compression
-/// * `layout` - Where a compressed header goes, set by the container format version
+/// See [`compress_tile_block_into`] for the arguments.
 ///
 /// # Returns
 /// Compressed data as a Vec<u8>
@@ -1300,146 +1298,240 @@ pub fn compress_tile_block(
     use_dynamic_predictor: bool,
     layout: TileHeaderLayout,
 ) -> Result<Vec<u8>> {
+    let mut output = vec![0u8; tile_block_scratch_size(width, rows)];
+    let size = compress_tile_block_into(
+        src_data,
+        width,
+        rows,
+        bytes_per_line,
+        error_limit,
+        compress_header,
+        use_dynamic_predictor,
+        layout,
+        &mut output,
+    )?;
+    output.truncate(size);
+    Ok(output)
+}
+
+/// Compress a block into `dst`, which needs [`tile_block_scratch_size`] bytes
+/// (beyond the returned size its contents are unspecified).
+///
+/// # Arguments
+/// * `src_data` - Source grayscale image data
+/// * `width` - Image width in pixels (must be multiple of 4)
+/// * `rows` - Number of rows to compress (must be multiple of 4)
+/// * `bytes_per_line` - Stride of the source image
+/// * `error_limit` - Quality level (0, 2, 4, 8, 16 or 32)
+/// * `compress_header` - Whether to attempt header compression
+/// * `use_dynamic_predictor` - Whether to use dynamic predictor for header compression
+/// * `layout` - Where a compressed header goes, set by the container format version
+/// * `dst` - Output buffer
+///
+/// # Returns
+/// The number of bytes written to `dst`.
+#[allow(clippy::too_many_arguments)]
+pub fn compress_tile_block_into(
+    src_data: &[u8],
+    width: u32,
+    rows: u32,
+    bytes_per_line: u32,
+    error_limit: u8,
+    compress_header: bool,
+    use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
+    dst: &mut [u8],
+) -> Result<usize> {
     if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
     }
     if rows > 0 && src_data.len() < ((rows - 1) * bytes_per_line + width) as usize {
         return Err(LlicError::InvalidArgument);
     }
+    if dst.len() < tile_block_scratch_size(width, rows) {
+        return Err(LlicError::InvalidArgument);
+    }
 
     let num_tiles = ((width / 4) * (rows / 4)) as usize;
-    let blocks_per_row = (width / 4) as usize;
     // Header values are chosen for the header coder only when it runs.
     let select_header =
         layout == TileHeaderLayout::AfterPixels && compress_header && error_limit == 0;
-
-    // Generate bucket LUT for this error_limit
     let bucket_lut = generate_bucket_lut(error_limit);
-
-    // Allocate output buffer for uncompressed header first
-    // Format: 1 byte header + num_tiles min values + num_tiles dist values + pixel data
-    // Worst case pixel data: 16 bytes per tile (8-bit mode)
-    let max_size = 1 + num_tiles * 2 + num_tiles * 16;
-    let mut temp_output = vec![0u8; max_size];
-
-    // First byte: flags (bit 7 = compressed header) + error_limit
-    // Set bit 7 to 0 initially (uncompressed header)
-    temp_output[0] = error_limit & 0x7f;
-
-    // Split temp_output into non-overlapping mutable slices
-    let (header_and_streams, pixel_stream) = temp_output[1..].split_at_mut(num_tiles * 2);
-    let (min_stream, dist_stream) = header_and_streams.split_at_mut(num_tiles);
-    let mut pixel_pos = 0usize;
-
-    #[cfg(target_arch = "x86_64")]
-    let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(&bucket_lut));
-    for y in (0..rows).step_by(4) {
-        let first_block = (y / 4 * (width / 4)) as usize;
-        let select_row = select_header && y > 0;
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut x = 0u32;
+    let block = TileBlock {
+        src_data,
+        width,
+        rows,
+        bytes_per_line,
         #[cfg(target_arch = "x86_64")]
-        if let Some(lut) = &sse_lut {
-            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
-            let (end, written) = unsafe {
-                tile_sse::encode_row_groups(
+        error_limit,
+        select_header,
+        bucket_lut: &bucket_lut,
+    };
+    dst[0] = error_limit & 0x7f;
+
+    if !compress_header {
+        // [flags][min stream][dist stream][pixels]
+        let (header, pixel_stream) = dst[1..].split_at_mut(num_tiles * 2);
+        let (min_stream, dist_stream) = header.split_at_mut(num_tiles);
+        let pixel_pos = block.encode(min_stream, dist_stream, pixel_stream);
+        return Ok(1 + num_tiles * 2 + pixel_pos);
+    }
+
+    // The compressed header's size is known only at the end, so the pixels go
+    // to offset 5 and the raw header past their bound, as in the C++ encoder.
+    let header_start = 5 + 16 * num_tiles;
+    let (pixel_area, header) = dst.split_at_mut(header_start);
+    let (min_stream, dist_stream) = header[..num_tiles * 2].split_at_mut(num_tiles);
+    let pixel_pos = block.encode(min_stream, dist_stream, &mut pixel_area[5..]);
+    finish_header(
+        dst,
+        num_tiles,
+        pixel_pos,
+        use_dynamic_predictor,
+        layout,
+        width,
+        rows,
+    )
+}
+
+/// The inputs of one tile block encode.
+struct TileBlock<'a> {
+    src_data: &'a [u8],
+    width: u32,
+    rows: u32,
+    bytes_per_line: u32,
+    /// For the SSE groups; the per-block code reads the bucket LUT.
+    #[cfg(target_arch = "x86_64")]
+    error_limit: u8,
+    select_header: bool,
+    bucket_lut: &'a [BucketLutEntry; 256],
+}
+
+impl TileBlock<'_> {
+    /// Encodes every block, filling the header streams; returns the bytes
+    /// written to `pixel_stream` (which needs 16 bytes per block).
+    fn encode(
+        &self,
+        min_stream: &mut [u8],
+        dist_stream: &mut [u8],
+        pixel_stream: &mut [u8],
+    ) -> usize {
+        let TileBlock {
+            src_data,
+            width,
+            rows,
+            bytes_per_line,
+            select_header,
+            bucket_lut,
+            ..
+        } = *self;
+        let blocks_per_row = (width / 4) as usize;
+        let mut pixel_pos = 0usize;
+        #[cfg(target_arch = "x86_64")]
+        let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(bucket_lut));
+        for y in (0..rows).step_by(4) {
+            let first_block = (y / 4 * (width / 4)) as usize;
+            let select_row = select_header && y > 0;
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+            let mut x = 0u32;
+            #[cfg(target_arch = "x86_64")]
+            if let Some(lut) = &sse_lut {
+                // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
+                let (end, written) = unsafe {
+                    tile_sse::encode_row_groups(
+                        src_data,
+                        (y * bytes_per_line) as usize,
+                        bytes_per_line as usize,
+                        width as usize,
+                        first_block,
+                        select_row,
+                        min_stream,
+                        dist_stream,
+                        self.error_limit,
+                        lut,
+                        &mut pixel_stream[pixel_pos..],
+                    )
+                };
+                #[allow(clippy::cast_possible_truncation)] // at most the width
+                {
+                    x = end as u32;
+                }
+                pixel_pos += written;
+            }
+            for x in (x..width).step_by(4) {
+                let block_idx = first_block + (x / 4) as usize;
+                let above = select_row.then(|| {
+                    let above = block_idx - blocks_per_row;
+                    (min_stream[above], dist_stream[above])
+                });
+                let starts = [0, 1, 2, 3].map(|r| ((y + r) * bytes_per_line + x) as usize);
+                let (min_val, dist, written) = encode_single_tile(
                     src_data,
-                    (y * bytes_per_line) as usize,
-                    bytes_per_line as usize,
-                    width as usize,
-                    first_block,
-                    select_row,
-                    min_stream,
-                    dist_stream,
-                    error_limit,
-                    lut,
+                    starts,
+                    bucket_lut,
+                    above,
                     &mut pixel_stream[pixel_pos..],
-                )
-            };
-            #[allow(clippy::cast_possible_truncation)] // at most the width
-            {
-                x = end as u32;
+                );
+                min_stream[block_idx] = min_val;
+                dist_stream[block_idx] = dist;
+                pixel_pos += written;
             }
-            pixel_pos += written;
         }
-        for x in (x..width).step_by(4) {
-            let block_idx = first_block + (x / 4) as usize;
-            let above = select_row.then(|| {
-                let above = block_idx - blocks_per_row;
-                (min_stream[above], dist_stream[above])
-            });
-            let starts = [0, 1, 2, 3].map(|r| ((y + r) * bytes_per_line + x) as usize);
-            let (min_val, dist, written) = encode_single_tile(
-                src_data,
-                starts,
-                &bucket_lut,
-                above,
-                &mut pixel_stream[pixel_pos..],
-            );
-            min_stream[block_idx] = min_val;
-            dist_stream[block_idx] = dist;
-            pixel_pos += written;
-        }
+        pixel_pos
+    }
+}
+
+/// Finishes a block whose pixels are at `dst[5..5 + pixel_pos]` and raw header
+/// at `dst[5 + 16 * num_tiles..]`: stores the entropy-coded header in the
+/// layout's place, or the raw header in front when it does not compress (it
+/// must save more than the 4-byte size or offset field). Returns the size.
+fn finish_header(
+    dst: &mut [u8],
+    num_tiles: usize,
+    pixel_pos: usize,
+    use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
+    width: u32,
+    rows: u32,
+) -> Result<usize> {
+    let header_start = 5 + 16 * num_tiles;
+    let raw_header = &dst[header_start..header_start + num_tiles * 2];
+    let (header_width, header_height) = (width / 4, (rows / 4) * 2);
+    let compressed = if use_dynamic_predictor {
+        crate::entropy_coder::compress_dynamic(
+            raw_header,
+            header_width,
+            header_height,
+            header_width,
+        )?
+    } else {
+        crate::entropy_coder::compress(raw_header, header_width, header_height, header_width)?
+    };
+
+    if compressed.len() + 4 >= num_tiles * 2 {
+        // Rare: store the raw header in front, as in fast mode. Its destination
+        // overlaps the pixels, so it is staged.
+        let raw_header = raw_header.to_vec();
+        dst.copy_within(5..5 + pixel_pos, 1 + num_tiles * 2);
+        dst[1..1 + num_tiles * 2].copy_from_slice(&raw_header);
+        return Ok(1 + num_tiles * 2 + pixel_pos);
     }
 
-    // Calculate uncompressed size
-    let uncompressed_size = 1 + num_tiles * 2 + pixel_pos;
-
-    // Try header compression if requested
-    if compress_header {
-        // Arrange header as: [min_values][dist_values] in a single buffer
-        let header_width = width / 4;
-        let header_height = (rows / 4) * 2;
-        let mut header_buffer = vec![0u8; num_tiles * 2];
-
-        // Copy min and dist streams from their slices (which are views into temp_output)
-        header_buffer[..num_tiles].copy_from_slice(min_stream);
-        header_buffer[num_tiles..].copy_from_slice(dist_stream);
-
-        // Compress header using entropy coder (dynamic predictor if requested)
-        let compressed_header = if use_dynamic_predictor {
-            crate::entropy_coder::compress_dynamic(
-                &header_buffer,
-                header_width,
-                header_height,
-                header_width,
-            )?
-        } else {
-            crate::entropy_coder::compress(
-                &header_buffer,
-                header_width,
-                header_height,
-                header_width,
-            )?
-        };
-
-        // Check if compression actually saves space (need at least 5 bytes overhead)
-        let compressed_size_with_header = 1 + 4 + compressed_header.len() + pixel_pos;
-
-        if compressed_size_with_header < uncompressed_size {
-            let mut output = Vec::with_capacity(compressed_size_with_header);
-            output.push(0x80 | (error_limit & 0x7f)); // Set bit 7 for compressed header
-            let pixels = &pixel_stream[..pixel_pos];
-            #[allow(clippy::cast_possible_truncation)] // chunks are far below 4 GiB
-            match layout {
-                TileHeaderLayout::BeforePixels => {
-                    output.extend_from_slice(&(compressed_header.len() as u32).to_le_bytes());
-                    output.extend_from_slice(&compressed_header);
-                    output.extend_from_slice(pixels);
-                }
-                TileHeaderLayout::AfterPixels => {
-                    output.extend_from_slice(&((5 + pixels.len()) as u32).to_le_bytes());
-                    output.extend_from_slice(pixels);
-                    output.extend_from_slice(&compressed_header);
-                }
-            }
-            return Ok(output);
+    dst[0] |= 0x80;
+    let size = 5 + compressed.len() + pixel_pos;
+    #[allow(clippy::cast_possible_truncation)] // chunks are far below 4 GiB
+    match layout {
+        TileHeaderLayout::BeforePixels => {
+            dst.copy_within(5..5 + pixel_pos, 5 + compressed.len());
+            dst[1..5].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+            dst[5..5 + compressed.len()].copy_from_slice(&compressed);
+        }
+        TileHeaderLayout::AfterPixels => {
+            dst[1..5].copy_from_slice(&((5 + pixel_pos) as u32).to_le_bytes());
+            dst[5 + pixel_pos..size].copy_from_slice(&compressed);
         }
     }
-
-    // Use uncompressed header (or compression didn't help)
-    temp_output.truncate(uncompressed_size);
-    Ok(temp_output)
+    Ok(size)
 }
 
 /// Decompress a single block of tile-based lossy compressed data.

@@ -382,9 +382,10 @@ impl LlicContext {
             Quality::VeryLow => 32,
         };
 
-        // Run the chosen algorithm — block payload is identical across versions.
-        let compressed: Vec<u8> = if use_entropy {
-            if mode == Mode::Dynamic {
+        // Block payloads are identical across versions, apart from where a tile
+        // block keeps a compressed header (see `TileHeaderLayout`).
+        if use_entropy {
+            let compressed = if mode == Mode::Dynamic {
                 entropy_coder::compress_dynamic(
                     src_graymap,
                     self.width,
@@ -393,11 +394,26 @@ impl LlicContext {
                 )?
             } else {
                 entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?
-            }
-        } else {
-            let compress_header = mode != Mode::Fast;
-            let use_dynamic_predictor = mode == Mode::Dynamic;
-            lossy::compress_tile_block(
+            };
+            return match format_version {
+                FormatVersion::V4 | FormatVersion::V5 => {
+                    write_v4_block(&compressed, format_version, false, mode, dst_data)
+                }
+                FormatVersion::V3 => write_v3_block(&compressed, true, dst_data),
+            };
+        }
+
+        let compress_header = mode != Mode::Fast;
+        let use_dynamic_predictor = mode == Mode::Dynamic;
+        let layout = lossy::TileHeaderLayout::for_format_version(format_version as u8);
+        let offset = match format_version {
+            FormatVersion::V3 => V3_TILE_HEADER_LEN,
+            FormatVersion::V4 | FormatVersion::V5 => V4_HEADER_LEN,
+        };
+        // Encode in place behind the container header when the buffer has room
+        // for the worst case (compressed_buffer_size always does).
+        if dst_data.len() >= offset + lossy::tile_block_scratch_size(self.width, self.height) {
+            let size = lossy::compress_tile_block_into(
                 src_graymap,
                 self.width,
                 self.height,
@@ -405,15 +421,33 @@ impl LlicContext {
                 error_limit,
                 compress_header,
                 use_dynamic_predictor,
-                lossy::TileHeaderLayout::for_format_version(format_version as u8),
-            )?
-        };
+                layout,
+                &mut dst_data[offset..],
+            )?;
+            return Ok(match format_version {
+                FormatVersion::V4 | FormatVersion::V5 => {
+                    write_v4_header(dst_data, format_version, true, mode, size);
+                    offset + size
+                }
+                FormatVersion::V3 => write_v3_tile_header(dst_data, size),
+            });
+        }
 
+        let compressed = lossy::compress_tile_block(
+            src_graymap,
+            self.width,
+            self.height,
+            self.bytes_per_line,
+            error_limit,
+            compress_header,
+            use_dynamic_predictor,
+            layout,
+        )?;
         match format_version {
             FormatVersion::V4 | FormatVersion::V5 => {
-                write_v4_block(&compressed, format_version, !use_entropy, mode, dst_data)
+                write_v4_block(&compressed, format_version, true, mode, dst_data)
             }
-            FormatVersion::V3 => write_v3_block(&compressed, use_entropy, dst_data),
+            FormatVersion::V3 => write_v3_block(&compressed, false, dst_data),
         }
     }
 }
@@ -439,6 +473,45 @@ fn chunk_rows(version: u8, height: usize, num_chunks: usize, index: usize) -> us
     }
 }
 
+/// Container header length before a single block's payload in v4/v5.
+const V4_HEADER_LEN: usize = 8;
+/// Container header length before a single tile-based block's payload in v3.
+const V3_TILE_HEADER_LEN: usize = 6;
+
+/// Write the v4/v5 header of a single-block container whose payload of
+/// `payload_len` bytes is already in place:
+/// `[version][1][tile_based][mode][block_size:u32 LE]`.
+fn write_v4_header(
+    dst_data: &mut [u8],
+    version: FormatVersion,
+    tile_based: bool,
+    mode: Mode,
+    payload_len: usize,
+) {
+    dst_data[0] = version as u8;
+    dst_data[1] = 1;
+    dst_data[2] = tile_based as u8;
+    dst_data[3] = mode as u8;
+    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
+    dst_data[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
+}
+
+/// Write the v3 header of a single tile-based block whose payload is already
+/// in place, padding it as [`write_v3_block`] describes; needs one byte of
+/// room after the payload. Returns the container size.
+fn write_v3_tile_header(dst_data: &mut [u8], payload_len: usize) -> usize {
+    let padding = usize::from(payload_len.is_multiple_of(256));
+    let total = V3_TILE_HEADER_LEN + payload_len + padding;
+    if padding == 1 {
+        dst_data[total - 1] = 0;
+    }
+    dst_data[0] = FormatVersion::V3 as u8;
+    dst_data[1] = 1;
+    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
+    dst_data[2..6].copy_from_slice(&((payload_len + padding) as u32).to_le_bytes());
+    total
+}
+
 /// Write a single-block container with the v4 header, also used by v5:
 /// `[version][1][tile_based][mode][block_size:u32 LE][payload]`.
 fn write_v4_block(
@@ -448,16 +521,12 @@ fn write_v4_block(
     mode: Mode,
     dst_data: &mut [u8],
 ) -> Result<usize> {
-    let total = 8 + payload.len();
+    let total = V4_HEADER_LEN + payload.len();
     if dst_data.len() < total {
         return Err(LlicError::InvalidArgument);
     }
-    dst_data[0] = version as u8;
-    dst_data[1] = 1;
-    dst_data[2] = tile_based as u8;
-    dst_data[3] = mode as u8;
-    dst_data[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    dst_data[8..total].copy_from_slice(payload);
+    dst_data[V4_HEADER_LEN..total].copy_from_slice(payload);
+    write_v4_header(dst_data, version, tile_based, mode, payload.len());
     Ok(total)
 }
 
@@ -486,19 +555,11 @@ fn write_v3_block(payload: &[u8], entropy: bool, dst_data: &mut [u8]) -> Result<
         Ok(total)
     } else {
         let padding = usize::from(payload.len().is_multiple_of(256));
-        let block_size = (payload.len() + padding) as u32;
-        let total = 6 + payload.len() + padding;
-        if dst_data.len() < total {
+        if dst_data.len() < V3_TILE_HEADER_LEN + payload.len() + padding {
             return Err(LlicError::InvalidArgument);
         }
-        dst_data[0] = FormatVersion::V3 as u8;
-        dst_data[1] = 1;
-        dst_data[2..6].copy_from_slice(&block_size.to_le_bytes());
-        dst_data[6..6 + payload.len()].copy_from_slice(payload);
-        if padding == 1 {
-            dst_data[total - 1] = 0;
-        }
-        Ok(total)
+        dst_data[V3_TILE_HEADER_LEN..V3_TILE_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        Ok(write_v3_tile_header(dst_data, payload.len()))
     }
 }
 
@@ -1258,6 +1319,43 @@ mod tests {
                 let v3: usize = split(3, height, chunks).iter().sum();
                 assert!(v2 <= height, "v2 {height} rows in {chunks}");
                 assert_eq!(v3, height, "v3 {height} rows in {chunks}");
+            }
+        }
+    }
+
+    /// The in-place encoder (buffer with room for the worst case) and the
+    /// fallback (buffer barely larger than the stream) must agree exactly.
+    #[test]
+    fn in_place_and_fallback_encodes_match() {
+        let (width, height) = (72u32, 40u32);
+        let src: Vec<u8> = (0..width * height)
+            .map(|i| ((i * 7919) % 251 + (i % width)) as u8)
+            .collect();
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+            for quality in [Quality::Lossless, Quality::Medium, Quality::LosslessEntropy] {
+                for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
+                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                        continue;
+                    }
+                    let mut roomy = vec![0u8; ctx.compressed_buffer_size()];
+                    let size = ctx
+                        .compress_gray8_versioned(&src, quality, mode, version, &mut roomy)
+                        .unwrap();
+                    let mut tight = vec![0u8; size];
+                    let tight_size = ctx
+                        .compress_gray8_versioned(&src, quality, mode, version, &mut tight)
+                        .unwrap();
+                    let case = format!("{version:?} {quality:?} {mode:?}");
+                    assert_eq!(tight_size, size, "{case}");
+                    assert_eq!(tight, roomy[..size], "{case}");
+                    let mut too_small = vec![0u8; size - 1];
+                    assert!(
+                        ctx.compress_gray8_versioned(&src, quality, mode, version, &mut too_small)
+                            .is_err(),
+                        "{case}"
+                    );
+                }
             }
         }
     }
