@@ -102,8 +102,16 @@ impl LlicContext {
         })
     }
 
+    /// Size of an output buffer that holds any stream `compress_gray8` and
+    /// `compress_gray8_versioned` can write for this context, as the C++
+    /// `llic_compressedBufferSize` computes it for one chunk: the container
+    /// header and the larger of the entropy-coded worst case (13 bits per
+    /// pixel plus the dynamic predictor bitmap) and the tile-based one.
     pub fn compressed_buffer_size(&self) -> usize {
-        ((self.width as usize * self.height as usize * 5) / 4) + 16384
+        let (width, height) = (self.width as usize, self.height as usize);
+        let entropy = (width * height * 13).div_ceil(32) * 4 + height.div_ceil(8).div_ceil(4) * 4;
+        let tile = lossy::tile_block_scratch_size(self.width, self.height);
+        V4_HEADER_LEN + entropy.max(tile)
     }
 
     pub fn decompress_gray8(
@@ -1355,6 +1363,40 @@ mod tests {
                             .is_err(),
                         "{case}"
                     );
+                }
+            }
+        }
+    }
+
+    /// Random noise is the entropy coder's worst case (13-bit escapes); every
+    /// quality and mode must fit in `compressed_buffer_size`.
+    #[test]
+    fn compressed_buffer_size_fits_noise() {
+        // Large enough that a fixed margin cannot hide a per-pixel shortfall.
+        let (width, height) = (512u32, 128u32);
+        let mut state = 0x1234_5678_u32;
+        let noise: Vec<u8> = (0..width * height)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+            for quality in [
+                Quality::Lossless,
+                Quality::VeryLow,
+                Quality::LosslessEntropy,
+            ] {
+                for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
+                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                        continue;
+                    }
+                    ctx.compress_gray8_versioned(&noise, quality, mode, version, &mut buf)
+                        .unwrap_or_else(|e| panic!("{version:?} {quality:?} {mode:?}: {e}"));
                 }
             }
         }

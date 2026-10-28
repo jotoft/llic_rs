@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `compressed_buffer_size` was smaller than the worst case of lossless entropy
+  coding (13 bits per pixel): on noisy images above about 44k pixels,
+  `compress_gray8` with `Quality::LosslessEntropy` returned `InvalidArgument`.
+  It is now sized like the C++ `llic_compressedBufferSize`.
 - The entropy encoder and its dynamic-mode row cost estimate read residual
   pairs through misaligned `u16` pointers (undefined behaviour).
 - Decoding a truncated tile stream panicked instead of returning
