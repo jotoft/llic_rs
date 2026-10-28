@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Format version 5, written by the C++ reference since 3.5.0. Tile chunks with
+  an entropy-coded min/dist header now store a 32-bit header offset and put the
+  header after the pixel stream (`lossy::TileHeaderLayout`); every other stream
+  is unchanged apart from the version byte. The decoder accepts versions 3 to 5,
+  so streams from current C++ releases decode, and `FormatVersion::V5` encodes
+  them.
+- In v5, lossless default- and dynamic-mode tile streams choose each block's
+  header values nearest the block above, as the C++ encoder does, which makes
+  them 2-3% smaller. Decoders need no change for this.
+- Compatibility tests against the C++ reference's decoder vectors
+  (`test_data/vectors`, from every C++ release since 2.0.0): all format 3-5
+  streams decode to the expected images, and our single-chunk v4 and v5 output
+  matches the C++ encoder byte for byte.
+
+### Changed
+
+- **Breaking:** `compress_gray8` writes format v5, like the C++ reference.
+  Decoders older than llic_rs 0.5.0 or C++ 3.5.0 cannot read it; use
+  `compress_gray8_versioned` with `FormatVersion::V4` for them.
+- **Breaking:** `lossy::compress_tile_block`, `decompress_tile_block`,
+  `decompress_tile_block_dynamic` and `extract_tile_metadata` take a
+  `TileHeaderLayout`.
+
 ### Fixed
 
 - Lossy tile encoding in builds without SSE4.1 (the default x86-64 target, and

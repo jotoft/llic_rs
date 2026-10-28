@@ -3,6 +3,8 @@
 //! This implements the 4x4 tile-based lossy compression algorithm used by LLIC
 //! for quality levels VeryHigh (2), High (4), Medium (8), and Low (16).
 
+use std::borrow::Cow;
+
 use crate::{LlicError, Result};
 
 #[cfg(target_arch = "x86_64")]
@@ -1252,6 +1254,81 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
     }
 }
 
+/// Where a tile chunk with an entropy-coded header stores that header.
+///
+/// Chunks with a raw header (fast mode, or a header that does not compress)
+/// have the same layout in every format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileHeaderLayout {
+    /// Formats 3 and 4: `[flags][header_size:u32 LE][compressed header][pixels]`.
+    BeforePixels,
+    /// Format 5: `[flags][header_offset:u32 LE][pixels][compressed header]`,
+    /// where `header_offset` is counted from the start of the chunk.
+    ///
+    /// The encoder also chooses lossless header values for the header coder
+    /// (see [`select_lossless_header`]), as the C++ encoder has since 3.5.0.
+    AfterPixels,
+}
+
+impl TileHeaderLayout {
+    /// The layout used by a container format version.
+    pub fn for_format_version(version: u8) -> Self {
+        if version >= 5 {
+            Self::AfterPixels
+        } else {
+            Self::BeforePixels
+        }
+    }
+}
+
+/// Choose a lossless block's header values nearest the block above.
+///
+/// Lossless decoding adds the residuals to `min` and uses `dist` only for its
+/// bit width, so a block decodes the same with any `min` in
+/// `[max - (2^bits - 1), min]` and any `dist` of the same width (0..=6 bits for
+/// `dist < 64`, else 8). Values near the block above leave small residuals for
+/// the header coder. Matches the C++ `selectLosslessHeader`.
+fn select_lossless_header(min: u8, dist: u8, top_min: u8, top_dist: u8) -> (u8, u8) {
+    let dist = u32::from(dist);
+    let mut hi = dist | (dist >> 1);
+    hi |= hi >> 2;
+    hi |= hi >> 4;
+    let (lo, hi) = if dist >= 64 {
+        (64, 255)
+    } else {
+        (hi - (hi >> 1), hi)
+    };
+    let max = u32::from(min) + dist;
+    let min_lo = max.saturating_sub(hi);
+    let new_min = u32::from(top_min).min(u32::from(min)).max(min_lo);
+    let new_dist = u32::from(top_dist).max(lo).min(hi);
+    #[allow(clippy::cast_possible_truncation)] // both are clamped to at most 255
+    (new_min as u8, new_dist as u8)
+}
+
+/// Apply [`select_lossless_header`] to an encoded lossless block and rebase its
+/// residuals onto the new minimum.
+///
+/// The new minimum is at most the old one and keeps every residual within the
+/// block's bit width, so adding the difference cannot overflow.
+#[inline]
+fn rebase_lossless_block<T: Copy + From<u8> + std::ops::AddAssign>(
+    min: u8,
+    dist: u8,
+    top_min: u8,
+    top_dist: u8,
+    residuals: &mut [T; 16],
+) -> (u8, u8) {
+    let (new_min, new_dist) = select_lossless_header(min, dist, top_min, top_dist);
+    let shift = T::from(min - new_min);
+    if min != new_min {
+        for residual in residuals.iter_mut() {
+            *residual += shift;
+        }
+    }
+    (new_min, new_dist)
+}
+
 /// Compress a single block of grayscale image data using tile-based lossy compression.
 ///
 /// This produces the same format as the C++ encoder's `doCompressTileBased` function.
@@ -1264,9 +1341,11 @@ fn pack_pixels(indices: &[u8; 16], bits: u8, dst: &mut [u8]) -> usize {
 /// * `error_limit` - Quality level (2, 4, 8, or 16)
 /// * `compress_header` - Whether to attempt header compression
 /// * `use_dynamic_predictor` - Whether to use dynamic predictor for header compression
+/// * `layout` - Where a compressed header goes, set by the container format version
 ///
 /// # Returns
 /// Compressed data as a Vec<u8>
+#[allow(clippy::too_many_arguments)]
 pub fn compress_tile_block(
     src_data: &[u8],
     width: u32,
@@ -1275,12 +1354,17 @@ pub fn compress_tile_block(
     error_limit: u8,
     compress_header: bool,
     use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
 ) -> Result<Vec<u8>> {
     if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
     }
 
     let num_tiles = ((width / 4) * (rows / 4)) as usize;
+    let blocks_per_row = (width / 4) as usize;
+    // Header values are chosen for the header coder only when it runs.
+    let select_header =
+        layout == TileHeaderLayout::AfterPixels && compress_header && error_limit == 0;
 
     // Generate bucket LUT for this error_limit
     let bucket_lut = generate_bucket_lut(error_limit);
@@ -1330,8 +1414,31 @@ pub fn compress_tile_block(
                     )
                 };
 
-                // Store tile A
                 let block_idx_a = ((y / 4) * tiles_per_row + (x / 4)) as usize;
+                let block_idx_b = block_idx_a + 1;
+                let (min_a, dist_a, min_b, dist_b) = if select_header && y > 0 {
+                    let (above_a, above_b) =
+                        (block_idx_a - blocks_per_row, block_idx_b - blocks_per_row);
+                    let (min_a, dist_a) = rebase_lossless_block(
+                        min_a,
+                        dist_a,
+                        min_stream[above_a],
+                        dist_stream[above_a],
+                        &mut result_a,
+                    );
+                    let (min_b, dist_b) = rebase_lossless_block(
+                        min_b,
+                        dist_b,
+                        min_stream[above_b],
+                        dist_stream[above_b],
+                        &mut result_b,
+                    );
+                    (min_a, dist_a, min_b, dist_b)
+                } else {
+                    (min_a, dist_a, min_b, dist_b)
+                };
+
+                // Store tile A
                 min_stream[block_idx_a] = min_a;
                 dist_stream[block_idx_a] = dist_a;
                 if bits_a > 0 {
@@ -1342,7 +1449,6 @@ pub fn compress_tile_block(
                 }
 
                 // Store tile B
-                let block_idx_b = block_idx_a + 1;
                 min_stream[block_idx_b] = min_b;
                 dist_stream[block_idx_b] = dist_b;
                 if bits_b > 0 {
@@ -1375,6 +1481,18 @@ pub fn compress_tile_block(
                 };
 
                 let block_idx = ((y / 4) * tiles_per_row + (x / 4)) as usize;
+                let (min_val, dist) = if select_header && y > 0 {
+                    let above = block_idx - blocks_per_row;
+                    rebase_lossless_block(
+                        min_val,
+                        dist,
+                        min_stream[above],
+                        dist_stream[above],
+                        &mut result_a,
+                    )
+                } else {
+                    (min_val, dist)
+                };
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
@@ -1422,6 +1540,18 @@ pub fn compress_tile_block(
                 let block_idx = ((y * width) >> 4) + (x >> 2);
                 let block_idx = block_idx as usize;
 
+                let (min_val, dist) = if select_header && y > 0 {
+                    let above = block_idx - blocks_per_row;
+                    rebase_lossless_block(
+                        min_val,
+                        dist,
+                        min_stream[above],
+                        dist_stream[above],
+                        &mut result,
+                    )
+                } else {
+                    (min_val, dist)
+                };
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
@@ -1465,6 +1595,18 @@ pub fn compress_tile_block(
                 let block_idx = ((y * width) >> 4) + (x >> 2);
                 let block_idx = block_idx as usize;
 
+                let (min_val, dist) = if select_header && y > 0 {
+                    let above = block_idx - blocks_per_row;
+                    rebase_lossless_block(
+                        min_val,
+                        dist,
+                        min_stream[above],
+                        dist_stream[above],
+                        &mut indices,
+                    )
+                } else {
+                    (min_val, dist)
+                };
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
@@ -1500,6 +1642,18 @@ pub fn compress_tile_block(
                 let block_idx = ((y * width) >> 4) + (x >> 2);
                 let block_idx = block_idx as usize;
 
+                let (min_val, dist) = if select_header && y > 0 {
+                    let above = block_idx - blocks_per_row;
+                    rebase_lossless_block(
+                        min_val,
+                        dist,
+                        min_stream[above],
+                        dist_stream[above],
+                        &mut indices,
+                    )
+                } else {
+                    (min_val, dist)
+                };
                 min_stream[block_idx] = min_val;
                 dist_stream[block_idx] = dist;
 
@@ -1546,21 +1700,22 @@ pub fn compress_tile_block(
         let compressed_size_with_header = 1 + 4 + compressed_header.len() + pixel_pos;
 
         if compressed_size_with_header < uncompressed_size {
-            // Use compressed header
-            // Format: [flags|error_limit:1][header_size:4][compressed_header][pixel_data]
-            let mut output = vec![0u8; compressed_size_with_header];
-            output[0] = 0x80 | (error_limit & 0x7f); // Set bit 7 for compressed header
-
-            // Write header size (little-endian u32)
-            let header_size = compressed_header.len() as u32;
-            output[1..5].copy_from_slice(&header_size.to_le_bytes());
-
-            // Copy compressed header
-            output[5..5 + compressed_header.len()].copy_from_slice(&compressed_header);
-
-            // Copy pixel data
-            output[5 + compressed_header.len()..].copy_from_slice(&pixel_stream[..pixel_pos]);
-
+            let mut output = Vec::with_capacity(compressed_size_with_header);
+            output.push(0x80 | (error_limit & 0x7f)); // Set bit 7 for compressed header
+            let pixels = &pixel_stream[..pixel_pos];
+            #[allow(clippy::cast_possible_truncation)] // chunks are far below 4 GiB
+            match layout {
+                TileHeaderLayout::BeforePixels => {
+                    output.extend_from_slice(&(compressed_header.len() as u32).to_le_bytes());
+                    output.extend_from_slice(&compressed_header);
+                    output.extend_from_slice(pixels);
+                }
+                TileHeaderLayout::AfterPixels => {
+                    output.extend_from_slice(&((5 + pixels.len()) as u32).to_le_bytes());
+                    output.extend_from_slice(pixels);
+                    output.extend_from_slice(&compressed_header);
+                }
+            }
             return Ok(output);
         }
     }
@@ -1579,10 +1734,19 @@ pub fn decompress_tile_block(
     width: u32,
     rows: u32,
     bytes_per_line: u32,
+    layout: TileHeaderLayout,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     // Default: no dynamic predictor for headers
-    decompress_tile_block_impl(src_data, width, rows, bytes_per_line, false, dst_graymap)
+    decompress_tile_block_dynamic(
+        src_data,
+        width,
+        rows,
+        bytes_per_line,
+        false,
+        layout,
+        dst_graymap,
+    )
 }
 
 /// Decompress a single block of tile-based lossy compressed data with dynamic predictor option.
@@ -1592,129 +1756,111 @@ pub fn decompress_tile_block_dynamic(
     rows: u32,
     bytes_per_line: u32,
     use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
-    decompress_tile_block_impl(
-        src_data,
+    let chunk = parse_tile_chunk(src_data, width, rows, use_dynamic_predictor, layout)?;
+    let bucket_lut = generate_bucket_lut(chunk.error_limit);
+    let (min_stream, dist_stream) = chunk.header.split_at(chunk.header.len() / 2);
+    decompress_tiles(
+        min_stream,
+        dist_stream,
+        chunk.pixels,
         width,
         rows,
         bytes_per_line,
-        use_dynamic_predictor,
+        &bucket_lut,
+        chunk.error_limit == 0,
         dst_graymap,
     )
 }
 
-/// Decompress a tile-based block implementation.
+/// A tile chunk split into its parts.
+struct TileChunk<'a> {
+    /// Quantization error limit (bits 0-6 of the flags byte).
+    error_limit: u8,
+    /// `min[num_tiles]` followed by `dist[num_tiles]`, decoded if it was entropy coded.
+    header: Cow<'a, [u8]>,
+    /// The packed pixel indices.
+    pixels: &'a [u8],
+}
+
+/// Split a tile chunk into its header and pixel stream.
 ///
-/// The block format from C++:
-/// - Byte 0: flags/quality (bit 7 = compressed header, bits 0-6 = error_limit)
-/// - If uncompressed header (flags & 0x80 == 0):
-///   - Bytes 1..: min[num_tiles], dist[num_tiles], pixels[...]
-/// - If compressed header (flags & 0x80 == 0x80):
-///   - Bytes 1-4: header_size (u32)
-///   - Bytes 5..: compressed_header[header_size], pixels[...]
-fn decompress_tile_block_impl(
+/// Byte 0 holds the flags (bit 7 = compressed header) and the error limit.
+/// - Raw header: `[flags][min[num_tiles]][dist[num_tiles]][pixels]`
+/// - Compressed header: see [`TileHeaderLayout`]. The header is entropy coded
+///   as a `(width/4) x (rows/4 * 2)` image, mins above dists.
+fn parse_tile_chunk(
     src_data: &[u8],
     width: u32,
     rows: u32,
-    bytes_per_line: u32,
     use_dynamic_predictor: bool,
-    dst_graymap: &mut [u8],
-) -> Result<()> {
-    if src_data.is_empty() {
+    layout: TileHeaderLayout,
+) -> Result<TileChunk<'_>> {
+    let Some(&flags) = src_data.first() else {
         return Err(LlicError::InvalidData);
-    }
-
+    };
+    let error_limit = flags & 0x7f;
     let num_tiles = ((width / 4) * (rows / 4)) as usize;
 
-    // First byte contains flags and error_limit
-    let flags = src_data[0];
-    let compressed_header = (flags & 0x80) != 0;
-    let error_limit = flags & 0x7f; // Extract error_limit from lower 7 bits
-
-    // Generate bucket LUT for the actual error_limit from the block
-    let bucket_lut = generate_bucket_lut(error_limit);
-    let is_lossless = error_limit == 0;
-
-    if compressed_header {
-        // Compressed header - decompress min/dist streams using entropy coder
-        // Format: [flags:1][header_size:4][compressed_header:header_size][pixel_data:...]
-        if src_data.len() < 5 {
+    if flags & 0x80 == 0 {
+        let header_end = 1 + num_tiles * 2;
+        if src_data.len() < header_end {
             return Err(LlicError::InvalidData);
         }
-
-        let header_size =
-            u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
-
-        if src_data.len() < 5 + header_size {
-            return Err(LlicError::InvalidData);
-        }
-
-        // The header is entropy-coded as a (width/4) × (rows/4 * 2) "image"
-        // First half = min values, second half = dist values
-        let header_width = width / 4;
-        let header_height = (rows / 4) * 2;
-        let header_decompressed_size = (header_width * header_height) as usize;
-
-        // Decompress the header (using dynamic predictor if requested)
-        let mut header_buffer = vec![0u8; header_decompressed_size];
-        if use_dynamic_predictor {
-            crate::entropy_coder::decompress_dynamic(
-                &src_data[5..5 + header_size],
-                header_width,
-                header_height,
-                header_width,
-                &mut header_buffer,
-            )?;
-        } else {
-            crate::entropy_coder::decompress(
-                &src_data[5..5 + header_size],
-                header_width,
-                header_height,
-                header_width,
-                &mut header_buffer,
-            )?;
-        }
-
-        // Split into min and dist streams
-        let half = header_decompressed_size / 2;
-        let min_stream = &header_buffer[..half];
-        let dist_stream = &header_buffer[half..];
-        let pixel_stream_start = 5 + header_size;
-
-        decompress_tiles(
-            min_stream,
-            dist_stream,
-            &src_data[pixel_stream_start..],
-            width,
-            rows,
-            bytes_per_line,
-            &bucket_lut,
-            is_lossless,
-            dst_graymap,
-        )
-    } else {
-        // Uncompressed header: min and dist streams start at byte 1
-        if src_data.len() < 1 + num_tiles * 2 {
-            return Err(LlicError::InvalidData);
-        }
-
-        let min_stream = &src_data[1..1 + num_tiles];
-        let dist_stream = &src_data[1 + num_tiles..1 + num_tiles * 2];
-        let pixel_stream_start = 1 + num_tiles * 2;
-
-        decompress_tiles(
-            min_stream,
-            dist_stream,
-            &src_data[pixel_stream_start..],
-            width,
-            rows,
-            bytes_per_line,
-            &bucket_lut,
-            is_lossless,
-            dst_graymap,
-        )
+        return Ok(TileChunk {
+            error_limit,
+            header: Cow::Borrowed(&src_data[1..header_end]),
+            pixels: &src_data[header_end..],
+        });
     }
+
+    if src_data.len() < 5 || num_tiles == 0 {
+        return Err(LlicError::InvalidData);
+    }
+    let field = u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
+    let (compressed_header, pixels) = match layout {
+        TileHeaderLayout::BeforePixels => {
+            let header_end = 5usize.checked_add(field).ok_or(LlicError::InvalidData)?;
+            if header_end > src_data.len() {
+                return Err(LlicError::InvalidData);
+            }
+            (&src_data[5..header_end], &src_data[header_end..])
+        }
+        TileHeaderLayout::AfterPixels => {
+            if field < 5 || field > src_data.len() {
+                return Err(LlicError::InvalidData);
+            }
+            (&src_data[field..], &src_data[5..field])
+        }
+    };
+
+    let header_width = width / 4;
+    let header_height = (rows / 4) * 2;
+    let mut header = vec![0u8; num_tiles * 2];
+    if use_dynamic_predictor {
+        crate::entropy_coder::decompress_dynamic(
+            compressed_header,
+            header_width,
+            header_height,
+            header_width,
+            &mut header,
+        )?;
+    } else {
+        crate::entropy_coder::decompress(
+            compressed_header,
+            header_width,
+            header_height,
+            header_width,
+            &mut header,
+        )?;
+    }
+    Ok(TileChunk {
+        error_limit,
+        header: Cow::Owned(header),
+        pixels,
+    })
 }
 
 /// Helper for decompressing with a pre-decompressed header buffer.
@@ -1757,6 +1903,8 @@ fn decompress_tile_block_with_header(
 /// * `src_data` - Compressed tile block data (starts after format header)
 /// * `width` - Image width in pixels (must be multiple of 4)
 /// * `height` - Image height in pixels (must be multiple of 4)
+/// * `use_dynamic_predictor` - Whether the header was coded with the dynamic predictor
+/// * `layout` - Where a compressed header is stored, set by the format version
 ///
 /// # Returns
 /// Vec of (min, dist, bits) for each tile in row-major order
@@ -1765,87 +1913,16 @@ pub fn extract_tile_metadata(
     width: u32,
     height: u32,
     use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
 ) -> Result<Vec<(u8, u8, u8)>> {
-    if src_data.is_empty() {
-        return Err(LlicError::InvalidData);
-    }
-
-    let num_tiles = ((width / 4) * (height / 4)) as usize;
-
-    // First byte contains flags and error_limit
-    let flags = src_data[0];
-    let compressed_header = (flags & 0x80) != 0;
-    let error_limit = flags & 0x7f;
-
-    // Generate bucket LUT for this error_limit
-    let bucket_lut = generate_bucket_lut(error_limit);
-
-    let (min_stream, dist_stream): (Vec<u8>, Vec<u8>) = if compressed_header {
-        // Compressed header - decompress min/dist streams using entropy coder
-        if src_data.len() < 5 {
-            return Err(LlicError::InvalidData);
-        }
-
-        let header_size =
-            u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
-
-        if src_data.len() < 5 + header_size {
-            return Err(LlicError::InvalidData);
-        }
-
-        // The header is entropy-coded as a (width/4) × (height/4 * 2) "image"
-        let header_width = width / 4;
-        let header_height = (height / 4) * 2;
-        let header_decompressed_size = (header_width * header_height) as usize;
-
-        // Decompress the header (using dynamic predictor if requested)
-        let mut header_buffer = vec![0u8; header_decompressed_size];
-        if use_dynamic_predictor {
-            crate::entropy_coder::decompress_dynamic(
-                &src_data[5..5 + header_size],
-                header_width,
-                header_height,
-                header_width,
-                &mut header_buffer,
-            )?;
-        } else {
-            crate::entropy_coder::decompress(
-                &src_data[5..5 + header_size],
-                header_width,
-                header_height,
-                header_width,
-                &mut header_buffer,
-            )?;
-        }
-
-        // Split into min and dist streams
-        let half = header_decompressed_size / 2;
-        (
-            header_buffer[..half].to_vec(),
-            header_buffer[half..].to_vec(),
-        )
-    } else {
-        // Uncompressed header: min and dist streams start at byte 1
-        if src_data.len() < 1 + num_tiles * 2 {
-            return Err(LlicError::InvalidData);
-        }
-
-        (
-            src_data[1..1 + num_tiles].to_vec(),
-            src_data[1 + num_tiles..1 + num_tiles * 2].to_vec(),
-        )
-    };
-
-    // Build result vector
-    let mut result = Vec::with_capacity(num_tiles);
-    for i in 0..num_tiles {
-        let min_val = min_stream[i];
-        let dist = dist_stream[i];
-        let (bits, _bucket_size) = bucket_lut[dist as usize];
-        result.push((min_val, dist, bits));
-    }
-
-    Ok(result)
+    let chunk = parse_tile_chunk(src_data, width, height, use_dynamic_predictor, layout)?;
+    let bucket_lut = generate_bucket_lut(chunk.error_limit);
+    let (min_stream, dist_stream) = chunk.header.split_at(chunk.header.len() / 2);
+    Ok(min_stream
+        .iter()
+        .zip(dist_stream)
+        .map(|(&min_val, &dist)| (min_val, dist, bucket_lut[dist as usize].0))
+        .collect())
 }
 
 /// Core tile decompression loop.
@@ -2077,9 +2154,17 @@ mod tests {
 
         // Test with different quality levels
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed =
-                compress_tile_block(&image, width, height, width, error_limit, false, false)
-                    .expect("Compression failed");
+            let compressed = compress_tile_block(
+                &image,
+                width,
+                height,
+                width,
+                error_limit,
+                false,
+                false,
+                TileHeaderLayout::BeforePixels,
+            )
+            .expect("Compression failed");
 
             // Verify header
             assert_eq!(
@@ -2095,8 +2180,15 @@ mod tests {
 
             // Decompress
             let mut decompressed = vec![0u8; (width * height) as usize];
-            decompress_tile_block(&compressed, width, height, width, &mut decompressed)
-                .expect("Decompression failed");
+            decompress_tile_block(
+                &compressed,
+                width,
+                height,
+                width,
+                TileHeaderLayout::BeforePixels,
+                &mut decompressed,
+            )
+            .expect("Decompression failed");
 
             // Verify pixel error is within bounds
             for i in 0..image.len() {
@@ -2121,8 +2213,17 @@ mod tests {
         let height = 4u32;
         let image = vec![128u8; (width * height) as usize];
 
-        let compressed = compress_tile_block(&image, width, height, width, 16, false, false)
-            .expect("Compression failed");
+        let compressed = compress_tile_block(
+            &image,
+            width,
+            height,
+            width,
+            16,
+            false,
+            false,
+            TileHeaderLayout::BeforePixels,
+        )
+        .expect("Compression failed");
 
         // For a uniform block, we should have minimal pixel data
         // Header (1 byte) + min stream (1 byte) + dist stream (1 byte) + no pixel data
@@ -2137,8 +2238,15 @@ mod tests {
 
         // Decompress and verify
         let mut decompressed = vec![0u8; (width * height) as usize];
-        decompress_tile_block(&compressed, width, height, width, &mut decompressed)
-            .expect("Decompression failed");
+        decompress_tile_block(
+            &compressed,
+            width,
+            height,
+            width,
+            TileHeaderLayout::BeforePixels,
+            &mut decompressed,
+        )
+        .expect("Decompression failed");
 
         // All pixels should be 128 (or very close due to bucket_size adjustment)
         for (i, &pixel) in decompressed.iter().enumerate() {
@@ -2161,13 +2269,28 @@ mod tests {
         }
 
         for error_limit in [2u8, 4, 8, 16] {
-            let compressed =
-                compress_tile_block(&image, width, height, width, error_limit, false, false)
-                    .expect("Compression failed");
+            let compressed = compress_tile_block(
+                &image,
+                width,
+                height,
+                width,
+                error_limit,
+                false,
+                false,
+                TileHeaderLayout::BeforePixels,
+            )
+            .expect("Compression failed");
 
             let mut decompressed = vec![0u8; (width * height) as usize];
-            decompress_tile_block(&compressed, width, height, width, &mut decompressed)
-                .expect("Decompression failed");
+            decompress_tile_block(
+                &compressed,
+                width,
+                height,
+                width,
+                TileHeaderLayout::BeforePixels,
+                &mut decompressed,
+            )
+            .expect("Decompression failed");
 
             // Verify all pixels are within error bounds
             for i in 0..image.len() {
@@ -2200,6 +2323,43 @@ mod tests {
         }
     }
 
+    /// The chosen header must decode the block unchanged: same bit width, and
+    /// every pixel in [min, min + dist] still within the new min's range.
+    #[test]
+    fn lossless_header_selection_keeps_blocks_decodable() {
+        let lut = generate_bucket_lut(0);
+        let tops: Vec<u8> = (0..=255).step_by(15).chain([1, 254]).collect();
+        for min in 0..=255u8 {
+            for dist in 0..=(255 - min) {
+                let bits = lut[dist as usize].0;
+                let max = u32::from(min) + u32::from(dist);
+                for &top_min in &tops {
+                    for &top_dist in &tops {
+                        let (new_min, new_dist) =
+                            select_lossless_header(min, dist, top_min, top_dist);
+                        assert!(new_min <= min);
+                        assert_eq!(lut[new_dist as usize].0, bits, "dist {dist} -> {new_dist}");
+                        assert!(
+                            max - u32::from(new_min) < (1 << bits).max(1),
+                            "min {min} dist {dist} -> min {new_min} needs more than {bits} bits"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_header_selection_prefers_block_above() {
+        // dist 5 is 3 bits wide, so any min in [max - 7, min] = [13, 15] and any
+        // dist in [4, 7] decode the same block.
+        assert_eq!(select_lossless_header(15, 5, 14, 6), (14, 6));
+        assert_eq!(select_lossless_header(15, 5, 0, 0), (13, 4));
+        assert_eq!(select_lossless_header(15, 5, 200, 200), (15, 7));
+        // A flat block (0 bits) keeps its values.
+        assert_eq!(select_lossless_header(9, 0, 3, 3), (9, 0));
+    }
+
     fn noisy_gradient(width: u32, height: u32) -> Vec<u8> {
         let mut state = 0x2545_f491_u32;
         (0..width * height)
@@ -2213,6 +2373,95 @@ mod tests {
                 value
             })
             .collect()
+    }
+
+    #[test]
+    fn after_pixels_layout_roundtrips() {
+        let (width, height) = (32u32, 24u32);
+        let image = noisy_gradient(width, height);
+        for error_limit in [0u8, 2, 8] {
+            for dynamic in [false, true] {
+                let compressed = compress_tile_block(
+                    &image,
+                    width,
+                    height,
+                    width,
+                    error_limit,
+                    true,
+                    dynamic,
+                    TileHeaderLayout::AfterPixels,
+                )
+                .expect("compress");
+                assert_eq!(compressed[0] & 0x80, 0x80, "header should compress");
+                let offset = u32::from_le_bytes(compressed[1..5].try_into().unwrap()) as usize;
+                assert!(offset > 5 && offset < compressed.len(), "offset {offset}");
+
+                let mut decoded = vec![0u8; image.len()];
+                decompress_tile_block_dynamic(
+                    &compressed,
+                    width,
+                    height,
+                    width,
+                    dynamic,
+                    TileHeaderLayout::AfterPixels,
+                    &mut decoded,
+                )
+                .expect("decompress");
+                for (&a, &b) in image.iter().zip(&decoded) {
+                    assert!(a.abs_diff(b) <= error_limit, "{a} vs {b} at q{error_limit}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn after_pixels_layout_rejects_bad_header_offset() {
+        let (width, height) = (32u32, 24u32);
+        let image = noisy_gradient(width, height);
+        let compressed = compress_tile_block(
+            &image,
+            width,
+            height,
+            width,
+            0,
+            true,
+            false,
+            TileHeaderLayout::AfterPixels,
+        )
+        .expect("compress");
+        let len = compressed.len() as u32;
+        for bad_offset in [0u32, 4, len + 1, u32::MAX] {
+            let mut corrupt = compressed.clone();
+            corrupt[1..5].copy_from_slice(&bad_offset.to_le_bytes());
+            let mut decoded = vec![0u8; image.len()];
+            assert!(
+                decompress_tile_block(
+                    &corrupt,
+                    width,
+                    height,
+                    width,
+                    TileHeaderLayout::AfterPixels,
+                    &mut decoded,
+                )
+                .is_err(),
+                "offset {bad_offset} should be rejected"
+            );
+        }
+    }
+
+    /// Lossless default-mode streams get smaller with the header selection.
+    #[test]
+    fn after_pixels_layout_shrinks_lossless_streams() {
+        let (width, height) = (64u32, 64u32);
+        let image = noisy_gradient(width, height);
+        let size = |layout| {
+            compress_tile_block(&image, width, height, width, 0, true, false, layout)
+                .expect("compress")
+                .len()
+        };
+        let before = size(TileHeaderLayout::BeforePixels);
+        let after = size(TileHeaderLayout::AfterPixels);
+        assert!(after < before, "v5 {after} bytes, v4 {before} bytes");
     }
 
     /// The scalar tile path (used by WASM) must quantize like the C++ encoder:

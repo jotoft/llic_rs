@@ -30,15 +30,18 @@ LLSC\n
 
 ### 2. Raw Compressed Stream Format
 
-Byte 0 of the stream is the format version. Two versions are emitted and
-decoded by this implementation: v4 (current) and v3 (legacy). They differ only
-in the fixed header; the block-size table and per-block payloads are identical.
+Byte 0 of the stream is the format version. Three versions are emitted and
+decoded by this implementation: v5 (current, C++ 3.5.0 and later), v4 and v3
+(legacy). v3 and v4 differ only in the fixed header. v5 has the v4 header and
+differs only in where a tile block stores a compressed min/dist header (see
+[Header Compression](#header-compression)). The block-size table and all other
+payloads are identical across versions.
 
-#### Format v4 Header (4 bytes)
+#### Format v4/v5 Header (4 bytes)
 
 | Offset | Size | Description                                          |
 |--------|------|------------------------------------------------------|
-| 0      | 1    | Format version = 4                                   |
+| 0      | 1    | Format version = 4 or 5                              |
 | 1      | 1    | Number of compressed blocks/threads                  |
 | 2      | 1    | Stream type: 0 = entropy-coded lossless, 1 = tile-based |
 | 3      | 1    | Mode: 0 = Default, 1 = Fast, 2 = Dynamic             |
@@ -165,9 +168,27 @@ For each 4x4 pixel block:
 - Bit 7: Header compression flag (1 = compressed, 0 = uncompressed)
 - Bits 0-6: Error limit value
 
-**Header Compression:**
-When enabled (mode=DEFAULT or quality=LOSSLESS), the min/dist streams are further compressed using the u8v1 entropy
-coder.
+#### Header Compression
+
+In Default and Dynamic mode, the min/dist streams are further compressed with the u8v1 entropy coder, as a
+`(width/4) x (rows/4 * 2)` image with the mins above the dists (Dynamic mode uses the dynamic predictor). The
+compressed header is used only when it saves more than the 4-byte field it needs (`compressed + 4 < numBlocks * 2`);
+otherwise the block keeps the raw layout above with bit 7 clear. With bit 7 set:
+
+```
+v3/v4: [General Header: 1 byte][header_size: u32 LE][compressed header][Pixel data]
+v5:    [General Header: 1 byte][header_offset: u32 LE][Pixel data][compressed header]
+```
+
+In v5, `header_offset` is counted from the start of the block (so it is at least 5) and the compressed header runs to
+the end of the block. The encoder can then write the pixel stream before it knows the header size.
+
+**Lossless header selection (v5 encoders):** lossless decoding adds the residuals to the block minimum and uses the
+distance only for its bit width, so a block decodes the same with any `min` in `[max - (2^bits - 1), min]` and any
+`dist` of the same width (0-6 bits for `dist < 64`, else 8). When the header is compressed at quality 0, the encoder
+picks the values in those ranges nearest the block above (clamping the above block's `min` and `dist` into them) and
+stores the residuals relative to the chosen `min`. This makes lossless default/dynamic streams 2-3% smaller and needs
+no decoder change. Rows of blocks at the top of a chunk keep their own values.
 
 **Pixel Data Packing:**
 Quantized indices are packed efficiently based on bit count:
@@ -195,7 +216,7 @@ Quantized indices are packed efficiently based on bit count:
 
 1. Image dimensions must be non-zero multiples of 4
 2. Only 8-bit grayscale images are supported
-3. Maximum supported format version is 4; the decoder accepts versions 3 and 4
+3. Maximum supported format version is 5; the decoder accepts versions 3 to 5
 4. Multi-threaded compression splits image into horizontal strips
 
 ## Implementation Notes
@@ -218,7 +239,7 @@ For multi-threaded processing:
 
 1. Read format version and validate
 2. Read number of blocks
-3. Determine stream type and mode: from header bytes 2 and 3 (v4), or from
+3. Determine stream type and mode: from header bytes 2 and 3 (v4/v5), or from
    the byte-2 discriminator and the first payload byte (v3)
 4. Read block size table
 5. For each block:

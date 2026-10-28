@@ -4,7 +4,7 @@ pub const API_VERSION_MAJOR: u32 = 3;
 pub const API_VERSION_MINOR: u32 = 0;
 
 /// Format version for compressed streams
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
@@ -37,8 +37,13 @@ pub enum FormatVersion {
     /// Legacy format without a mode byte:
     /// `[3][num_blocks][block-size table or 0x00 entropy marker]...`
     V3 = 3,
-    /// Current format: `[4][num_blocks][tile_based][mode][block-size table]...`
+    /// `[4][num_blocks][tile_based][mode][block-size table]...`, readable by
+    /// the C++ reference before 3.5.0 and llic_rs before 0.5.0.
     V4 = 4,
+    /// Current format: the v4 header, but tile chunks with an entropy-coded
+    /// header store it after the pixel stream (C++ reference 3.5.0 and later).
+    /// Lossless tile streams in default and dynamic mode are also smaller.
+    V5 = 5,
 }
 
 #[derive(Error, Debug)]
@@ -114,15 +119,15 @@ impl LlicContext {
         let version = src_data[0];
         let num_blocks = src_data[1];
 
-        // Support format versions 3 and 4.
+        // Support format versions 3 to 5.
         //
         // Legacy v0/v1/v2 share v3's on-disk header layout but select different
         // internal algorithms in the C++ reference (older task splitters and the
         // pre-v3 bucket-size algorithm `findBucketsNeededOld`). This port only
-        // implements the v3/v4 behavior, so a genuine v1/v2 entropy stream is not
+        // implements the v3+ behavior, so a genuine v1/v2 entropy stream is not
         // guaranteed to decode correctly; we reject it cleanly rather than risk a
         // silent misdecode.
-        if version != 3 && version != 4 {
+        if !(3..=5).contains(&version) {
             return Err(LlicError::UnsupportedFormat);
         }
 
@@ -207,14 +212,19 @@ impl LlicContext {
             .collect();
 
         // Helper closure to decompress a block based on mode and tile_based flag
+        let layout = lossy::TileHeaderLayout::for_format_version(version);
         let decompress_block =
             |data: &[u8], w: u32, h: u32, bpl: u32, dst: &mut [u8]| -> Result<()> {
                 if tile_based {
-                    if mode == Mode::Dynamic {
-                        lossy::decompress_tile_block_dynamic(data, w, h, bpl, true, dst)
-                    } else {
-                        lossy::decompress_tile_block(data, w, h, bpl, dst)
-                    }
+                    lossy::decompress_tile_block_dynamic(
+                        data,
+                        w,
+                        h,
+                        bpl,
+                        mode == Mode::Dynamic,
+                        layout,
+                        dst,
+                    )
                 } else if mode == Mode::Dynamic {
                     entropy_coder::decompress_dynamic(data, w, h, bpl, dst)
                 } else {
@@ -306,10 +316,11 @@ impl LlicContext {
         Ok((quality, mode))
     }
 
-    /// Compress grayscale image data using the current format version (v4).
+    /// Compress grayscale image data using the current format version (v5).
     ///
     /// Equivalent to calling [`compress_gray8_versioned`](Self::compress_gray8_versioned)
-    /// with [`FormatVersion::V4`].
+    /// with [`FormatVersion::V5`]. Use [`FormatVersion::V4`] for decoders older
+    /// than C++ 3.5.0 or llic_rs 0.5.0.
     pub fn compress_gray8(
         &self,
         src_graymap: &[u8],
@@ -317,7 +328,7 @@ impl LlicContext {
         mode: Mode,
         dst_data: &mut [u8],
     ) -> Result<usize> {
-        self.compress_gray8_versioned(src_graymap, quality, mode, FormatVersion::V4, dst_data)
+        self.compress_gray8_versioned(src_graymap, quality, mode, FormatVersion::V5, dst_data)
     }
 
     /// Compress grayscale image data with an explicit format version.
@@ -333,6 +344,8 @@ impl LlicContext {
     /// Number of bytes written to dst_data, or error.
     ///
     /// # Format
+    /// - v5: as v4 with `version=5`; tile chunks with a compressed header put it
+    ///   after the pixel stream (see [`lossy::TileHeaderLayout`])
     /// - v4: `[version=4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]`
     /// - v3 entropy-coded: `[version=3][num_blocks=1][0x00][block_size:u32 LE][data]`
     /// - v3 tile-based: `[version=3][num_blocks=1][block_size:u32 LE][data]`
@@ -398,19 +411,24 @@ impl LlicContext {
                 error_limit,
                 compress_header,
                 use_dynamic_predictor,
+                lossy::TileHeaderLayout::for_format_version(format_version as u8),
             )?
         };
 
         match format_version {
-            FormatVersion::V4 => write_v4_block(&compressed, !use_entropy, mode, dst_data),
+            FormatVersion::V4 | FormatVersion::V5 => {
+                write_v4_block(&compressed, format_version, !use_entropy, mode, dst_data)
+            }
             FormatVersion::V3 => write_v3_block(&compressed, use_entropy, dst_data),
         }
     }
 }
 
-/// Write a single-block v4 container: `[4][1][tile_based][mode][block_size:u32 LE][payload]`.
+/// Write a single-block container with the v4 header, also used by v5:
+/// `[version][1][tile_based][mode][block_size:u32 LE][payload]`.
 fn write_v4_block(
     payload: &[u8],
+    version: FormatVersion,
     tile_based: bool,
     mode: Mode,
     dst_data: &mut [u8],
@@ -419,7 +437,7 @@ fn write_v4_block(
     if dst_data.len() < total {
         return Err(LlicError::InvalidArgument);
     }
-    dst_data[0] = FormatVersion::V4 as u8;
+    dst_data[0] = version as u8;
     dst_data[1] = 1;
     dst_data[2] = tile_based as u8;
     dst_data[3] = mode as u8;
@@ -801,8 +819,8 @@ mod tests {
             .unwrap();
         compressed.truncate(compressed_size);
 
-        // Check format v4 header
-        assert_eq!(compressed[0], 4); // version
+        // Check format v5 header
+        assert_eq!(compressed[0], 5); // version
         assert_eq!(compressed[2], 1); // tile_based = true
 
         // Decompress
@@ -816,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_entropy_lossless() {
-        // Test round-trip with legacy entropy-coded lossless (format v4 with tile_based=0)
+        // Test round-trip with legacy entropy-coded lossless (format v5 with tile_based=0)
         let original: Vec<u8> = (0..16).collect(); // 4x4 gradient
 
         let context = LlicContext::new(4, 4, 4, Some(1)).unwrap();
@@ -833,8 +851,8 @@ mod tests {
             .unwrap();
         compressed.truncate(compressed_size);
 
-        // Check format v4 header
-        assert_eq!(compressed[0], 4); // version
+        // Check format v5 header
+        assert_eq!(compressed[0], 5); // version
         assert_eq!(compressed[2], 0); // tile_based = false
 
         // Decompress
@@ -861,8 +879,8 @@ mod tests {
                 .unwrap();
             compressed.truncate(compressed_size);
 
-            // Check format v4 header
-            assert_eq!(compressed[0], 4, "version should be 4 for mode {:?}", mode);
+            // Check format v5 header
+            assert_eq!(compressed[0], 5, "version should be 5 for mode {mode:?}");
             assert_eq!(
                 compressed[2], 1,
                 "tile_based should be 1 for mode {:?}",
@@ -1186,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_gray8_still_defaults_to_v4() {
+    fn compress_gray8_defaults_to_v5() {
         let width = 16;
         let height = 16;
         let src = gradient_image(width, height);
@@ -1194,8 +1212,8 @@ mod tests {
         let mut buf = vec![0u8; ctx.compressed_buffer_size()];
         let n = ctx
             .compress_gray8(&src, Quality::LosslessEntropy, Mode::Default, &mut buf)
-            .expect("v4 compress");
-        assert_eq!(buf[0], 4, "compress_gray8 must keep emitting v4");
+            .expect("v5 compress");
+        assert_eq!(buf[0], 5, "compress_gray8 must emit the current format, v5");
         // Sanity round-trip
         let mut decoded = vec![0u8; (width * height) as usize];
         ctx.decompress_gray8(&buf[..n], &mut decoded).unwrap();
