@@ -13,15 +13,18 @@ use std::arch::x86_64::*;
 /// - bucket_size: quantization step size
 type BucketLutEntry = (u8, u8);
 
-/// Precomputed reciprocals for fast division: x / d ≈ (x * RECIP[d]) >> 16
-/// For bucket_size d in [1, 256], RECIP[d] = min(65536 / d, 65535)
-/// Using u32 to avoid overflow in computation
+/// Precomputed reciprocals for fast division: x / d == (x * RECIP[d]) >> 16
+/// For bucket_size d in [2, 256], RECIP[d] = ceil(65536 / d). Rounding up makes
+/// the quotient exact for every x <= 255 (the error, below 255 / 65536, never
+/// reaches 1 / d); rounding down would give one too little when d divides x.
+/// d == 1 is never looked up (it keeps the residual). Using u32 to avoid
+/// overflow in computation.
 static RECIPROCAL_TABLE: [u32; 257] = {
     let mut table = [0u32; 257];
     table[0] = 0; // unused, avoid div by zero
     let mut i = 1usize;
     while i <= 256 {
-        let recip = 65536u32 / i as u32;
+        let recip = 65536u32.div_ceil(i as u32);
         // Cap at 65535 to fit in mulhi_epu16 range (though we use u32 here)
         table[i] = if recip > 65535 { 65535 } else { recip };
         i += 1;
@@ -2178,6 +2181,72 @@ mod tests {
                     image[i],
                     decompressed[i]
                 );
+            }
+        }
+    }
+
+    /// Every LUT entry the encoders quantize with must divide exactly.
+    #[test]
+    fn reciprocal_table_divides_exactly() {
+        for bucket_size in 2..=256u32 {
+            let recip = RECIPROCAL_TABLE[bucket_size as usize];
+            for residual in 0..=255u32 {
+                assert_eq!(
+                    (residual * recip) >> 16,
+                    residual / bucket_size,
+                    "{residual} / {bucket_size}"
+                );
+            }
+        }
+    }
+
+    fn noisy_gradient(width: u32, height: u32) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        (0..width * height)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let (x, y) = (i % width, i / width);
+                #[allow(clippy::cast_possible_truncation)]
+                let value = ((x * 3 + y * 2) + (state & 7)) as u8;
+                value
+            })
+            .collect()
+    }
+
+    /// The scalar tile path (used by WASM) must quantize like the C++ encoder:
+    /// exact integer division of the residual by the bucket size.
+    #[test]
+    fn scalar_tile_quantizes_like_cpp() {
+        let image = noisy_gradient(64, 64);
+        let stretched: Vec<u8> = image.iter().map(|&p| p.wrapping_mul(37)).collect();
+        for error_limit in [2u8, 4, 8, 16, 32] {
+            let lut = generate_bucket_lut(error_limit);
+            for src in [&image, &stretched] {
+                for y in (0..64usize).step_by(4) {
+                    for x in (0..64usize).step_by(4) {
+                        let starts = [0, 1, 2, 3].map(|r| (y + r) * 64 + x);
+                        let mut indices = [0u8; 16];
+                        let (min, dist, bits) = process_tile_scalar(
+                            src,
+                            starts[0],
+                            starts[1],
+                            starts[2],
+                            starts[3],
+                            &lut,
+                            &mut indices,
+                        );
+                        if bits == 0 {
+                            continue;
+                        }
+                        let bucket_size = lut[dist as usize].1;
+                        for (i, &index) in indices.iter().enumerate() {
+                            let pixel = src[starts[i / 4] + i % 4];
+                            assert_eq!(index, (pixel - min) / bucket_size, "q{error_limit}");
+                        }
+                    }
+                }
             }
         }
     }

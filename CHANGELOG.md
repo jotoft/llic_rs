@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Lossy tile encoding in builds without SSE4.1 (the default x86-64 target, and
+  WebAssembly) quantized some pixels one bucket too low: the reciprocal table
+  rounded `65536 / bucket_size` down, so residuals that are exact multiples of
+  the bucket size lost one. Images stayed within the error limit, but streams
+  differed from the C++ encoder and the SSE4.1/AVX2 builds. The table now
+  rounds up, which is exact for every 8-bit residual, and lossy streams match
+  the C++ reference byte for byte in every build.
+
 ## [0.4.1] - 2026-10-28
 
 ### Fixed
