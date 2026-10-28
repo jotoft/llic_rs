@@ -7,8 +7,15 @@ use std::borrow::Cow;
 
 use crate::{LlicError, Result};
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod tile_simd128;
 #[cfg(target_arch = "x86_64")]
 mod tile_sse;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use tile_simd128 as tile_simd;
+/// The grouped tile codec for this target (same interface in both modules).
+#[cfg(target_arch = "x86_64")]
+use tile_sse as tile_simd;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -1362,7 +1369,10 @@ pub fn compress_tile_block_into(
         width,
         rows,
         bytes_per_line,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
         error_limit,
         select_header,
         bucket_lut: &bucket_lut,
@@ -1400,8 +1410,11 @@ struct TileBlock<'a> {
     width: u32,
     rows: u32,
     bytes_per_line: u32,
-    /// For the SSE groups; the per-block code reads the bucket LUT.
-    #[cfg(target_arch = "x86_64")]
+    /// For the SIMD groups; the per-block code reads the bucket LUT.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     error_limit: u8,
     select_header: bool,
     bucket_lut: &'a [BucketLutEntry; 256],
@@ -1427,18 +1440,30 @@ impl TileBlock<'_> {
         } = *self;
         let blocks_per_row = (width / 4) as usize;
         let mut pixel_pos = 0usize;
-        #[cfg(target_arch = "x86_64")]
-        let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(bucket_lut));
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
+        let simd_lut = tile_simd::available().then(|| tile_simd::packed_lut(bucket_lut));
         for y in (0..rows).step_by(4) {
             let first_block = (y / 4 * (width / 4)) as usize;
             let select_row = select_header && y > 0;
-            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+            #[cfg_attr(
+                not(any(
+                    target_arch = "x86_64",
+                    all(target_arch = "wasm32", target_feature = "simd128")
+                )),
+                allow(unused_mut)
+            )]
             let mut x = 0u32;
-            #[cfg(target_arch = "x86_64")]
-            if let Some(lut) = &sse_lut {
-                // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
+            #[cfg(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", target_feature = "simd128")
+            ))]
+            if let Some(lut) = &simd_lut {
+                // SAFETY: the CPU supports the kernels' instructions (`tile_simd::available`).
                 let (end, written) = unsafe {
-                    tile_sse::encode_row_groups(
+                    tile_simd::encode_row_groups(
                         src_data,
                         (y * bytes_per_line) as usize,
                         bytes_per_line as usize,
@@ -1756,19 +1781,31 @@ fn decompress_tiles(
         return Err(LlicError::InvalidData);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(bucket_lut));
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    let simd_lut = tile_simd::available().then(|| tile_simd::packed_lut(bucket_lut));
     let mut pixel_pos = 0usize;
     for y in (0..rows).step_by(4) {
         let first_block = (y / 4 * (width / 4)) as usize;
         let row_start = y as usize * stride;
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", target_feature = "simd128")
+            )),
+            allow(unused_mut)
+        )]
         let mut x = 0u32;
-        #[cfg(target_arch = "x86_64")]
-        if let Some(lut) = &sse_lut {
-            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        ))]
+        if let Some(lut) = &simd_lut {
+            // SAFETY: the CPU supports the kernels' instructions (`tile_simd::available`).
             let (end, read) = unsafe {
-                tile_sse::decode_row_groups(
+                tile_simd::decode_row_groups(
                     dst_graymap,
                     row_start,
                     stride,
@@ -2384,6 +2421,95 @@ mod tests {
                         result.is_err(),
                         "q{error_limit} {layout:?} truncated to {len}"
                     );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    fn without_simd<T>(f: impl FnOnce() -> T) -> T {
+        tile_simd::tests::DISABLED.with(|d| d.set(true));
+        let result = f();
+        tile_simd::tests::DISABLED.with(|d| d.set(false));
+        result
+    }
+
+    /// Noise over a gradient with flat patches, so blocks of every bit width
+    /// and runs of payload-free blocks both occur.
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    fn test_image(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..width * height)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let (x, y) = (i % width, i / width);
+                if (x / 24 + y / 12) % 5 == 0 {
+                    return 77;
+                }
+                let amplitude = 1 << ((x / 8 + y / 4) % 9);
+                #[allow(clippy::cast_possible_truncation)]
+                let value = (x * 2 + y + (state % amplitude)) as u8;
+                value
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    fn simd_tiles_match_per_block_code() {
+        if !tile_simd::available() {
+            return;
+        }
+        // 200 = three 64-pixel groups plus 8 pixels; 136 = two groups plus 8.
+        for (width, height, stride) in [(200u32, 48u32, 200u32), (136, 20, 144), (64, 8, 64)] {
+            let image = test_image(stride, height, width);
+            for error_limit in [0u8, 2, 4, 8, 16, 32] {
+                for (compress_header, dynamic) in [(false, false), (true, false), (true, true)] {
+                    for layout in [
+                        TileHeaderLayout::BeforePixels,
+                        TileHeaderLayout::AfterPixels,
+                    ] {
+                        let encode = || {
+                            compress_tile_block(
+                                &image,
+                                width,
+                                height,
+                                stride,
+                                error_limit,
+                                compress_header,
+                                dynamic,
+                                layout,
+                            )
+                            .expect("compress")
+                        };
+                        let fast = encode();
+                        let reference = without_simd(encode);
+                        let case = format!(
+                            "{width}x{height} q{error_limit} header {compress_header} dynamic {dynamic} {layout:?}"
+                        );
+                        assert_eq!(fast, reference, "encode {case}");
+
+                        let decode = || {
+                            let mut out = vec![0u8; image.len()];
+                            decompress_tile_block_dynamic(
+                                &fast, width, height, stride, dynamic, layout, &mut out,
+                            )
+                            .expect("decompress");
+                            out
+                        };
+                        assert_eq!(decode(), without_simd(decode), "decode {case}");
+                    }
                 }
             }
         }

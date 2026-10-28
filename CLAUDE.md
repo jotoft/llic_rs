@@ -39,6 +39,17 @@ mise run wasm:release       # All targets (pkg/, pkg-node/, pkg-bundler/)
 # Run demo locally
 mise run demo:dev
 
+# WebAssembly (SIMD128) tests and benchmark in Node/V8, the demo's engine
+rustup target add wasm32-wasip1
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings $PWD/scripts/wasm_bench.mjs"
+RUSTFLAGS="-C target-feature=+simd128" cargo test --release --target wasm32-wasip1 --lib --tests -- --test-threads=1
+RUSTFLAGS="-C target-feature=+simd128" cargo build --release --example wasm_bench --target wasm32-wasip1
+node scripts/wasm_bench.mjs target/wasm32-wasip1/release/examples/wasm_bench.wasm /abs/path/image.pgm
+
+# Rust vs C++ speed on the test photos (single thread)
+cargo build --release -p llic-cpp-bench --example photo_matrix
+taskset -c 2 target/release/examples/photo_matrix 1920 300
+
 # Setup git hooks (runs tests/lint on commit when Rust files change)
 mise run setup:hooks
 ```

@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer a zero-filled buffer of 2 bytes per pixel. Lossless entropy and
   default/dynamic tile encoding take 7-45% fewer cycles, dynamic mode the most.
   Streams are unchanged.
+- WebAssembly builds with `simd128` (the web demo) use a SIMD128 port of the
+  grouped tile codec: in Node/V8, tile-based encoding is 3.2-3.7x and decoding
+  2.3-2.4x faster, fast-mode decoding 4-7.6 GP/s. `examples/wasm_bench` and
+  `scripts/wasm_bench.mjs` benchmark and test the WebAssembly build in Node.
 
 ### Fixed
 

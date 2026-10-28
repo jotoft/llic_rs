@@ -54,8 +54,12 @@ clap = { version = "4", features = ["derive"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+
+# Criterion's Rayon does not build for WebAssembly; the benches are native only,
+# while examples/wasm_bench also runs as wasm32-wasip1.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+criterion = "0.5"
 
 [lib]
 name = "llic"

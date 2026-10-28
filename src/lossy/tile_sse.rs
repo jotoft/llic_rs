@@ -582,91 +582,12 @@ pub(super) mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::lossy::{
-        compress_tile_block, decompress_tile_block_dynamic, generate_bucket_lut, TileHeaderLayout,
-    };
+    use crate::lossy::generate_bucket_lut;
 
     thread_local! {
         /// Makes [`available`] report false on this thread, to compare the
         /// SSE path with the per-block code.
         pub(in crate::lossy) static DISABLED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    fn without_sse<T>(f: impl FnOnce() -> T) -> T {
-        DISABLED.with(|d| d.set(true));
-        let result = f();
-        DISABLED.with(|d| d.set(false));
-        result
-    }
-
-    /// Noise over a gradient with flat patches, so blocks of every bit width
-    /// and runs of payload-free blocks both occur.
-    fn test_image(width: u32, height: u32, seed: u32) -> Vec<u8> {
-        let mut state = seed | 1;
-        (0..width * height)
-            .map(|i| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                let (x, y) = (i % width, i / width);
-                if (x / 24 + y / 12) % 5 == 0 {
-                    return 77;
-                }
-                let amplitude = 1 << ((x / 8 + y / 4) % 9);
-                #[allow(clippy::cast_possible_truncation)]
-                let value = (x * 2 + y + (state % amplitude)) as u8;
-                value
-            })
-            .collect()
-    }
-
-    #[test]
-    fn sse_matches_per_block_code() {
-        if !available() {
-            return;
-        }
-        // 200 = three 64-pixel groups plus 8 pixels; 136 = two groups plus 8.
-        for (width, height, stride) in [(200u32, 48u32, 200u32), (136, 20, 144), (64, 8, 64)] {
-            let image = test_image(stride, height, width);
-            for error_limit in [0u8, 2, 4, 8, 16, 32] {
-                for (compress_header, dynamic) in [(false, false), (true, false), (true, true)] {
-                    for layout in [
-                        TileHeaderLayout::BeforePixels,
-                        TileHeaderLayout::AfterPixels,
-                    ] {
-                        let encode = || {
-                            compress_tile_block(
-                                &image,
-                                width,
-                                height,
-                                stride,
-                                error_limit,
-                                compress_header,
-                                dynamic,
-                                layout,
-                            )
-                            .expect("compress")
-                        };
-                        let fast = encode();
-                        let reference = without_sse(encode);
-                        let case = format!(
-                            "{width}x{height} q{error_limit} header {compress_header} dynamic {dynamic} {layout:?}"
-                        );
-                        assert_eq!(fast, reference, "encode {case}");
-
-                        let decode = || {
-                            let mut out = vec![0u8; image.len()];
-                            decompress_tile_block_dynamic(
-                                &fast, width, height, stride, dynamic, layout, &mut out,
-                            )
-                            .expect("decompress");
-                            out
-                        };
-                        assert_eq!(decode(), without_sse(decode), "decode {case}");
-                    }
-                }
-            }
-        }
     }
 
     #[test]
