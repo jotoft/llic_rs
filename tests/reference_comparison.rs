@@ -386,7 +386,11 @@ fn test_lossy_compression_roundtrip() {
 
 /// Test that Rust compression output format matches C++ output format byte-for-byte
 /// when both use the same input and settings.
+///
+/// Runs the C++ `llic_compress` tool, so not on WebAssembly (WASI cannot spawn
+/// processes).
 #[test]
+#[cfg(not(target_family = "wasm"))]
 fn test_lossy_compression_format_match() {
     use llic::{Mode, Quality};
     use std::process::Command;
