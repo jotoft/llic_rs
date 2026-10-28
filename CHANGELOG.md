@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The tile codec's bucket tables for the six quality levels (and their packed
   SIMD forms) are built at compile time instead of on every call: 5-8% faster
   coding of small images (256x256), up to 20% for fast low-quality encoding.
+- Lossy tile encoding in builds with AVX2 enabled (such as
+  `-C target-cpu=native`) was 13-23% slower than in default builds: LLVM turned
+  the quantization's `PMULHUW` into 256-bit widening 32-bit multiplies. It is
+  now pinned with inline assembly; native builds encode at 0.99x of C++ 4.1.1.
 - Near the end of a tile stream, groups of blocks without payload kept the
   SIMD tile decoder's 16-byte reads from going past the stream end by falling
   back to per-block code for the rest of the image; they read nothing, so they

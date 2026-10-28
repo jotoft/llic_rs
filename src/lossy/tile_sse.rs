@@ -301,6 +301,31 @@ unsafe fn select_lossless_header(
     (mins, dists)
 }
 
+/// `PMULHUW`, kept as one instruction. `_mm_mulhi_epu16` is a generic
+/// widen-multiply-shift in Rust, and with AVX2 enabled (`target-cpu=native`)
+/// LLVM turned it, for these known-narrow operands, into 256-bit zero-extends,
+/// `VPMULLD` and packs: lossy tile encoding ran 13-23% slower than in the
+/// default build.
+#[inline(always)]
+unsafe fn mulhi_epu16(a: __m128i, b: __m128i) -> __m128i {
+    let mut product = a;
+    #[cfg(target_feature = "avx")]
+    std::arch::asm!(
+        "vpmulhuw {p}, {p}, {b}",
+        p = inout(xmm_reg) product,
+        b = in(xmm_reg) b,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    #[cfg(not(target_feature = "avx"))]
+    std::arch::asm!(
+        "pmulhuw {p}, {b}",
+        p = inout(xmm_reg) product,
+        b = in(xmm_reg) b,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    product
+}
+
 /// Packs the residuals of one row-major block without branching on the bit
 /// count and returns the packed size. Writes up to 16 bytes at `dst`: the
 /// second store overwrites the unused bytes of the first.
@@ -322,8 +347,8 @@ unsafe fn encode_tile<const QUANTIZE: bool>(block: __m128i, lut_entry: u32, dst:
         );
         let low_bytes = _mm_set1_epi16(0x00FF);
         let twice_reciprocal = _mm_add_epi16(reciprocal, reciprocal);
-        let even = _mm_mulhi_epu16(_mm_and_si128(residuals, low_bytes), twice_reciprocal);
-        let odd = _mm_mulhi_epu16(_mm_andnot_si128(low_bytes, residuals), twice_reciprocal);
+        let even = mulhi_epu16(_mm_and_si128(residuals, low_bytes), twice_reciprocal);
+        let odd = mulhi_epu16(_mm_andnot_si128(low_bytes, residuals), twice_reciprocal);
         values = _mm_or_si128(even, _mm_andnot_si128(low_bytes, odd));
     }
     let pairs = _mm_maddubs_epi16(values, load(&params.pair_factor));
