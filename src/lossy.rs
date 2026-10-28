@@ -1860,10 +1860,15 @@ fn decode_single_tile(
     if tile_bytes > src.len() {
         return Err(LlicError::InvalidData);
     }
-    let mut indices = [0u8; 16];
-    if bits > 0 {
-        unpack_pixels_dispatch(src, bits, &mut indices);
+    if bits == 0 {
+        // Blocks without payload are flat.
+        for row in 0..4 {
+            dst[row * stride..row * stride + 4].fill(base);
+        }
+        return Ok(0);
     }
+    let mut indices = [0u8; 16];
+    unpack_pixels_dispatch(src, bits, &mut indices);
     for (row, row_indices) in indices.chunks_exact(4).enumerate() {
         let out = &mut dst[row * stride..row * stride + 4];
         for (pixel, &index) in out.iter_mut().zip(row_indices) {

@@ -464,10 +464,15 @@ pub(super) unsafe fn decode_row_groups(
     let midpoint_mask: u32 = if lossless { 0 } else { 0xFF };
     let mut read = 0usize;
     let mut group = 0usize;
-    while group < groups && pixel_stream.len() - read >= 64 {
+    while group < groups {
         let block_mins = &mins[group * 4..group * 4 + 4];
         let entries: [u32; 4] = std::array::from_fn(|i| lut[usize::from(dists[group * 4 + i])]);
-        let rows = if entries.iter().fold(0, |acc, e| acc | e) & 0xFF00 == 0 {
+        let no_payload = entries.iter().fold(0, |acc, e| acc | e) & 0xFF00 == 0;
+        // Groups without payload read nothing, so only the others need the guard.
+        if !no_payload && pixel_stream.len() - read < 64 {
+            break;
+        }
+        let rows = if no_payload {
             // Four blocks without payload, common in flat or low-quality regions.
             let bases = std::array::from_fn::<u8, 4, _>(|i| {
                 #[allow(clippy::cast_possible_truncation)]

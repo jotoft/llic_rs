@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sixteen-row wavefront: in Node/V8, decoding 1.1-1.4x faster overall and
   1.7-2x in dynamic mode.
 - The scalar MED predictor in the decoder is branch-free, like the encoder's.
+- Near the end of a tile stream, groups of blocks without payload kept the
+  SIMD tile decoder's 16-byte reads from going past the stream end by falling
+  back to per-block code for the rest of the image; they read nothing, so they
+  now stay on the SIMD path (flat blocks in the per-block code are a fill).
+  Fast-mode decoding of low qualities is up to 1.7x faster (VeryLow 0.58x ->
+  0.98x of C++ 4.1.1).
 - WebAssembly builds with `simd128` compute the entropy encoder's residual rows
   and dynamic-mode code lengths with SIMD128: lossless entropy encoding in
   dynamic mode is about 1.4x faster in Node/V8.
