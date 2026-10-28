@@ -15,6 +15,9 @@
 
 use super::tables::get_compress_table_entry;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod residuals_simd128;
+
 /// MED (Median Edge Detector) predictor used in JPEG-LS and Dynamic mode.
 ///
 /// Returns a prediction based on:
@@ -32,6 +35,7 @@ fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
 
 /// Code length of a residual pair `(s0, s1)` plus the lengths' sum in the low
 /// six bits, from the pair table (codes are left-justified above bit 6).
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
 fn pair_entry(pair: &[u8]) -> u32 {
     get_compress_table_entry(usize::from(u16::from_le_bytes([pair[0], pair[1]])))
@@ -46,6 +50,7 @@ fn single_entry(sym: u8) -> u32 {
 }
 
 /// Estimate how many bits a row of residuals takes to code.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline]
 fn estimate_row_bits(residuals: &[u8]) -> u64 {
     let pairs = residuals.chunks_exact(2);
@@ -60,6 +65,7 @@ fn estimate_row_bits(residuals: &[u8]) -> u64 {
 }
 
 /// Compute MED residuals for a row (the first pixel predicts from the top).
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline]
 fn compute_med_residual_row(current_row: &[u8], prev_row: &[u8], out_row: &mut [u8]) {
     let width = current_row.len();
@@ -101,7 +107,10 @@ fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
 }
 
 #[inline]
-#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "ssse3"),
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 fn compute_first_row_deltas(src_row: &[u8], delta_buffer: &mut [u8]) {
     compute_first_row_deltas_scalar(src_row, delta_buffer);
 }
@@ -179,7 +188,10 @@ fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &
 }
 
 #[inline]
-#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "ssse3"),
+    all(target_arch = "wasm32", target_feature = "simd128")
+)))]
 fn compute_avg_predictor_deltas(src_row: &[u8], prev_row: &[u8], delta_buffer: &mut [u8]) {
     compute_avg_predictor_deltas_scalar(src_row, prev_row, delta_buffer);
 }
@@ -413,6 +425,7 @@ fn encode_image<const SIMD: bool>(
     stream.finish()
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
 fn first_row_residuals<const SIMD: bool>(row: &[u8], out: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
@@ -423,6 +436,7 @@ fn first_row_residuals<const SIMD: bool>(row: &[u8], out: &mut [u8]) {
     compute_first_row_deltas(row, out);
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
 fn average_residuals<const SIMD: bool>(row: &[u8], prev: &[u8], out: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
@@ -433,7 +447,32 @@ fn average_residuals<const SIMD: bool>(row: &[u8], prev: &[u8], out: &mut [u8]) 
     compute_avg_predictor_deltas(row, prev, out);
 }
 
+/// WebAssembly with SIMD128: the residual rows are always vectorised.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn first_row_residuals<const SIMD: bool>(row: &[u8], out: &mut [u8]) {
+    residuals_simd128::first_row(row, out);
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn average_residuals<const SIMD: bool>(row: &[u8], prev: &[u8], out: &mut [u8]) {
+    residuals_simd128::average_row(row, prev, out);
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn dynamic_residual_rows<const SIMD: bool>(
+    row: &[u8],
+    prev: &[u8],
+    avg_out: &mut [u8],
+    med_out: &mut [u8],
+) -> (u64, u64) {
+    residuals_simd128::dynamic_rows(row, prev, avg_out, med_out)
+}
+
 /// Computes the average and MED residual rows and their coded sizes in bits.
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 #[inline(always)]
 fn dynamic_residual_rows<const SIMD: bool>(
     row: &[u8],

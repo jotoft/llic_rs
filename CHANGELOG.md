@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sixteen-row wavefront: in Node/V8, decoding 1.1-1.4x faster overall and
   1.7-2x in dynamic mode.
 - The scalar MED predictor in the decoder is branch-free, like the encoder's.
+- WebAssembly builds with `simd128` compute the entropy encoder's residual rows
+  and dynamic-mode code lengths with SIMD128: lossless entropy encoding in
+  dynamic mode is about 1.4x faster in Node/V8.
 
 ### Fixed
 
