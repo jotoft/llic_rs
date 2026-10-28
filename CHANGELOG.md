@@ -24,9 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   x86-64 (SSSE3/SSE4.1, detected at run time), as the C++ reference does: about
   1.5x for lossless entropy streams (2.5x in dynamic mode) and 1.2-1.6x for tile
   streams with compressed headers. Output is unchanged.
+- Entropy encoding is rebuilt after the C++ encoder: on x86-64 a build with
+  BMI2 shifts and SSE residuals is selected at run time; rows above 5.5 bits per
+  symbol pair flush words without a data-dependent branch; dynamic mode computes
+  both predictors' residuals and code lengths in one SSE pass; and the output is
+  no longer a zero-filled buffer of 2 bytes per pixel. Lossless entropy and
+  default/dynamic tile encoding take 7-45% fewer cycles, dynamic mode the most.
+  Streams are unchanged.
 
 ### Fixed
 
+- The entropy encoder and its dynamic-mode row cost estimate read residual
+  pairs through misaligned `u16` pointers (undefined behaviour).
 - Decoding a truncated tile stream panicked instead of returning
   `InvalidData`.
 - `lossy::compress_tile_block` did not check that the source buffer holds the

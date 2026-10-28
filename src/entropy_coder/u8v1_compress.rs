@@ -13,7 +13,6 @@
 //! - Stores a bitmap indicating which predictor was used for each row
 //! - Improves compression for images with edges/sharp transitions
 
-use super::bit_writer::BitWriter;
 use super::tables::get_compress_table_entry;
 
 /// MED (Median Edge Detector) predictor used in JPEG-LS and Dynamic mode.
@@ -22,81 +21,53 @@ use super::tables::get_compress_table_entry;
 /// - If top_left >= max(left, top): min(left, top)
 /// - If top_left <= min(left, top): max(left, top)
 /// - Otherwise: left + top - top_left
-#[inline]
+#[inline(always)]
 fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
-    let a = left as i32;
-    let b = top as i32;
-    let c = top_left as i32;
-    let min_ab = a.min(b);
-    let max_ab = a.max(b);
-
-    if c >= max_ab {
-        min_ab as u8
-    } else if c <= min_ab {
-        max_ab as u8
-    } else {
-        (a + b - c) as u8
-    }
+    // left + top - clamp(top_left, min, max) gives all three cases without
+    // branches, which mispredict on noisy rows (the SSE code computes the same).
+    let (min_ab, max_ab) = (left.min(top), left.max(top));
+    left.wrapping_add(top)
+        .wrapping_sub(top_left.max(min_ab).min(max_ab))
 }
 
-/// Estimate how many bits a row of delta values would take to compress.
-///
-/// Uses the compression table to estimate the output size without actually compressing.
-/// Optimized version using pointer reads like C++.
-#[inline]
-fn estimate_row_bits(deltas: &[u8]) -> u64 {
-    let mut bits: u64 = 0;
-    let width = deltas.len();
-    let num_pairs = width / 2;
-
-    // Cast to u16 pointer like C++
-    let ptr = deltas.as_ptr() as *const u16;
-
-    for i in 0..num_pairs {
-        // SAFETY: i < num_pairs ensures we're within bounds
-        let index = unsafe { *ptr.add(i) as usize };
-        let entry = get_compress_table_entry(index);
-        bits += (entry & 0x3F) as u64;
-    }
-
-    // Handle odd trailing symbol
-    if (width & 1) != 0 {
-        let index = deltas[width - 1] as usize;
-        let entry = get_compress_table_entry(index);
-        // Subtract 2 bits (the encoding of the dummy zero)
-        bits += ((entry & 0x3F) - 2) as u64;
-    }
-
-    bits
+/// Code length of a residual pair `(s0, s1)` plus the lengths' sum in the low
+/// six bits, from the pair table (codes are left-justified above bit 6).
+#[inline(always)]
+fn pair_entry(pair: &[u8]) -> u32 {
+    get_compress_table_entry(usize::from(u16::from_le_bytes([pair[0], pair[1]])))
 }
 
-/// Compute MED residuals for a row.
-///
-/// Returns residuals computed using MED predictor instead of average predictor.
-/// Uses unsafe unchecked access for performance.
+/// Table entry for a single trailing symbol: the pair `(sym, 0)` minus the
+/// 2-bit code of the dummy zero (the length is at least 4, so this cannot
+/// borrow from the code bits).
+#[inline(always)]
+fn single_entry(sym: u8) -> u32 {
+    get_compress_table_entry(usize::from(sym)) - 2
+}
+
+/// Estimate how many bits a row of residuals takes to code.
 #[inline]
-fn compute_med_residual_row(current_row: &[u8], prev_row: &[u8], width: usize, out_row: &mut [u8]) {
-    if width == 0 {
-        return;
-    }
+fn estimate_row_bits(residuals: &[u8]) -> u64 {
+    let pairs = residuals.chunks_exact(2);
+    let tail = pairs
+        .remainder()
+        .first()
+        .map_or(0, |&sym| single_entry(sym) & 0x3F);
+    pairs
+        .map(|pair| u64::from(pair_entry(pair) & 0x3F))
+        .sum::<u64>()
+        + u64::from(tail)
+}
 
-    // SAFETY: bounds already verified by caller
-    unsafe {
-        // First pixel: use only top as predictor
-        *out_row.get_unchecked_mut(0) = current_row
-            .get_unchecked(0)
-            .wrapping_sub(*prev_row.get_unchecked(0));
-
-        // Remaining pixels: use MED predictor
-        let mut left = *current_row.get_unchecked(0);
-        for x in 1..width {
-            let value = *current_row.get_unchecked(x);
-            let top = *prev_row.get_unchecked(x);
-            let top_left = *prev_row.get_unchecked(x - 1);
-            let predictor = med_predictor(left, top, top_left);
-            *out_row.get_unchecked_mut(x) = value.wrapping_sub(predictor);
-            left = value;
-        }
+/// Compute MED residuals for a row (the first pixel predicts from the top).
+#[inline]
+fn compute_med_residual_row(current_row: &[u8], prev_row: &[u8], out_row: &mut [u8]) {
+    let width = current_row.len();
+    let (prev_row, out_row) = (&prev_row[..width], &mut out_row[..width]);
+    out_row[0] = current_row[0].wrapping_sub(prev_row[0]);
+    for x in 1..width {
+        let predictor = med_predictor(current_row[x - 1], prev_row[x], prev_row[x - 1]);
+        out_row[x] = current_row[x].wrapping_sub(predictor);
     }
 }
 
@@ -116,51 +87,7 @@ pub fn compress(
     height: u32,
     bytes_per_line: u32,
 ) -> crate::Result<Vec<u8>> {
-    if width == 0 || height == 0 {
-        return Err(crate::LlicError::InvalidArgument);
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let bytes_per_line = bytes_per_line as usize;
-
-    // Verify source buffer size
-    if src_image.len() < (height - 1) * bytes_per_line + width {
-        return Err(crate::LlicError::InvalidArgument);
-    }
-
-    // Estimate output size (compressed should be smaller, but allocate generously)
-    let estimated_size = width * height * 2;
-    let mut writer = BitWriter::with_capacity(estimated_size);
-
-    // Buffer for delta-encoded values for current row
-    let mut delta_buffer = vec![0u8; width];
-
-    // Process first row (horizontal delta only) - optimized version
-    {
-        let src_row = &src_image[..width];
-        compute_first_row_deltas(src_row, &mut delta_buffer);
-    }
-
-    // Process remaining rows using pipelined approach like C++:
-    // Encode previous row while computing current row
-    for y in 1..height {
-        // Encode the previously computed delta row
-        encode_row(&delta_buffer, &mut writer);
-
-        let row_offset = y * bytes_per_line;
-        let prev_row_offset = (y - 1) * bytes_per_line;
-        let src_row = &src_image[row_offset..row_offset + width];
-        let prev_row = &src_image[prev_row_offset..prev_row_offset + width];
-
-        // Compute deltas for current row
-        compute_avg_predictor_deltas(src_row, prev_row, &mut delta_buffer);
-    }
-
-    // Encode the final row
-    encode_row(&delta_buffer, &mut writer);
-
-    Ok(writer.finish())
+    encode(src_image, width, height, bytes_per_line, false)
 }
 
 /// Compute delta values for the first row (horizontal differences).
@@ -382,180 +309,452 @@ pub fn compress_dynamic(
     height: u32,
     bytes_per_line: u32,
 ) -> crate::Result<Vec<u8>> {
+    encode(src_image, width, height, bytes_per_line, true)
+}
+
+/// Checks the arguments and runs the image encoder, on x86-64 the build with
+/// BMI2 shifts and SSE residuals when the CPU has them (as the C++ reference
+/// selects its BMI2 build at run time).
+fn encode(
+    src_image: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    dynamic: bool,
+) -> crate::Result<Vec<u8>> {
     if width == 0 || height == 0 {
         return Err(crate::LlicError::InvalidArgument);
     }
-
-    let width = width as usize;
-    let height = height as usize;
-    let bytes_per_line = bytes_per_line as usize;
-
-    // Verify source buffer size
-    if src_image.len() < (height - 1) * bytes_per_line + width {
+    let (width, height, stride) = (width as usize, height as usize, bytes_per_line as usize);
+    if stride < width || src_image.len() < (height - 1) * stride + width {
         return Err(crate::LlicError::InvalidArgument);
     }
-
-    // Calculate predictor bitmap size (1 bit per row, aligned to 4 bytes)
-    let predictor_bytes = height.div_ceil(8);
-    let predictor_storage_bytes = align_to_4(predictor_bytes);
-
-    // Allocate output with predictor bitmap at the start
-    let estimated_size = predictor_storage_bytes + width * height * 2;
-    let mut output = vec![0u8; estimated_size];
-
-    // Predictor bitmap (all zeros initially = all average predictor)
-    let predictor_bits = &mut output[..predictor_storage_bytes];
-
-    // Create BitWriter for compressed data after predictor bitmap
-    let mut writer = BitWriter::with_capacity(width * height * 2);
-
-    // Buffers for delta-encoded values
-    let mut avg_delta_buffer = vec![0u8; width];
-    let mut med_delta_buffer = vec![0u8; width];
-
-    // Process first row (horizontal delta only, no predictor choice)
-    {
-        let src_row = &src_image[..width];
-        avg_delta_buffer[0] = src_row[0];
-        for x in 1..width {
-            avg_delta_buffer[x] = src_row[x].wrapping_sub(src_row[x - 1]);
-        }
-        encode_row(&avg_delta_buffer, &mut writer);
-        // Row 0 always uses "average" (actually horizontal delta), so bit stays 0
+    #[cfg(target_arch = "x86_64")]
+    if simd_encoder_available() {
+        // SAFETY: the CPU supports BMI2, SSSE3 and SSE4.1.
+        return Ok(unsafe { encode_image_x86(src_image, width, height, stride, dynamic) });
     }
+    Ok(encode_image::<false>(
+        src_image, width, height, stride, dynamic,
+    ))
+}
 
-    // Process remaining rows with dynamic predictor selection
+/// Whether the CPU supports the x86-64 encoder build.
+#[cfg(target_arch = "x86_64")]
+fn simd_encoder_available() -> bool {
+    #[cfg(test)]
+    if tests::PORTABLE.with(std::cell::Cell::get) {
+        return false;
+    }
+    is_x86_feature_detected!("bmi2")
+        && is_x86_feature_detected!("ssse3")
+        && is_x86_feature_detected!("sse4.1")
+}
+
+/// The image encoder built for BMI2 (shifts by a register become `SHLX`/`SHRX`,
+/// one uop instead of three) with the SSE residual code inlined.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2,ssse3,sse4.1")]
+unsafe fn encode_image_x86(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    dynamic: bool,
+) -> Vec<u8> {
+    encode_image::<true>(src, width, height, stride, dynamic)
+}
+
+/// Encodes an image (arguments checked by [`encode`]). `SIMD` selects the
+/// x86-64 SSE residual code, for callers that enabled its target features.
+#[inline(always)]
+fn encode_image<const SIMD: bool>(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    dynamic: bool,
+) -> Vec<u8> {
+    let predictor_bytes = if dynamic {
+        align_to_4(height.div_ceil(8))
+    } else {
+        0
+    };
+    let mut stream = Stream::new(predictor_bytes, width, height);
+    let mut residuals = vec![0u8; width];
+    let mut med_residuals = vec![0u8; if dynamic { width } else { 0 }];
+
+    first_row_residuals::<SIMD>(&src[..width], &mut residuals);
+    let mut use_med = false;
+    let mut branch_free = true;
     for y in 1..height {
-        let row_offset = y * bytes_per_line;
-        let prev_row_offset = (y - 1) * bytes_per_line;
-        let src_row = &src_image[row_offset..row_offset + width];
-        let prev_row = &src_image[prev_row_offset..prev_row_offset + width];
+        // Code the previous row while this one is predicted.
+        let row = if use_med { &med_residuals } else { &residuals };
+        let row_bits = stream.encode_row(row, false, branch_free);
+        // Above 5.5 bits per pair, flush timing is irregular enough that the
+        // branch mispredicts more than storing every pair costs.
+        branch_free = row_bits * 4 > 11 * width as u64;
 
-        // Compute average predictor residuals
-        avg_delta_buffer[0] = src_row[0].wrapping_sub(prev_row[0]);
-        for x in 1..width {
-            let left = src_row[x - 1];
-            let top = prev_row[x];
-            let avg = ((left as u16 + top as u16) >> 1) as u8;
-            avg_delta_buffer[x] = src_row[x].wrapping_sub(avg);
-        }
-
-        // Compute MED predictor residuals
-        compute_med_residual_row(src_row, prev_row, width, &mut med_delta_buffer);
-
-        // Estimate bits for each predictor
-        let avg_bits = estimate_row_bits(&avg_delta_buffer);
-        let med_bits = estimate_row_bits(&med_delta_buffer);
-
-        // Choose the better predictor
-        let use_med = med_bits < avg_bits;
-
-        if use_med {
-            // Set the predictor bit for this row
-            predictor_bits[y / 8] |= 1 << (y % 8);
-            encode_row(&med_delta_buffer, &mut writer);
+        let current = &src[y * stride..y * stride + width];
+        let prev = &src[(y - 1) * stride..(y - 1) * stride + width];
+        if dynamic {
+            let (avg_bits, med_bits) =
+                dynamic_residual_rows::<SIMD>(current, prev, &mut residuals, &mut med_residuals);
+            use_med = med_bits < avg_bits;
+            if use_med {
+                stream.set_predictor_bit(y);
+            }
         } else {
-            encode_row(&avg_delta_buffer, &mut writer);
+            average_residuals::<SIMD>(current, prev, &mut residuals);
+        }
+    }
+    let row = if use_med { &med_residuals } else { &residuals };
+    stream.encode_row(row, true, branch_free);
+    stream.finish()
+}
+
+#[inline(always)]
+fn first_row_residuals<const SIMD: bool>(row: &[u8], out: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if SIMD {
+        // SAFETY: SIMD callers enabled SSSE3.
+        return unsafe { compute_first_row_deltas_ssse3(row, out) };
+    }
+    compute_first_row_deltas(row, out);
+}
+
+#[inline(always)]
+fn average_residuals<const SIMD: bool>(row: &[u8], prev: &[u8], out: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if SIMD {
+        // SAFETY: SIMD callers enabled SSSE3.
+        return unsafe { compute_avg_predictor_deltas_ssse3(row, prev, out) };
+    }
+    compute_avg_predictor_deltas(row, prev, out);
+}
+
+/// Computes the average and MED residual rows and their coded sizes in bits.
+#[inline(always)]
+fn dynamic_residual_rows<const SIMD: bool>(
+    row: &[u8],
+    prev: &[u8],
+    avg_out: &mut [u8],
+    med_out: &mut [u8],
+) -> (u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    if SIMD {
+        // SAFETY: SIMD callers enabled SSSE3 and SSE4.1.
+        return unsafe { dynamic_residual_rows_sse(row, prev, avg_out, med_out) };
+    }
+    compute_avg_predictor_deltas(row, prev, avg_out);
+    compute_med_residual_row(row, prev, med_out);
+    (estimate_row_bits(avg_out), estimate_row_bits(med_out))
+}
+
+/// Computes the average and MED residual rows and their coded sizes in one
+/// pass, sixteen pixels at a time (the C++ `computeDynamicResidualRows`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn dynamic_residual_rows_sse(
+    row: &[u8],
+    prev: &[u8],
+    avg_out: &mut [u8],
+    med_out: &mut [u8],
+) -> (u64, u64) {
+    use std::arch::x86_64::*;
+
+    /// Code lengths of sixteen residuals, summed into two 64-bit lanes. Lengths
+    /// depend on the signed magnitude: a table up to 16, 13 bits beyond.
+    #[inline(always)]
+    unsafe fn code_length_sums(residuals: __m128i) -> __m128i {
+        let lengths = _mm_setr_epi8(2, 3, 3, 5, 5, 7, 7, 7, 7, 9, 9, 9, 9, 9, 9, 9);
+        let magnitude = _mm_abs_epi8(residuals);
+        let short_code = _mm_cmpeq_epi8(_mm_min_epu8(magnitude, _mm_set1_epi8(16)), magnitude);
+        let length = _mm_add_epi8(
+            _mm_shuffle_epi8(lengths, _mm_min_epu8(magnitude, _mm_set1_epi8(15))),
+            _mm_andnot_si128(short_code, _mm_set1_epi8(4)),
+        );
+        _mm_sad_epu8(length, _mm_setzero_si128())
+    }
+
+    #[allow(clippy::cast_sign_loss)] // each lane of a row sum fits in 32 bits
+    unsafe fn add_lanes(sums: __m128i) -> u64 {
+        u64::from(_mm_cvtsi128_si32(sums) as u32)
+            + u64::from(_mm_cvtsi128_si32(_mm_unpackhi_epi64(sums, sums)) as u32)
+    }
+
+    let width = row.len();
+    assert!(prev.len() >= width && avg_out.len() >= width && med_out.len() >= width);
+    let mut avg_sums = _mm_setzero_si128();
+    let mut med_sums = _mm_setzero_si128();
+    // With left equal to top, both predictors return top for the first pixel.
+    #[allow(clippy::cast_possible_wrap)]
+    let mut prev_current = _mm_set1_epi8(prev[0] as i8);
+    let mut prev_top = prev_current;
+    let one = _mm_set1_epi8(1);
+    let mut x = 0;
+    while x + 16 <= width {
+        let current = _mm_loadu_si128(row.as_ptr().add(x).cast());
+        let top = _mm_loadu_si128(prev.as_ptr().add(x).cast());
+        let left = _mm_alignr_epi8::<15>(current, prev_current);
+        let top_left = _mm_alignr_epi8::<15>(top, prev_top);
+        prev_current = current;
+        prev_top = top;
+        // PAVGB rounds up; subtract the rounding to get the floor average.
+        let average = _mm_sub_epi8(
+            _mm_avg_epu8(left, top),
+            _mm_and_si128(_mm_xor_si128(left, top), one),
+        );
+        let min_ab = _mm_min_epu8(left, top);
+        let max_ab = _mm_max_epu8(left, top);
+        let clamped = _mm_min_epu8(_mm_max_epu8(top_left, min_ab), max_ab);
+        let med = _mm_sub_epi8(_mm_add_epi8(left, top), clamped);
+        let avg_residuals = _mm_sub_epi8(current, average);
+        let med_residuals = _mm_sub_epi8(current, med);
+        _mm_storeu_si128(avg_out.as_mut_ptr().add(x).cast(), avg_residuals);
+        _mm_storeu_si128(med_out.as_mut_ptr().add(x).cast(), med_residuals);
+        avg_sums = _mm_add_epi64(avg_sums, code_length_sums(avg_residuals));
+        med_sums = _mm_add_epi64(med_sums, code_length_sums(med_residuals));
+        x += 16;
+    }
+    let mut avg_bits = add_lanes(avg_sums);
+    let mut med_bits = add_lanes(med_sums);
+    for x in x..width {
+        let left = if x == 0 { prev[0] } else { row[x - 1] };
+        let top_left = if x == 0 { prev[0] } else { prev[x - 1] };
+        let average = ((u16::from(left) + u16::from(prev[x])) >> 1) as u8;
+        let avg_residual = row[x].wrapping_sub(average);
+        let med_residual = row[x].wrapping_sub(med_predictor(left, prev[x], top_left));
+        avg_out[x] = avg_residual;
+        med_out[x] = med_residual;
+        avg_bits += u64::from(single_entry(avg_residual) & 0x3F);
+        med_bits += u64::from(single_entry(med_residual) & 0x3F);
+    }
+    (avg_bits, med_bits)
+}
+
+/// Bit stream output. Codes are packed MSB-first into a 64-bit container;
+/// each full 32-bit word is stored as two 16-bit little-endian halves, high
+/// half first (the C++ `storeWord`).
+struct Stream {
+    /// Written bytes are `[0, pos)`; the rest of the capacity is unwritten.
+    out: Vec<u8>,
+    pos: usize,
+    bits: u64,
+    num_bits: u32,
+}
+
+impl Stream {
+    /// A stream after a zeroed predictor bitmap of `predictor_bytes`, with
+    /// capacity for the worst case of a `width` x `height` image.
+    fn new(predictor_bytes: usize, width: usize, height: usize) -> Self {
+        let mut out = Vec::with_capacity(predictor_bytes + height * max_row_bytes(width) + 4);
+        out.resize(predictor_bytes, 0);
+        Self {
+            out,
+            pos: predictor_bytes,
+            bits: 0,
+            num_bits: 0,
         }
     }
 
-    // Finalize the output
-    let compressed_data = writer.finish();
-    let total_size = predictor_storage_bytes + compressed_data.len();
-    output.truncate(total_size);
-    output[predictor_storage_bytes..].copy_from_slice(&compressed_data);
+    fn set_predictor_bit(&mut self, y: usize) {
+        self.out[y / 8] |= 1 << (y % 8);
+    }
 
-    Ok(output)
-}
+    /// Stores the container's top word at `pos` (without advancing).
+    ///
+    /// # Safety
+    /// `pos + 4` must be within the capacity.
+    #[inline(always)]
+    unsafe fn store_word(out: &mut Vec<u8>, pos: usize, bits: u64) {
+        #[allow(clippy::cast_possible_truncation)] // the top word
+        let word = ((bits >> 32) as u32).rotate_left(16);
+        out.as_mut_ptr()
+            .add(pos)
+            .cast::<[u8; 4]>()
+            .write_unaligned(word.to_le_bytes());
+    }
 
-/// Encode a row of delta values to the bit stream.
-///
-/// Uses the compression table which encodes pairs of symbols for efficiency.
-/// Matches C++ optimization: 8x unrolled loop processing 16 symbols per iteration.
-#[inline]
-fn encode_row(deltas: &[u8], writer: &mut BitWriter) {
-    let width = deltas.len();
-    let num_pairs = width / 2;
+    /// Codes a row of residuals in pairs (a trailing odd one alone) and
+    /// returns the bits it took. With `branch_free`, words are flushed without
+    /// a data-dependent branch: the top word is always stored and kept only
+    /// when complete, so a following code must overwrite it or
+    /// [`Stream::finish`] completes it; the final row leaves its last pair to
+    /// the branching tail. The state stays in locals so it lives in registers,
+    /// and both loops are unrolled by eight like the C++ `compressRow`.
+    #[inline(always)]
+    fn encode_row(&mut self, residuals: &[u8], final_row: bool, branch_free: bool) -> u64 {
+        assert!(self.pos + max_row_bytes(residuals.len()) <= self.out.capacity());
+        let out = &mut self.out;
+        let (mut bits, mut num_bits, mut pos) = (self.bits, u64::from(self.num_bits), self.pos);
+        let start = (pos, num_bits);
+        let num_pairs = residuals.len() / 2;
+        let tail = &residuals[2 * num_pairs..];
+        // Reads pair `i` as one 16-bit load (`as_chunks` needs Rust 1.88).
+        let entry = |i: usize| {
+            debug_assert!(i < num_pairs);
+            // SAFETY: every caller passes i < num_pairs, so bytes 2i and 2i + 1
+            // are in `residuals`.
+            let pair = unsafe {
+                residuals
+                    .as_ptr()
+                    .add(2 * i)
+                    .cast::<[u8; 2]>()
+                    .read_unaligned()
+            };
+            get_compress_table_entry(usize::from(u16::from_le_bytes(pair)))
+        };
 
-    // Cast to u16 pointer like C++ (safe: deltas is contiguous and we only read within bounds)
-    let ptr = deltas.as_ptr() as *const u16;
-
-    let mut i = 0;
-
-    // Unroll by 8 (16 symbols per iteration, matches C++)
-    while i + 8 <= num_pairs {
-        // SAFETY: i + 8 <= num_pairs ensures we read at most num_pairs u16 values
-        // which corresponds to 2*num_pairs bytes, all within the slice
-        unsafe {
-            let t0 = get_compress_table_entry(*ptr.add(i) as usize);
-            writer.write_packed(t0);
-
-            let t1 = get_compress_table_entry(*ptr.add(i + 1) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t1);
-
-            let t2 = get_compress_table_entry(*ptr.add(i + 2) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t2);
-
-            let t3 = get_compress_table_entry(*ptr.add(i + 3) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t3);
-
-            let t4 = get_compress_table_entry(*ptr.add(i + 4) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t4);
-
-            let t5 = get_compress_table_entry(*ptr.add(i + 5) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t5);
-
-            let t6 = get_compress_table_entry(*ptr.add(i + 6) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t6);
-
-            let t7 = get_compress_table_entry(*ptr.add(i + 7) as usize);
-            writer.flush_if_needed();
-            writer.write_packed(t7);
-            writer.flush_if_needed();
+        // Appends a table entry's code.
+        macro_rules! put {
+            ($entry:expr) => {{
+                let entry: u32 = $entry;
+                bits |= (u64::from(entry & 0xFFFF_FFC0) << 32) >> num_bits;
+                num_bits += u64::from(entry & 0x3F);
+            }};
+        }
+        // Stores a complete word, if there is one.
+        macro_rules! flush {
+            () => {
+                if num_bits >= 32 {
+                    num_bits -= 32;
+                    // SAFETY: the capacity was checked above.
+                    unsafe { Self::store_word(out, pos, bits) };
+                    pos += 4;
+                    bits <<= 32;
+                }
+            };
         }
 
-        i += 8;
+        let mut i = 0;
+        if branch_free {
+            let unrolled = num_pairs.saturating_sub(usize::from(final_row)) / 8 * 8;
+            while i < unrolled {
+                for j in 0..8 {
+                    let entry = entry(i + j);
+                    bits |= (u64::from(entry & 0xFFFF_FFC0) << 32) >> (num_bits & 0x3F);
+                    // At most 31 pending bits plus a 26-bit pair: bit 5 marks a
+                    // complete word. Only the low six bits of `num_bits` count.
+                    num_bits += u64::from(entry);
+                    let full = num_bits & 32;
+                    // SAFETY: the capacity was checked above.
+                    unsafe { Self::store_word(out, pos, bits) };
+                    pos += (full >> 3) as usize;
+                    bits <<= full;
+                    num_bits -= full;
+                }
+                i += 8;
+            }
+            num_bits &= 0x3F;
+        } else {
+            // Short codes flush rarely and predictably; load each next entry
+            // before the preceding flush branch.
+            while i + 8 <= num_pairs {
+                let mut next = entry(i);
+                for j in 1..8 {
+                    put!(next);
+                    next = entry(i + j);
+                    flush!();
+                }
+                put!(next);
+                flush!();
+                i += 8;
+            }
+        }
+        for i in i..num_pairs {
+            put!(entry(i));
+            flush!();
+        }
+        if let [sym] = tail {
+            put!(single_entry(*sym));
+            flush!();
+        }
+        #[allow(clippy::cast_possible_truncation)] // below 32
+        {
+            (self.bits, self.num_bits, self.pos) = (bits, num_bits as u32, pos);
+        }
+        ((pos - start.0) * 8) as u64 + num_bits - start.1
     }
 
-    // Handle remaining pairs
-    while i < num_pairs {
-        // SAFETY: i < num_pairs ensures we're within bounds
-        let idx = unsafe { *ptr.add(i) as usize };
-        let entry = get_compress_table_entry(idx);
-        writer.write_packed(entry);
-        writer.flush_if_needed();
-        i += 1;
-    }
-
-    // Handle odd trailing symbol
-    if (width & 1) != 0 {
-        encode_single(deltas[width - 1], writer);
+    /// Stores the last, partial word and returns the stream.
+    fn finish(mut self) -> Vec<u8> {
+        if self.num_bits > 0 {
+            // SAFETY: the capacity includes a final word.
+            unsafe { Self::store_word(&mut self.out, self.pos, self.bits) };
+            self.pos += 4;
+        }
+        // SAFETY: every byte below pos was written.
+        unsafe { self.out.set_len(self.pos) };
+        self.out
     }
 }
 
-/// Encode a single symbol at the end of a row.
-///
-/// Uses the same trick as C++: look up (sym, 0) pair and subtract 2 bits
-/// to remove the trailing zero encoding.
-#[inline]
-fn encode_single(sym: u8, writer: &mut BitWriter) {
-    // Look up symbol paired with 0
-    let entry = get_compress_table_entry(sym as usize);
-    // Subtract 2 bits (the encoding of the dummy zero)
-    let adjusted = entry - 2;
-    writer.write_packed(adjusted);
-    writer.flush_if_needed();
+/// Upper bound on the bytes one row of `width` residuals adds, including the
+/// branch-free flush's speculative store: at most 13 bits per residual on top
+/// of up to 31 pending bits.
+fn max_row_bytes(width: usize) -> usize {
+    (13 * width + 31).div_ceil(32) * 4 + 4
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Makes the encoder use its portable build on this thread.
+        pub(super) static PORTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The BMI2/SSE build and the portable build must write identical streams
+    /// (both flush strategies, odd widths, both predictors, narrow rows).
+    #[test]
+    fn simd_and_portable_encoders_match() {
+        let mut state = 0x2468_ACE1_u32;
+        for (width, height, stride) in [
+            (1u32, 1u32, 1u32),
+            (3, 5, 4),
+            (17, 9, 17),
+            (65, 33, 70),
+            (300, 40, 300),
+        ] {
+            for amplitude in [2u32, 9, 70, 256] {
+                let image: Vec<u8> = (0..stride * height)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let value = ((i % stride) * 2 + (i / stride) + state % amplitude) as u8;
+                        value
+                    })
+                    .collect();
+                for dynamic in [false, true] {
+                    let run = || encode(&image, width, height, stride, dynamic).expect("encode");
+                    let simd = run();
+                    PORTABLE.with(|p| p.set(true));
+                    let portable = run();
+                    PORTABLE.with(|p| p.set(false));
+                    assert_eq!(
+                        simd, portable,
+                        "{width}x{height} amplitude {amplitude} dynamic {dynamic}"
+                    );
+                    let mut decoded = vec![0u8; image.len()];
+                    if dynamic {
+                        decompress_dynamic(&simd, width, height, stride, &mut decoded)
+                    } else {
+                        decompress(&simd, width, height, stride, &mut decoded)
+                    }
+                    .expect("decode");
+                    for y in 0..height as usize {
+                        let row = y * stride as usize..y * stride as usize + width as usize;
+                        assert_eq!(decoded[row.clone()], image[row]);
+                    }
+                }
+            }
+        }
+    }
     use crate::entropy_coder::{decompress, decompress_dynamic};
 
     #[test]
