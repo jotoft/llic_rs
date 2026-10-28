@@ -601,3 +601,64 @@ input[type="file"] {
 .panel.zoom-mode {
   cursor: zoom-in;
 }
+
+/* ==========================================================================
+   Narrow screens (phones): one scrolling column with the images above the
+   controls. The desktop layout fixes the page to the viewport height and
+   gives the controls a 280px column, which left the images a sliver.
+   ========================================================================== */
+
+@media (max-width: 800px) {
+  html { font-size: 15px; }
+
+  body {
+    height: auto;
+    overflow: auto;
+    padding: 0.75rem 0.75rem 0;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .main-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
+  }
+
+  .main-content {
+    height: auto;
+    overflow: visible;
+  }
+
+  .view-toggle { flex-wrap: wrap; }
+
+  .view-btn {
+    flex: 1 1 auto;
+    font-size: 0.9rem;
+    padding: 0.5rem;
+  }
+
+  /* Panels stack at full width and take the image's own aspect ratio. */
+  .image-container,
+  .tile-viz-container {
+    grid-template-columns: 1fr;
+  }
+
+  .main-content > .image-container,
+  .main-content > .tile-viz-container,
+  .main-content > .compare-container {
+    flex: none;
+  }
+
+  .panel canvas { height: auto; }
+
+  .sidebar-stack {
+    max-height: none;
+    overflow: visible;
+  }
+
+  footer { position: static; }
+}
