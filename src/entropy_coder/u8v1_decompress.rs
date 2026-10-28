@@ -2,25 +2,25 @@ use super::bit_reader::BitReader64;
 use super::tables::DECOMPRESS_TABLE;
 use crate::{LlicError, Result};
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wavefront_simd128;
 #[cfg(target_arch = "x86_64")]
 mod wavefront_sse;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use wavefront_simd128 as wavefront;
+/// The wavefront for this target (same interface in both modules).
+#[cfg(target_arch = "x86_64")]
+use wavefront_sse as wavefront;
 
 /// MED (Median Edge Detector) predictor used in JPEG-LS and Dynamic mode.
-#[inline]
+///
+/// `left + top - clamp(top_left, min, max)` gives all three cases without
+/// branches, which mispredict on noisy rows (the SIMD code computes the same).
+#[inline(always)]
 fn med_predictor(left: u8, top: u8, top_left: u8) -> u8 {
-    let a = left as i32;
-    let b = top as i32;
-    let c = top_left as i32;
-    let min_ab = a.min(b);
-    let max_ab = a.max(b);
-
-    if c >= max_ab {
-        min_ab as u8
-    } else if c <= min_ab {
-        max_ab as u8
-    } else {
-        (a + b - c) as u8
-    }
+    let (min_ab, max_ab) = (left.min(top), left.max(top));
+    left.wrapping_add(top)
+        .wrapping_sub(top_left.max(min_ab).min(max_ab))
 }
 
 /// Align a value up to the next multiple of 4.
@@ -98,7 +98,10 @@ fn reconstruct_row(top: &[u8], residuals: &[u8], row: &mut [u8], width: usize, u
 
 /// Like [`reconstruct_row`] for pixels `[x0, x1)`, with `row` holding the
 /// residuals on entry (pixel `x` is replaced after pixel `x - 1`).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
 #[inline(always)]
 fn reconstruct_row_in_place(top: &[u8], row: &mut [u8], x0: usize, x1: usize, use_med: bool) {
     let mut x = x0;
@@ -114,6 +117,31 @@ fn reconstruct_row_in_place(top: &[u8], row: &mut [u8], x0: usize, x1: usize, us
         for x in x..x1 {
             let average = ((u16::from(row[x - 1]) + u16::from(top[x])) >> 1) as u8;
             row[x] = row[x].wrapping_add(average);
+        }
+    }
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+/// Reconstructs pixels `span(k)` of each wavefront row k in order, in place;
+/// `rows` holds the rows `width` apart and `prev` is the row above them.
+#[inline(always)]
+fn reconstruct_parts(
+    prev: &[u8],
+    rows: &mut [u8],
+    width: usize,
+    uses_med: impl Fn(usize) -> bool,
+    span: impl Fn(usize) -> (usize, usize),
+) {
+    for k in 0..WAVE_ROWS {
+        let (x0, x1) = span(k);
+        if k == 0 {
+            reconstruct_row_in_place(prev, &mut rows[..width], x0, x1, uses_med(0));
+        } else {
+            let (above, row) = rows[(k - 1) * width..(k + 1) * width].split_at_mut(width);
+            reconstruct_row_in_place(above, row, x0, x1, uses_med(k));
         }
     }
 }
@@ -136,9 +164,15 @@ fn decode_image(
         return Err(LlicError::InvalidArgument);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    let wave = width >= 2 * WAVE_ROWS && wavefront_sse::available();
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    let wave = width >= 2 * WAVE_ROWS && wavefront::available();
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     let wave = false;
     let mut decoder = FastDecoder::new(stream);
     // Residuals for a wavefront of rows, plus room for a symbol pair beyond.
@@ -151,9 +185,18 @@ fn decode_image(
         dst_image[x] = residuals[x].wrapping_add(dst_image[x - 1]);
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )),
+        allow(unused_mut)
+    )]
     let mut y = 1;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
     if wave {
         let count = WAVE_ROWS * width;
         while y + WAVE_ROWS <= height {
@@ -164,8 +207,8 @@ fn decode_image(
                 .fold(0u32, |rows, k| rows | (1 << k));
             let (done, rest) = dst_image.split_at_mut(y * stride);
             let prev = &done[(y - 1) * stride..(y - 1) * stride + width];
-            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`wavefront_sse::available`).
-            unsafe { wavefront_sse::reconstruct(prev, &mut residuals[..count], width, med_rows) };
+            // SAFETY: the CPU supports the wavefront's instructions (`available`).
+            unsafe { wavefront::reconstruct(prev, &mut residuals[..count], width, med_rows) };
             // Sixteen interleaved row streams write back slowly, so the rows are
             // reconstructed in the buffer and copied one after another.
             for (k, row) in residuals[..count].chunks_exact(width).enumerate() {
@@ -828,6 +871,76 @@ mod tests {
             }
         } else {
             println!("Skipping patterns test - files not found");
+        }
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    fn test_image(width: u32, height: u32, stride: u32) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_u32 ^ width;
+        (0..stride * height)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let (x, y) = (i % stride, i / stride);
+                let amplitude = 1 << ((x / 8 + y / 3) % 9);
+                #[allow(clippy::cast_possible_truncation)]
+                let value = (x * 3 + y * 5 + (state % amplitude)) as u8;
+                value
+            })
+            .collect()
+    }
+
+    /// The wavefront must reproduce the per-row decode for every width
+    /// remainder and height, both predictors and mixed per-row selection.
+    #[test]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    fn wavefront_matches_per_row_decode() {
+        if !wavefront::available() {
+            return;
+        }
+        for (width, height, stride) in [
+            (32u32, 17u32, 32u32),
+            (48, 40, 52),
+            (68, 33, 68),
+            (100, 50, 104),
+            (200, 16, 200),
+        ] {
+            let image = test_image(width, height, stride);
+            for dynamic in [false, true] {
+                let compressed = if dynamic {
+                    crate::entropy_coder::compress_dynamic(&image, width, height, stride)
+                } else {
+                    crate::entropy_coder::compress(&image, width, height, stride)
+                }
+                .expect("compress");
+                let decode = || {
+                    let mut out = vec![0u8; image.len()];
+                    if dynamic {
+                        decompress_dynamic(&compressed, width, height, stride, &mut out)
+                    } else {
+                        decompress(&compressed, width, height, stride, &mut out)
+                    }
+                    .expect("decompress");
+                    out
+                };
+                let wave = decode();
+                wavefront::tests::DISABLED.with(|d| d.set(true));
+                let per_row = decode();
+                wavefront::tests::DISABLED.with(|d| d.set(false));
+                let case = format!("{width}x{height} stride {stride} dynamic {dynamic}");
+                assert_eq!(wave, per_row, "{case}");
+                for y in 0..height as usize {
+                    let row = y * stride as usize..y * stride as usize + width as usize;
+                    assert_eq!(wave[row.clone()], image[row], "{case} row {y}");
+                }
+            }
         }
     }
 }

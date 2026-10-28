@@ -14,7 +14,7 @@
 
 use std::arch::x86_64::*;
 
-use super::{reconstruct_row_in_place, WAVE_ROWS};
+use super::{reconstruct_parts, WAVE_ROWS};
 
 /// Whether the CPU supports the instructions this module uses.
 pub(super) fn available() -> bool {
@@ -128,98 +128,13 @@ unsafe fn reconstruct_kind<const KIND: u8>(
     reconstruct_parts(prev, rows, width, uses_med, |k| (t0 - k, width));
 }
 
-/// Reconstructs pixels `span(k)` of each row k in order, in place.
-#[inline(always)]
-fn reconstruct_parts(
-    prev: &[u8],
-    rows: &mut [u8],
-    width: usize,
-    uses_med: impl Fn(usize) -> bool,
-    span: impl Fn(usize) -> (usize, usize),
-) {
-    for k in 0..WAVE_ROWS {
-        let (x0, x1) = span(k);
-        if k == 0 {
-            reconstruct_row_in_place(prev, &mut rows[..width], x0, x1, uses_med(0));
-        } else {
-            let (above, row) = rows[(k - 1) * width..(k + 1) * width].split_at_mut(width);
-            reconstruct_row_in_place(above, row, x0, x1, uses_med(k));
-        }
-    }
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use std::cell::Cell;
 
-    use super::*;
-    use crate::entropy_coder::{compress, compress_dynamic, decompress, decompress_dynamic};
-
     thread_local! {
-        /// Makes [`available`] report false on this thread, to compare the
+        /// Makes [`super::available`] report false on this thread, to compare the
         /// wavefront with the per-row code.
         pub(in crate::entropy_coder) static DISABLED: Cell<bool> = const { Cell::new(false) };
-    }
-
-    fn test_image(width: u32, height: u32, stride: u32) -> Vec<u8> {
-        let mut state = 0x9E37_79B9_u32 ^ width;
-        (0..stride * height)
-            .map(|i| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                let (x, y) = (i % stride, i / stride);
-                let amplitude = 1 << ((x / 8 + y / 3) % 9);
-                #[allow(clippy::cast_possible_truncation)]
-                let value = (x * 3 + y * 5 + (state % amplitude)) as u8;
-                value
-            })
-            .collect()
-    }
-
-    /// The wavefront must reproduce the per-row decode for every width
-    /// remainder and height, both predictors and mixed per-row selection.
-    #[test]
-    fn wavefront_matches_per_row_decode() {
-        if !available() {
-            return;
-        }
-        for (width, height, stride) in [
-            (32u32, 17u32, 32u32),
-            (48, 40, 52),
-            (68, 33, 68),
-            (100, 50, 104),
-            (200, 16, 200),
-        ] {
-            let image = test_image(width, height, stride);
-            for dynamic in [false, true] {
-                let compressed = if dynamic {
-                    compress_dynamic(&image, width, height, stride)
-                } else {
-                    compress(&image, width, height, stride)
-                }
-                .expect("compress");
-                let decode = || {
-                    let mut out = vec![0u8; image.len()];
-                    if dynamic {
-                        decompress_dynamic(&compressed, width, height, stride, &mut out)
-                    } else {
-                        decompress(&compressed, width, height, stride, &mut out)
-                    }
-                    .expect("decompress");
-                    out
-                };
-                let wave = decode();
-                DISABLED.with(|d| d.set(true));
-                let per_row = decode();
-                DISABLED.with(|d| d.set(false));
-                let case = format!("{width}x{height} stride {stride} dynamic {dynamic}");
-                assert_eq!(wave, per_row, "{case}");
-                for y in 0..height as usize {
-                    let row = y * stride as usize..y * stride as usize + width as usize;
-                    assert_eq!(wave[row.clone()], image[row], "{case} row {y}");
-                }
-            }
-        }
     }
 }

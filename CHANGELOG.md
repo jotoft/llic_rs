@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grouped tile codec: in Node/V8, tile-based encoding is 3.2-3.7x and decoding
   2.3-2.4x faster, fast-mode decoding 4-7.6 GP/s. `examples/wasm_bench` and
   `scripts/wasm_bench.mjs` benchmark and test the WebAssembly build in Node.
+- WebAssembly builds with `simd128` also reconstruct entropy-coded rows with
+  the sixteen-row wavefront: in Node/V8, decoding 1.1-1.4x faster overall and
+  1.7-2x in dynamic mode.
+- The scalar MED predictor in the decoder is branch-free, like the encoder's.
 
 ### Fixed
 
