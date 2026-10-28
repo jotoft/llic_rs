@@ -1,5 +1,4 @@
-use super::bit_reader::BitReader64;
-use super::tables::DECOMPRESS_TABLE;
+use super::tables::{get_compress_table_entry, DECODE_TABLE_13, DECOMPRESS_TABLE};
 use crate::{LlicError, Result};
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -174,11 +173,11 @@ fn decode_image(
         all(target_arch = "wasm32", target_feature = "simd128")
     )))]
     let wave = false;
-    let mut decoder = FastDecoder::new(stream);
+    let mut decoder = SymbolDecoder::new(stream);
     // Residuals for a wavefront of rows, plus room for a symbol pair beyond.
     let mut residuals = vec![0u8; if wave { WAVE_ROWS } else { 1 } * width + 256];
 
-    let mut num_filled = decoder.decompress_row(&mut residuals, 0, 0, width);
+    let mut num_filled = decoder.decompress_row(&mut residuals, 0, 0, width)?;
     let mut prev_count = width;
     dst_image[0] = residuals[0];
     for x in 1..width {
@@ -200,7 +199,7 @@ fn decode_image(
     if wave {
         let count = WAVE_ROWS * width;
         while y + WAVE_ROWS <= height {
-            num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, count);
+            num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, count)?;
             prev_count = count;
             let med_rows = (0..WAVE_ROWS)
                 .filter(|&k| row_uses_med(predictor_bits, y + k))
@@ -218,7 +217,7 @@ fn decode_image(
         }
     }
     for y in y..height {
-        num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, width);
+        num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, width)?;
         prev_count = width;
         let (done, rest) = dst_image.split_at_mut(y * stride);
         let top = &done[(y - 1) * stride..];
@@ -237,101 +236,142 @@ fn decode_image(
 /// Rows reconstructed together by the wavefront; lane k holds row k.
 const WAVE_ROWS: usize = 16;
 
-/// Entropy decoder using BitReader for bit consumption
-struct FastDecoder<'a> {
-    reader: BitReader64<'a>,
+/// Loads 64 stream bits: four 16-bit little-endian words, the first one most
+/// significant.
+#[inline(always)]
+fn stream_bits(bytes: [u8; 8]) -> u64 {
+    let words = u64::from_le_bytes(bytes).rotate_left(32);
+    ((words << 16) & 0xFFFF_0000_FFFF_0000) | ((words >> 16) & 0x0000_FFFF_0000_FFFF)
 }
 
-impl<'a> FastDecoder<'a> {
-    fn new(data: &'a [u8]) -> Self {
+/// Symbol decoder after the C++ 4.1 `decompressFast`: a 64-bit container
+/// refilled with whole 16-bit words, and three lookups per refill in
+/// [`DECODE_TABLE_13`], each decoding up to three symbols.
+struct SymbolDecoder<'a> {
+    src: &'a [u8],
+    /// Bytes of `src` loaded into the container.
+    pos: usize,
+    /// Stream bits, first bit in bit 63. `num_bits` are loaded; the bits
+    /// below are zero or bits a later refill ORs in again unchanged.
+    container: u64,
+    num_bits: u32,
+}
+
+impl<'a> SymbolDecoder<'a> {
+    fn new(src: &'a [u8]) -> Self {
         Self {
-            reader: BitReader64::new(data),
+            src,
+            pos: 0,
+            container: 0,
+            num_bits: 0,
         }
     }
 
-    /// Decode one symbol (1 or 2 bytes) from the bit stream
+    /// Decodes into `buf` from `elem` while three full lookups fit before
+    /// `count` and eight stream bytes remain. Returns the new `elem`.
     #[inline(always)]
-    fn decode_one(&mut self, buf: &mut [u8], elem: usize) -> usize {
-        let p = self.reader.peek_refilled_bulk();
-
-        if p < 0xF800_0000 {
-            // Table lookup path (common case)
-            let index = (p >> 20) as usize;
-            let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-            self.reader.consume(entry.bits);
-            unsafe {
-                *buf.get_unchecked_mut(elem) = entry.symbols[0];
-                *buf.get_unchecked_mut(elem + 1) = entry.symbols[1];
+    fn decode_fast(&mut self, buf: &mut [u8], mut elem: usize, count: usize) -> usize {
+        assert!(buf.len() >= count + 16);
+        let (src, mut pos) = (self.src, self.pos);
+        let (mut container, mut num_bits) = (self.container, self.num_bits);
+        // Only the low six bits of `shift` count: whole entries are subtracted.
+        let mut shift = num_bits;
+        while elem + 9 <= count && src.len() - pos >= 8 {
+            let bytes: [u8; 8] = src[pos..pos + 8].try_into().expect("8 bytes");
+            container |= stream_bits(bytes) >> (shift & 63);
+            // Whole words that fit: at least 48 bits are loaded afterwards,
+            // enough for three 13-bit lookups.
+            let words = (63 - num_bits) >> 4;
+            pos += (words * 2) as usize;
+            num_bits += words * 16;
+            shift = num_bits;
+            for _ in 0..3 {
+                let entry = DECODE_TABLE_13.0[(container >> 51) as usize];
+                container <<= entry & 63;
+                shift = shift.wrapping_sub(entry);
+                num_bits -= entry & 63;
+                // SAFETY: elem + 9 <= count before the three lookups, each
+                // adds at most 3, and buf holds count + 16 bytes.
+                unsafe {
+                    buf.as_mut_ptr()
+                        .add(elem)
+                        .cast::<[u8; 4]>()
+                        .write_unaligned((entry >> 8).to_le_bytes());
+                }
+                elem += ((entry >> 6) & 3) as usize;
             }
-            entry.num_symbols as usize
-        } else {
-            // 13-bit escape code path
-            self.reader.consume(13);
-            unsafe {
-                *buf.get_unchecked_mut(elem) = ((p >> 19) & 0xFF) as u8;
-            }
-            1
         }
+        (self.pos, self.container, self.num_bits) = (pos, container, num_bits);
+        elem
     }
 
-    /// Decodes symbols into `buf` until it holds at least `width` of them, and
-    /// returns how many it holds (a symbol pair can end one past `width`).
-    /// `num_elems` and `prev_count` are the previous call's return value and
-    /// `width`: symbols it decoded past its `width` move to the front first.
+    /// Decodes one table entry near the end of the stream, checking that its
+    /// bits are there; when only the first symbol's are, decodes that alone.
+    /// Returns the symbols decoded, or `InvalidData` for a truncated stream.
+    #[inline(always)]
+    fn decode_checked(&mut self, buf: &mut [u8], elem: usize) -> Result<usize> {
+        if self.num_bits < 16 {
+            let left = self.src.len() - self.pos;
+            if left >= 4 {
+                let bytes: [u8; 4] = self.src[self.pos..self.pos + 4]
+                    .try_into()
+                    .expect("4 bytes");
+                let word = u32::from_le_bytes(bytes).rotate_left(16);
+                self.container |= u64::from(word) << (32 - self.num_bits);
+                (self.num_bits, self.pos) = (self.num_bits + 32, self.pos + 4);
+            } else if left >= 2 {
+                let word = u16::from_le_bytes([self.src[self.pos], self.src[self.pos + 1]]);
+                self.container |= u64::from(word) << (48 - self.num_bits);
+                (self.num_bits, self.pos) = (self.num_bits + 16, self.pos + 2);
+            }
+        }
+        let entry = DECODE_TABLE_13.0[(self.container >> 51) as usize];
+        let (bits, count) = (entry & 63, (entry >> 6) & 3);
+        if bits <= self.num_bits {
+            self.container <<= bits;
+            self.num_bits -= bits;
+            buf[elem..elem + 4].copy_from_slice(&(entry >> 8).to_le_bytes());
+            return Ok(count as usize);
+        }
+        // Escapes are always alone; otherwise the first symbol has a short
+        // code, whose length the pair table gives.
+        #[allow(clippy::cast_possible_truncation)]
+        let symbol = (entry >> 8) as u8;
+        let first_bits = if count == 1 {
+            bits
+        } else {
+            (get_compress_table_entry(usize::from(symbol)) & 0x3F) - 2
+        };
+        if first_bits > self.num_bits {
+            return Err(LlicError::InvalidData);
+        }
+        self.container <<= first_bits;
+        self.num_bits -= first_bits;
+        buf[elem] = symbol;
+        Ok(1)
+    }
+
+    /// Decodes symbols into `buf` until it holds at least `count`, and returns
+    /// how many it holds (an entry can end up to two past `count`).
+    /// `filled` and `prev_count` are the previous call's return value and
+    /// `count`: symbols it decoded past its `count` move to the front first.
     #[inline(always)]
     fn decompress_row(
         &mut self,
         buf: &mut [u8],
-        num_elems: usize,
+        filled: usize,
         prev_count: usize,
-        width: usize,
-    ) -> usize {
-        assert!(buf.len() >= width + 4);
-
-        let mut elem = num_elems;
-
-        // Handle carryover from previous row
-        if elem > prev_count {
-            buf.copy_within(prev_count..elem, 0);
+        count: usize,
+    ) -> Result<usize> {
+        assert!(buf.len() >= count + 16 && filled >= prev_count);
+        if filled > prev_count {
+            buf.copy_within(prev_count..filled, 0);
         }
-        elem = elem.saturating_sub(prev_count);
-
-        // Unrolled loop: decode 2 symbols at a time when possible
-        while elem + 4 <= width {
-            // First decode
-            let p1 = self.reader.peek_refilled_bulk();
-            self.decode(buf, &mut elem, p1);
-
-            // Second decode
-            let p2 = self.reader.peek_refilled_bulk();
-            self.decode(buf, &mut elem, p2)
+        let mut elem = self.decode_fast(buf, filled - prev_count, count);
+        while elem < count {
+            elem += self.decode_checked(buf, elem)?;
         }
-
-        // Handle remaining symbols
-        while elem < width {
-            elem += self.decode_one(buf, elem);
-        }
-
-        elem
-    }
-
-    fn decode(&mut self, buf: &mut [u8], elem: &mut usize, p1: u32) {
-        if p1 < 0xF800_0000 {
-            let index = (p1 >> 20) as usize;
-            let entry = unsafe { DECOMPRESS_TABLE.get_unchecked(index) };
-            self.reader.consume(entry.bits);
-            unsafe {
-                *buf.get_unchecked_mut(*elem) = entry.symbols[0];
-                *buf.get_unchecked_mut(*elem + 1) = entry.symbols[1];
-            }
-            *elem += entry.num_symbols as usize;
-        } else {
-            self.reader.consume(13);
-            unsafe {
-                *buf.get_unchecked_mut(*elem) = ((p1 >> 19) & 0xFF) as u8;
-            }
-            *elem += 1;
-        }
+        Ok(elem)
     }
 }
 
@@ -941,6 +981,28 @@ mod tests {
                     assert_eq!(wave[row.clone()], image[row], "{case} row {y}");
                 }
             }
+        }
+    }
+
+    /// A truncated entropy stream is an error, not zeros decoded past its end.
+    #[test]
+    fn truncated_entropy_stream_is_an_error() {
+        let (width, height) = (64u32, 48u32);
+        let image: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
+        let compressed =
+            crate::entropy_coder::compress(&image, width, height, width).expect("compress");
+        let mut out = vec![0u8; image.len()];
+        decompress(&compressed, width, height, width, &mut out).expect("full stream");
+        assert_eq!(out, image);
+        for len in [0, 4, compressed.len() / 2, compressed.len() - 8] {
+            assert!(
+                matches!(
+                    decompress(&compressed[..len], width, height, width, &mut out),
+                    Err(LlicError::InvalidData)
+                ),
+                "truncated to {len} of {}",
+                compressed.len()
+            );
         }
     }
 }

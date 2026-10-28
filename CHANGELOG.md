@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sixteen-row wavefront: in Node/V8, decoding 1.1-1.4x faster overall and
   1.7-2x in dynamic mode.
 - The scalar MED predictor in the decoder is branch-free, like the encoder's.
+- Entropy symbol decoding is a port of the C++ 4.1 decoder: a 13-bit lookup
+  table (built at compile time, identical to the C++ one) decodes up to three
+  symbols per lookup, three lookups per 64-bit refill, with a checked tail for
+  the stream end. Lossless entropy decoding is about 1.6x faster (0.57x ->
+  0.92x of C++ 4.1.1) and tile streams with compressed headers decode faster
+  than C++; WebAssembly gains about 1.3x. A truncated entropy stream is now
+  `InvalidData` instead of decoding zeros past its end.
 - Near the end of a tile stream, groups of blocks without payload kept the
   SIMD tile decoder's 16-byte reads from going past the stream end by falling
   back to per-block code for the rest of the image; they read nothing, so they
