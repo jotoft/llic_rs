@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-28
+
+Performance release: the C++ reference's 3.4-4.1 x86 work is ported, with
+SIMD128 versions for WebAssembly. Single-threaded on the test photos, encoding
+went from about 0.23x to 0.96-0.99x of C++ 4.1.1 and decoding to about 1.0x;
+WebAssembly builds are 3-4x faster. Streams are unchanged and byte-identical to
+C++. The x86 kernels are selected at run time, so default builds get them.
+
+### Added
+
+- `entropy_coder::compress_into`, `compress_dynamic_into` and
+  `max_compressed_size`, and `lossy::compress_tile_block_into` and
+  `lossy::tile_block_scratch_size`, to encode into a caller's buffer.
+
 ### Changed
 
 - Tile-based (lossy and lossless) coding is about 2.7x faster on x86-64 with
@@ -18,8 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was no faster.
 - Tile-based encoding writes straight into the caller's buffer when it has room
   for the worst case (as `compressed_buffer_size` does) instead of zeroing a
-  scratch buffer and copying the stream twice: about 15% faster. Added
-  `lossy::compress_tile_block_into` and `lossy::tile_block_scratch_size`.
+  scratch buffer and copying the stream twice: about 15% faster.
 - Entropy decoding reconstructs sixteen rows at once as an SSE wavefront on
   x86-64 (SSSE3/SSE4.1, detected at run time), as the C++ reference does: about
   1.5x for lossless entropy streams (2.5x in dynamic mode) and 1.2-1.6x for tile
@@ -33,8 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Streams are unchanged.
 - WebAssembly builds with `simd128` (the web demo) use a SIMD128 port of the
   grouped tile codec: in Node/V8, tile-based encoding is 3.2-3.7x and decoding
-  2.3-2.4x faster, fast-mode decoding 4-7.6 GP/s. `examples/wasm_bench` and
-  `scripts/wasm_bench.mjs` benchmark and test the WebAssembly build in Node.
+  2.3-2.4x faster, fast-mode decoding 4-7.6 GP/s. In the repository,
+  `examples/wasm_bench` and `scripts/wasm_bench.mjs` benchmark and test the
+  WebAssembly build in Node.
 - WebAssembly builds with `simd128` also reconstruct entropy-coded rows with
   the sixteen-row wavefront: in Node/V8, decoding 1.1-1.4x faster overall and
   1.7-2x in dynamic mode.
@@ -55,10 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now pinned with inline assembly; native builds encode at 0.99x of C++ 4.1.1.
 - Entropy-coded streams are encoded straight into the caller's buffer when it
   has room for the worst case (as `compressed_buffer_size` does), like tile
-  streams, instead of into a vector that is then copied. Added
-  `entropy_coder::compress_into`, `compress_dynamic_into` and
-  `max_compressed_size`; `compressed_buffer_size` grows by 4 bytes. Lossless
-  entropy encoding about 2% faster.
+  streams, instead of into a vector that is then copied;
+  `compressed_buffer_size` grows by 4 bytes. Lossless entropy encoding about 2%
+  faster.
 - Near the end of a tile stream, groups of blocks without payload kept the
   SIMD tile decoder's 16-byte reads from going past the stream end by falling
   back to per-block code for the rest of the image; they read nothing, so they
@@ -80,8 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coding (13 bits per pixel): on noisy images above about 44k pixels,
   `compress_gray8` with `Quality::LosslessEntropy` returned `InvalidArgument`.
   It is now sized like the C++ `llic_compressedBufferSize`.
-- The entropy encoder and its dynamic-mode row cost estimate read residual
-  pairs through misaligned `u16` pointers (undefined behaviour).
+- Misaligned pointer reads (undefined behaviour): the SSE2/SSE4.1 per-block
+  tile encoders read tile rows, and the entropy encoder and its dynamic-mode row
+  cost estimate read residual pairs, through misaligned `i32`/`u16` pointers.
 - Decoding a truncated tile stream panicked instead of returning
   `InvalidData`.
 - `lossy::compress_tile_block` did not check that the source buffer holds the
