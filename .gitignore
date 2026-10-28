@@ -37,3 +37,6 @@ perf.data*
 /demo/node_modules/
 /demo/dist/
 /demo/pkg
+
+# Camera originals for test_data/photos (kept local, see test_data/photos/README.md)
+test_data/raw/
