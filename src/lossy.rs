@@ -119,16 +119,16 @@ unsafe fn process_tile_sse41(
 ) -> (u8, u8, u8) {
     // Load 4 bytes per row and expand to 4x32-bit integers (matches C++ _MM_CVTEPU8_EPI32)
     let row0 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
-        *(src_data.as_ptr().add(row0_start) as *const i32),
+        (src_data.as_ptr().add(row0_start) as *const i32).read_unaligned(),
     ));
     let row1 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
-        *(src_data.as_ptr().add(row1_start) as *const i32),
+        (src_data.as_ptr().add(row1_start) as *const i32).read_unaligned(),
     ));
     let row2 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
-        *(src_data.as_ptr().add(row2_start) as *const i32),
+        (src_data.as_ptr().add(row2_start) as *const i32).read_unaligned(),
     ));
     let row3 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(
-        *(src_data.as_ptr().add(row3_start) as *const i32),
+        (src_data.as_ptr().add(row3_start) as *const i32).read_unaligned(),
     ));
 
     // Find min/max using 32-bit comparisons
@@ -383,10 +383,10 @@ unsafe fn process_tile_sse2(
 ) -> (u8, u8, u8) {
     // Load 4 bytes from each row into a single 128-bit register
     // We use u32 loads and combine them
-    let r0 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row0_start) as *const i32));
-    let r1 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row1_start) as *const i32));
-    let r2 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row2_start) as *const i32));
-    let r3 = _mm_cvtsi32_si128(*(src_data.as_ptr().add(row3_start) as *const i32));
+    let r0 = _mm_cvtsi32_si128((src_data.as_ptr().add(row0_start) as *const i32).read_unaligned());
+    let r1 = _mm_cvtsi32_si128((src_data.as_ptr().add(row1_start) as *const i32).read_unaligned());
+    let r2 = _mm_cvtsi32_si128((src_data.as_ptr().add(row2_start) as *const i32).read_unaligned());
+    let r3 = _mm_cvtsi32_si128((src_data.as_ptr().add(row3_start) as *const i32).read_unaligned());
 
     // Combine: [r0 | r1 | r2 | r3] in low 16 bytes
     let r01 = _mm_unpacklo_epi32(r0, r1);
