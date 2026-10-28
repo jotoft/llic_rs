@@ -35,7 +35,9 @@ decoded by this implementation: v5 (current, C++ 3.5.0 and later), v4 and v3
 (legacy). v3 and v4 differ only in the fixed header. v5 has the v4 header and
 differs only in where a tile block stores a compressed min/dist header (see
 [Header Compression](#header-compression)). The block-size table and all other
-payloads are identical across versions.
+payloads are identical across versions. v2 (C++ 2.0.x) is also decoded: it is
+v3 with a different row split between blocks (see [Task
+Splitting](#task-splitting)).
 
 #### Format v4/v5 Header (4 bytes)
 
@@ -216,7 +218,7 @@ Quantized indices are packed efficiently based on bit count:
 
 1. Image dimensions must be non-zero multiples of 4
 2. Only 8-bit grayscale images are supported
-3. Maximum supported format version is 5; the decoder accepts versions 3 to 5
+3. Maximum supported format version is 5; the decoder accepts versions 2 to 5
 4. Multi-threaded compression splits image into horizontal strips
 
 ## Implementation Notes
@@ -228,12 +230,22 @@ The algorithm determines quantization buckets dynamically:
 - Tests 1, 2, 4, 8, 16, 32, 64, or 256 buckets
 - Selects minimum buckets where: ceil(range/buckets) <= error_limit + 1
 
-### Task Splitting (Format v3+)
+### Task Splitting
 
-For multi-threaded processing:
+For multi-threaded processing the image is split into horizontal strips, one
+per block. Format v3 and later:
 
 - Base block size = (height / num_threads) / 4 * 4
 - Last block gets remainder pixels
+
+Format v2 (C++ 2.0.x; otherwise identical to v3) rounds up instead:
+
+- Block size = height / num_threads, rounded up to a multiple of 4
+- Later blocks shrink (to zero if needed) so the total does not exceed the
+  height. This can leave rows unassigned (24 rows in 5 blocks covers 20), which
+  is why v3 changed the split; such streams are invalid.
+
+Formats v0 and v1 also use an older bucket-size algorithm and are not supported.
 
 ### Decoding Process
 

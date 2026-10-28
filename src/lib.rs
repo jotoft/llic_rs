@@ -119,15 +119,13 @@ impl LlicContext {
         let version = src_data[0];
         let num_blocks = src_data[1];
 
-        // Support format versions 3 to 5.
+        // Support format versions 2 to 5.
         //
-        // Legacy v0/v1/v2 share v3's on-disk header layout but select different
-        // internal algorithms in the C++ reference (older task splitters and the
-        // pre-v3 bucket-size algorithm `findBucketsNeededOld`). This port only
-        // implements the v3+ behavior, so a genuine v1/v2 entropy stream is not
-        // guaranteed to decode correctly; we reject it cleanly rather than risk a
-        // silent misdecode.
-        if !(3..=5).contains(&version) {
+        // v2 (C++ 2.0.x) is v3 with a different row split between chunks (see
+        // `chunk_rows`). v0/v1 share the layout too but also use the pre-2.0
+        // bucket-size algorithm (`findBucketsNeededOld`), which this port does
+        // not implement, so we reject them rather than risk a silent misdecode.
+        if !(2..=5).contains(&version) {
             return Err(LlicError::UnsupportedFormat);
         }
 
@@ -236,11 +234,6 @@ impl LlicContext {
             // Multiple blocks with data - image is divided among threads
             // Each thread handles a horizontal stripe of the image
 
-            // Calculate rows per block using the same logic as the C++ code
-            let base_block_size = (self.height as usize / num_blocks as usize) / 4 * 4;
-            let last_block_size =
-                self.height as usize - base_block_size * (num_blocks as usize - 1);
-
             // Calculate block positions
             let mut block_positions = Vec::new();
             let mut current_pos = pos;
@@ -257,11 +250,12 @@ impl LlicContext {
                     continue;
                 }
 
-                let block_rows = if block_idx == num_blocks as usize - 1 {
-                    last_block_size
-                } else {
-                    base_block_size
-                };
+                let block_rows = chunk_rows(
+                    version,
+                    self.height as usize,
+                    num_blocks as usize,
+                    block_idx,
+                );
 
                 if block_rows == 0 {
                     continue;
@@ -420,6 +414,27 @@ impl LlicContext {
                 write_v4_block(&compressed, format_version, !use_entropy, mode, dst_data)
             }
             FormatVersion::V3 => write_v3_block(&compressed, use_entropy, dst_data),
+        }
+    }
+}
+
+/// Rows in chunk `index` of `num_chunks`, split as the C++ reference does.
+///
+/// - v2 (`computeTaskSplitV1`): `height / num_chunks` rounded up to a multiple
+///   of 4; the last chunks shrink (to zero if needed) so the total fits.
+///   76 rows in 3 chunks: 28, 28, 20.
+/// - v3+ (`computeTaskSplitV2`): rounded down; the last chunk takes the rest.
+///   76 rows in 3 chunks: 24, 24, 28.
+fn chunk_rows(version: u8, height: usize, num_chunks: usize, index: usize) -> usize {
+    if version <= 2 {
+        let lines = (height / num_chunks).next_multiple_of(4);
+        lines.saturating_sub(((index + 1) * lines).saturating_sub(height))
+    } else {
+        let base = (height / num_chunks) / 4 * 4;
+        if index + 1 == num_chunks {
+            height - base * (num_chunks - 1)
+        } else {
+            base
         }
     }
 }
@@ -1218,5 +1233,32 @@ mod tests {
         let mut decoded = vec![0u8; (width * height) as usize];
         ctx.decompress_gray8(&buf[..n], &mut decoded).unwrap();
         assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn chunk_rows_match_cpp_task_splitters() {
+        let split = |version, height, chunks| -> Vec<usize> {
+            (0..chunks)
+                .map(|i| chunk_rows(version, height, chunks, i))
+                .collect()
+        };
+        assert_eq!(split(2, 76, 3), [28, 28, 20]);
+        assert_eq!(split(3, 76, 3), [24, 24, 28]);
+        assert_eq!(split(5, 76, 3), [24, 24, 28]);
+        // v2 rounds up, so later chunks can shrink to nothing.
+        assert_eq!(split(2, 8, 5), [4, 4, 0, 0, 0]);
+        assert_eq!(split(2, 44, 4), [12, 12, 12, 8]);
+        // v2 can also leave rows unassigned, which is why C++ 2.1 replaced it:
+        // 24 rows in 5 chunks covers only 20. Such streams fail the row check.
+        assert_eq!(split(2, 24, 5), [4, 4, 4, 4, 4]);
+        for height in (4..=200).step_by(4) {
+            // Encoders give every chunk at least one row of blocks.
+            for chunks in 1..=(height / 4).min(16) {
+                let v2: usize = split(2, height, chunks).iter().sum();
+                let v3: usize = split(3, height, chunks).iter().sum();
+                assert!(v2 <= height, "v2 {height} rows in {chunks}");
+                assert_eq!(v3, height, "v3 {height} rows in {chunks}");
+            }
+        }
     }
 }

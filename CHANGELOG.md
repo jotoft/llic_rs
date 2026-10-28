@@ -18,8 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In v5, lossless default- and dynamic-mode tile streams choose each block's
   header values nearest the block above, as the C++ encoder does, which makes
   them 2-3% smaller. Decoders need no change for this.
+- Format version 2 decoding (C++ 2.0.x). It is v3 with a different row split
+  between chunks, so only multi-chunk streams needed a change. Formats 0 and 1
+  are still rejected.
 - Compatibility tests against the C++ reference's decoder vectors
-  (`test_data/vectors`, from every C++ release since 2.0.0): all format 3-5
+  (`test_data/vectors`, from every C++ release since 2.0.0): all format 2-5
   streams decode to the expected images, and our single-chunk v4 and v5 output
   matches the C++ encoder byte for byte.
 

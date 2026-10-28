@@ -104,10 +104,10 @@ fn manifest_covers_formats_2_to_5() {
 }
 
 #[test]
-fn decodes_cpp_vectors_from_format_3_to_5() {
+fn decodes_cpp_vectors_from_format_2_to_5() {
     let mut failures = Vec::new();
     let mut decoded = 0;
-    for vector in load_manifest().iter().filter(|v| v.format >= 3) {
+    for vector in &load_manifest() {
         let (width, height) = input_dimensions(&vector.input);
         let stream = fs::read(vectors_dir().join(&vector.file)).expect("read stream");
         let ctx = LlicContext::new(width, height, width, Some(1)).expect("context");
@@ -143,7 +143,7 @@ fn decodes_cpp_vectors_from_format_3_to_5() {
         }
         decoded += 1;
     }
-    assert!(decoded > 0);
+    assert_eq!(decoded, 227, "every vector in the manifest");
     assert!(
         failures.is_empty(),
         "{} of {decoded} vectors failed:\n{}",
@@ -152,20 +152,27 @@ fn decodes_cpp_vectors_from_format_3_to_5() {
     );
 }
 
+/// Formats 0 and 1 use the pre-2.0 bucket-size algorithm, which we don't
+/// implement; they must be rejected, not misdecoded.
 #[test]
-fn rejects_format_2_vectors() {
-    for vector in load_manifest().iter().filter(|v| v.format == 2) {
-        let (width, height) = input_dimensions(&vector.input);
-        let stream = fs::read(vectors_dir().join(&vector.file)).expect("read stream");
-        let ctx = LlicContext::new(width, height, width, Some(1)).expect("context");
+fn rejects_formats_0_and_1() {
+    let vector = load_manifest()
+        .into_iter()
+        .find(|v| v.format == 2)
+        .expect("a format 2 vector");
+    let (width, height) = input_dimensions(&vector.input);
+    let stream = fs::read(vectors_dir().join(&vector.file)).expect("read stream");
+    let ctx = LlicContext::new(width, height, width, Some(1)).expect("context");
+    for version in [0u8, 1] {
+        let mut old = stream.clone();
+        old[0] = version;
         let mut image = vec![0u8; (width * height) as usize];
         assert!(
             matches!(
-                ctx.decompress_gray8(&stream, &mut image),
+                ctx.decompress_gray8(&old, &mut image),
                 Err(LlicError::UnsupportedFormat)
             ),
-            "{} should be rejected",
-            vector.file
+            "version {version} should be rejected"
         );
     }
 }

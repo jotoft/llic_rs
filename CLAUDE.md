@@ -9,7 +9,7 @@ LLIC (Low Latency Image Codec) is a fast lossy and lossless grayscale image comp
 **Key constraints:**
 - Only 8-bit grayscale images supported
 - Image dimensions must be non-zero multiples of 4
-- Maximum format version: 5 (decodes v3–v5, writes v5 by default)
+- Maximum format version: 5 (decodes v2–v5, writes v5 by default)
 
 ## Build Commands
 
