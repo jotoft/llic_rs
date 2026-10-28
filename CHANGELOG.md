@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tile-based (lossy and lossless) coding is about 2.7x faster on x86-64 with
+  SSSE3 and SSE4.1, detected at run time, so default builds get it too. A port
+  of the C++ reference's SSE tile codec (3.4+): the encoder reduces sixteen
+  blocks at once and packs every bit width without branching, and the decoder
+  unpacks four blocks at once. Fast-mode decoding now matches or beats C++
+  4.1.1; streams are unchanged. The AVX2 two-tile encoder path is gone, as it
+  was no faster.
+
+### Fixed
+
+- Decoding a truncated tile stream panicked instead of returning
+  `InvalidData`.
+- `lossy::compress_tile_block` did not check that the source buffer holds the
+  image; it now returns `InvalidArgument`.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added

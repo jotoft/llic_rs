@@ -8,6 +8,9 @@ use std::borrow::Cow;
 use crate::{LlicError, Result};
 
 #[cfg(target_arch = "x86_64")]
+mod tile_sse;
+
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 /// Bucket LUT entry: (bits, bucket_size)
@@ -186,183 +189,6 @@ unsafe fn process_tile_sse41(
     }
 
     (min_val, dist, bits)
-}
-
-/// AVX2 dual-tile processing: process 2 adjacent 4x4 tiles simultaneously.
-/// This loads 8 bytes per row (covering 2 tiles) and uses 256-bit operations.
-/// AVX2 min/max operations work per 128-bit lane, so both tiles are computed correctly.
-/// Returns ((min_a, dist_a, bits_a), (min_b, dist_b, bits_b))
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn process_dual_tiles_avx2(
-    src_data: &[u8],
-    row0_start: usize,
-    row1_start: usize,
-    row2_start: usize,
-    row3_start: usize,
-    bucket_lut: &[BucketLutEntry; 256],
-    result_a: &mut [u32; 16],
-    result_b: &mut [u32; 16],
-) -> ((u8, u8, u8), (u8, u8, u8)) {
-    // Load 8 bytes per row: [a0 a1 a2 a3 b0 b1 b2 b3]
-    // Expand to 8x32-bit: low lane = tile A's 4 pixels, high lane = tile B's 4 pixels
-    let row0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-        src_data.as_ptr().add(row0_start) as *const __m128i
-    ));
-    let row1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-        src_data.as_ptr().add(row1_start) as *const __m128i
-    ));
-    let row2 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-        src_data.as_ptr().add(row2_start) as *const __m128i
-    ));
-    let row3 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-        src_data.as_ptr().add(row3_start) as *const __m128i
-    ));
-
-    // Find min/max - AVX2 operates per 128-bit lane, so each tile computed separately
-    let min01 = _mm256_min_epi32(row0, row1);
-    let min23 = _mm256_min_epi32(row2, row3);
-    let max01 = _mm256_max_epi32(row0, row1);
-    let max23 = _mm256_max_epi32(row2, row3);
-
-    let min4 = _mm256_min_epi32(min01, min23);
-    let max4 = _mm256_max_epi32(max01, max23);
-
-    // Horizontal reduction within each 128-bit lane
-    let min2 = _mm256_min_epi32(min4, _mm256_shuffle_epi32(min4, 0b00_00_11_10));
-    let min1 = _mm256_min_epi32(min2, _mm256_shuffle_epi32(min2, 0b00_00_00_01));
-
-    let max2 = _mm256_max_epi32(max4, _mm256_shuffle_epi32(max4, 0b00_00_11_10));
-    let max1 = _mm256_max_epi32(max2, _mm256_shuffle_epi32(max2, 0b00_00_00_01));
-
-    // Extract min/max for each tile
-    let min_a = _mm256_extract_epi32(min1, 0) as u8;
-    let max_a = _mm256_extract_epi32(max1, 0) as u8;
-    let min_b = _mm256_extract_epi32(min1, 4) as u8; // High lane, element 0
-    let max_b = _mm256_extract_epi32(max1, 4) as u8;
-
-    let dist_a = max_a - min_a;
-    let dist_b = max_b - min_b;
-
-    let (bits_a, bucket_size_a) = bucket_lut[dist_a as usize];
-    let (bits_b, bucket_size_b) = bucket_lut[dist_b as usize];
-
-    // Create broadcast vectors for both tiles: low lane = min_a, high lane = min_b
-    let v_min = _mm256_set_epi32(
-        min_b as i32,
-        min_b as i32,
-        min_b as i32,
-        min_b as i32,
-        min_a as i32,
-        min_a as i32,
-        min_a as i32,
-        min_a as i32,
-    );
-
-    // Subtract min from all pixels (both tiles at once)
-    let res0 = _mm256_sub_epi32(row0, v_min);
-    let res1 = _mm256_sub_epi32(row1, v_min);
-    let res2 = _mm256_sub_epi32(row2, v_min);
-    let res3 = _mm256_sub_epi32(row3, v_min);
-
-    // If both tiles need division by the same bucket_size, we can do it in AVX2
-    // Otherwise fall back to per-tile processing
-    if bucket_size_a == bucket_size_b && bucket_size_a > 1 {
-        let v_rcp = _mm256_set1_ps(1.0f32 / bucket_size_a as f32);
-        let res0 = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(res0), v_rcp));
-        let res1 = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(res1), v_rcp));
-        let res2 = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(res2), v_rcp));
-        let res3 = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(res3), v_rcp));
-
-        // Store both tiles
-        if bits_a > 0 {
-            _mm_storeu_si128(
-                result_a.as_mut_ptr().add(0) as *mut __m128i,
-                _mm256_castsi256_si128(res0),
-            );
-            _mm_storeu_si128(
-                result_a.as_mut_ptr().add(4) as *mut __m128i,
-                _mm256_castsi256_si128(res1),
-            );
-            _mm_storeu_si128(
-                result_a.as_mut_ptr().add(8) as *mut __m128i,
-                _mm256_castsi256_si128(res2),
-            );
-            _mm_storeu_si128(
-                result_a.as_mut_ptr().add(12) as *mut __m128i,
-                _mm256_castsi256_si128(res3),
-            );
-        }
-        if bits_b > 0 {
-            _mm_storeu_si128(
-                result_b.as_mut_ptr().add(0) as *mut __m128i,
-                _mm256_extracti128_si256(res0, 1),
-            );
-            _mm_storeu_si128(
-                result_b.as_mut_ptr().add(4) as *mut __m128i,
-                _mm256_extracti128_si256(res1, 1),
-            );
-            _mm_storeu_si128(
-                result_b.as_mut_ptr().add(8) as *mut __m128i,
-                _mm256_extracti128_si256(res2, 1),
-            );
-            _mm_storeu_si128(
-                result_b.as_mut_ptr().add(12) as *mut __m128i,
-                _mm256_extracti128_si256(res3, 1),
-            );
-        }
-    } else {
-        // Different bucket sizes - process separately
-        if bits_a > 0 {
-            let res0_a = _mm256_castsi256_si128(res0);
-            let res1_a = _mm256_castsi256_si128(res1);
-            let res2_a = _mm256_castsi256_si128(res2);
-            let res3_a = _mm256_castsi256_si128(res3);
-
-            if bucket_size_a > 1 {
-                let v_rcp = _mm_set1_ps(1.0f32 / bucket_size_a as f32);
-                let res0_a = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res0_a), v_rcp));
-                let res1_a = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res1_a), v_rcp));
-                let res2_a = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res2_a), v_rcp));
-                let res3_a = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res3_a), v_rcp));
-                _mm_storeu_si128(result_a.as_mut_ptr().add(0) as *mut __m128i, res0_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(4) as *mut __m128i, res1_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(8) as *mut __m128i, res2_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(12) as *mut __m128i, res3_a);
-            } else {
-                _mm_storeu_si128(result_a.as_mut_ptr().add(0) as *mut __m128i, res0_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(4) as *mut __m128i, res1_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(8) as *mut __m128i, res2_a);
-                _mm_storeu_si128(result_a.as_mut_ptr().add(12) as *mut __m128i, res3_a);
-            }
-        }
-        if bits_b > 0 {
-            let res0_b = _mm256_extracti128_si256(res0, 1);
-            let res1_b = _mm256_extracti128_si256(res1, 1);
-            let res2_b = _mm256_extracti128_si256(res2, 1);
-            let res3_b = _mm256_extracti128_si256(res3, 1);
-
-            if bucket_size_b > 1 {
-                let v_rcp = _mm_set1_ps(1.0f32 / bucket_size_b as f32);
-                let res0_b = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res0_b), v_rcp));
-                let res1_b = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res1_b), v_rcp));
-                let res2_b = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res2_b), v_rcp));
-                let res3_b = _mm_cvttps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(res3_b), v_rcp));
-                _mm_storeu_si128(result_b.as_mut_ptr().add(0) as *mut __m128i, res0_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(4) as *mut __m128i, res1_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(8) as *mut __m128i, res2_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(12) as *mut __m128i, res3_b);
-            } else {
-                _mm_storeu_si128(result_b.as_mut_ptr().add(0) as *mut __m128i, res0_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(4) as *mut __m128i, res1_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(8) as *mut __m128i, res2_b);
-                _mm_storeu_si128(result_b.as_mut_ptr().add(12) as *mut __m128i, res3_b);
-            }
-        }
-    }
-
-    ((min_a, dist_a, bits_a), (min_b, dist_b, bits_b))
 }
 
 /// SSE2-only fallback (for systems without SSE4.1)
@@ -1329,6 +1155,124 @@ fn rebase_lossless_block<T: Copy + From<u8> + std::ops::AddAssign>(
     (new_min, new_dist)
 }
 
+/// Applies the lossless header selection to an encoded block when `above` (the
+/// header values of the block above) is given.
+#[inline(always)]
+fn select_against_above<T: Copy + From<u8> + std::ops::AddAssign>(
+    min: u8,
+    dist: u8,
+    above: Option<(u8, u8)>,
+    residuals: &mut [T; 16],
+) -> (u8, u8) {
+    match above {
+        Some((top_min, top_dist)) => rebase_lossless_block(min, dist, top_min, top_dist, residuals),
+        None => (min, dist),
+    }
+}
+
+/// Encodes one 4x4 block (rows starting at `starts`) with the per-block code
+/// for the compiled target features. With `above`, applies the lossless header
+/// selection. Returns the block's min and dist and the bytes written to `dst`.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+fn encode_single_tile(
+    src: &[u8],
+    starts: [usize; 4],
+    lut: &[BucketLutEntry; 256],
+    above: Option<(u8, u8)>,
+    dst: &mut [u8],
+) -> (u8, u8, usize) {
+    let mut result = [0u32; 16];
+    assert!(starts.iter().all(|&start| start + 4 <= src.len()));
+    // SAFETY: SSE4.1 is enabled at compile time and every row read is in bounds.
+    let (min, dist, bits) = unsafe {
+        process_tile_sse41(
+            src,
+            starts[0],
+            starts[1],
+            starts[2],
+            starts[3],
+            lut,
+            &mut result,
+        )
+    };
+    let (min, dist) = select_against_above(min, dist, above, &mut result);
+    // SAFETY: as above; pack_pixels_u32 writes at most 16 bytes, checked here.
+    let written = if bits > 0 {
+        assert!(dst.len() >= 16);
+        unsafe { pack_pixels_u32(&result, bits, dst) }
+    } else {
+        0
+    };
+    (min, dist, written)
+}
+
+/// See the SSE4.1 variant.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse2",
+    not(target_feature = "sse4.1")
+))]
+#[inline(always)]
+fn encode_single_tile(
+    src: &[u8],
+    starts: [usize; 4],
+    lut: &[BucketLutEntry; 256],
+    above: Option<(u8, u8)>,
+    dst: &mut [u8],
+) -> (u8, u8, usize) {
+    let mut indices = [0u8; 16];
+    assert!(starts.iter().all(|&start| start + 4 <= src.len()));
+    // SAFETY: SSE2 is enabled at compile time and every row read is in bounds.
+    let (min, dist, bits) = unsafe {
+        process_tile_sse2(
+            src,
+            starts[0],
+            starts[1],
+            starts[2],
+            starts[3],
+            lut,
+            &mut indices,
+        )
+    };
+    let (min, dist) = select_against_above(min, dist, above, &mut indices);
+    let written = if bits > 0 {
+        pack_pixels(&indices, bits, dst)
+    } else {
+        0
+    };
+    (min, dist, written)
+}
+
+/// See the SSE4.1 variant.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+#[inline(always)]
+fn encode_single_tile(
+    src: &[u8],
+    starts: [usize; 4],
+    lut: &[BucketLutEntry; 256],
+    above: Option<(u8, u8)>,
+    dst: &mut [u8],
+) -> (u8, u8, usize) {
+    let mut indices = [0u8; 16];
+    let (min, dist, bits) = process_tile_scalar(
+        src,
+        starts[0],
+        starts[1],
+        starts[2],
+        starts[3],
+        lut,
+        &mut indices,
+    );
+    let (min, dist) = select_against_above(min, dist, above, &mut indices);
+    let written = if bits > 0 {
+        pack_pixels(&indices, bits, dst)
+    } else {
+        0
+    };
+    (min, dist, written)
+}
+
 /// Compress a single block of grayscale image data using tile-based lossy compression.
 ///
 /// This produces the same format as the C++ encoder's `doCompressTileBased` function.
@@ -1359,6 +1303,9 @@ pub fn compress_tile_block(
     if !width.is_multiple_of(4) || !rows.is_multiple_of(4) {
         return Err(LlicError::ImageDimensions);
     }
+    if rows > 0 && src_data.len() < ((rows - 1) * bytes_per_line + width) as usize {
+        return Err(LlicError::InvalidArgument);
+    }
 
     let num_tiles = ((width / 4) * (rows / 4)) as usize;
     let blocks_per_row = (width / 4) as usize;
@@ -1384,284 +1331,54 @@ pub fn compress_tile_block(
     let (min_stream, dist_stream) = header_and_streams.split_at_mut(num_tiles);
     let mut pixel_pos = 0usize;
 
-    // Process each 4x4 block - use AVX2 dual-tile path when available
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        let mut result_a = [0u32; 16];
-        let mut result_b = [0u32; 16];
-        let tiles_per_row = width / 4;
-
-        for y in (0..rows).step_by(4) {
-            let mut x = 0u32;
-
-            // Process pairs of tiles with AVX2
-            while x + 8 <= width {
-                let row0_start = (y * bytes_per_line + x) as usize;
-                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
-                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
-                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
-
-                let ((min_a, dist_a, bits_a), (min_b, dist_b, bits_b)) = unsafe {
-                    process_dual_tiles_avx2(
-                        src_data,
-                        row0_start,
-                        row1_start,
-                        row2_start,
-                        row3_start,
-                        &bucket_lut,
-                        &mut result_a,
-                        &mut result_b,
-                    )
-                };
-
-                let block_idx_a = ((y / 4) * tiles_per_row + (x / 4)) as usize;
-                let block_idx_b = block_idx_a + 1;
-                let (min_a, dist_a, min_b, dist_b) = if select_header && y > 0 {
-                    let (above_a, above_b) =
-                        (block_idx_a - blocks_per_row, block_idx_b - blocks_per_row);
-                    let (min_a, dist_a) = rebase_lossless_block(
-                        min_a,
-                        dist_a,
-                        min_stream[above_a],
-                        dist_stream[above_a],
-                        &mut result_a,
-                    );
-                    let (min_b, dist_b) = rebase_lossless_block(
-                        min_b,
-                        dist_b,
-                        min_stream[above_b],
-                        dist_stream[above_b],
-                        &mut result_b,
-                    );
-                    (min_a, dist_a, min_b, dist_b)
-                } else {
-                    (min_a, dist_a, min_b, dist_b)
-                };
-
-                // Store tile A
-                min_stream[block_idx_a] = min_a;
-                dist_stream[block_idx_a] = dist_a;
-                if bits_a > 0 {
-                    let bytes_written = unsafe {
-                        pack_pixels_u32(&result_a, bits_a, &mut pixel_stream[pixel_pos..])
-                    };
-                    pixel_pos += bytes_written;
-                }
-
-                // Store tile B
-                min_stream[block_idx_b] = min_b;
-                dist_stream[block_idx_b] = dist_b;
-                if bits_b > 0 {
-                    let bytes_written = unsafe {
-                        pack_pixels_u32(&result_b, bits_b, &mut pixel_stream[pixel_pos..])
-                    };
-                    pixel_pos += bytes_written;
-                }
-
-                x += 8;
-            }
-
-            // Handle remaining single tile if width not multiple of 8
-            while x < width {
-                let row0_start = (y * bytes_per_line + x) as usize;
-                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
-                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
-                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
-
-                let (min_val, dist, bits) = unsafe {
-                    process_tile_sse41(
-                        src_data,
-                        row0_start,
-                        row1_start,
-                        row2_start,
-                        row3_start,
-                        &bucket_lut,
-                        &mut result_a,
-                    )
-                };
-
-                let block_idx = ((y / 4) * tiles_per_row + (x / 4)) as usize;
-                let (min_val, dist) = if select_header && y > 0 {
-                    let above = block_idx - blocks_per_row;
-                    rebase_lossless_block(
-                        min_val,
-                        dist,
-                        min_stream[above],
-                        dist_stream[above],
-                        &mut result_a,
-                    )
-                } else {
-                    (min_val, dist)
-                };
-                min_stream[block_idx] = min_val;
-                dist_stream[block_idx] = dist;
-
-                if bits > 0 {
-                    let bytes_written =
-                        unsafe { pack_pixels_u32(&result_a, bits, &mut pixel_stream[pixel_pos..]) };
-                    pixel_pos += bytes_written;
-                }
-
-                x += 4;
-            }
-        }
-    }
-
-    // SSE4.1 fallback (no AVX2)
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "sse4.1",
-        not(target_feature = "avx2")
-    ))]
-    {
-        // 32-bit aligned result buffer (matches C++ approach for efficient SIMD packing)
-        let mut result = [0u32; 16];
-
-        for y in (0..rows).step_by(4) {
-            for x in (0..width).step_by(4) {
-                let row0_start = (y * bytes_per_line + x) as usize;
-                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
-                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
-                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
-
-                // SAFETY: We've verified dimensions are multiples of 4
-                let (min_val, dist, bits) = unsafe {
-                    process_tile_sse41(
-                        src_data,
-                        row0_start,
-                        row1_start,
-                        row2_start,
-                        row3_start,
-                        &bucket_lut,
-                        &mut result,
-                    )
-                };
-
-                let block_idx = ((y * width) >> 4) + (x >> 2);
-                let block_idx = block_idx as usize;
-
-                let (min_val, dist) = if select_header && y > 0 {
-                    let above = block_idx - blocks_per_row;
-                    rebase_lossless_block(
-                        min_val,
-                        dist,
-                        min_stream[above],
-                        dist_stream[above],
-                        &mut result,
-                    )
-                } else {
-                    (min_val, dist)
-                };
-                min_stream[block_idx] = min_val;
-                dist_stream[block_idx] = dist;
-
-                if bits > 0 {
-                    let bytes_written =
-                        unsafe { pack_pixels_u32(&result, bits, &mut pixel_stream[pixel_pos..]) };
-                    pixel_pos += bytes_written;
-                }
-            }
-        }
-    }
-
-    // SSE2-only fallback (no SSE4.1)
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "sse2",
-        not(target_feature = "sse4.1")
-    ))]
-    {
-        let mut indices = [0u8; 16];
-        for y in (0..rows).step_by(4) {
-            for x in (0..width).step_by(4) {
-                let row0_start = (y * bytes_per_line + x) as usize;
-                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
-                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
-                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
-
-                // SAFETY: We've verified dimensions are multiples of 4
-                let (min_val, dist, bits) = unsafe {
-                    process_tile_sse2(
-                        src_data,
-                        row0_start,
-                        row1_start,
-                        row2_start,
-                        row3_start,
-                        &bucket_lut,
-                        &mut indices,
-                    )
-                };
-
-                let block_idx = ((y * width) >> 4) + (x >> 2);
-                let block_idx = block_idx as usize;
-
-                let (min_val, dist) = if select_header && y > 0 {
-                    let above = block_idx - blocks_per_row;
-                    rebase_lossless_block(
-                        min_val,
-                        dist,
-                        min_stream[above],
-                        dist_stream[above],
-                        &mut indices,
-                    )
-                } else {
-                    (min_val, dist)
-                };
-                min_stream[block_idx] = min_val;
-                dist_stream[block_idx] = dist;
-
-                if bits > 0 {
-                    let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
-                    pixel_pos += bytes_written;
-                }
-            }
-        }
-    }
-
-    // Scalar fallback (no SIMD)
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
-    {
-        let mut indices = [0u8; 16];
-        for y in (0..rows).step_by(4) {
-            for x in (0..width).step_by(4) {
-                let row0_start = (y * bytes_per_line + x) as usize;
-                let row1_start = ((y + 1) * bytes_per_line + x) as usize;
-                let row2_start = ((y + 2) * bytes_per_line + x) as usize;
-                let row3_start = ((y + 3) * bytes_per_line + x) as usize;
-
-                let (min_val, dist, bits) = process_tile_scalar(
+    #[cfg(target_arch = "x86_64")]
+    let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(&bucket_lut));
+    for y in (0..rows).step_by(4) {
+        let first_block = (y / 4 * (width / 4)) as usize;
+        let select_row = select_header && y > 0;
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut x = 0u32;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(lut) = &sse_lut {
+            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
+            let (end, written) = unsafe {
+                tile_sse::encode_row_groups(
                     src_data,
-                    row0_start,
-                    row1_start,
-                    row2_start,
-                    row3_start,
-                    &bucket_lut,
-                    &mut indices,
-                );
-
-                let block_idx = ((y * width) >> 4) + (x >> 2);
-                let block_idx = block_idx as usize;
-
-                let (min_val, dist) = if select_header && y > 0 {
-                    let above = block_idx - blocks_per_row;
-                    rebase_lossless_block(
-                        min_val,
-                        dist,
-                        min_stream[above],
-                        dist_stream[above],
-                        &mut indices,
-                    )
-                } else {
-                    (min_val, dist)
-                };
-                min_stream[block_idx] = min_val;
-                dist_stream[block_idx] = dist;
-
-                if bits > 0 {
-                    let bytes_written = pack_pixels(&indices, bits, &mut pixel_stream[pixel_pos..]);
-                    pixel_pos += bytes_written;
-                }
+                    (y * bytes_per_line) as usize,
+                    bytes_per_line as usize,
+                    width as usize,
+                    first_block,
+                    select_row,
+                    min_stream,
+                    dist_stream,
+                    error_limit,
+                    lut,
+                    &mut pixel_stream[pixel_pos..],
+                )
+            };
+            #[allow(clippy::cast_possible_truncation)] // at most the width
+            {
+                x = end as u32;
             }
+            pixel_pos += written;
+        }
+        for x in (x..width).step_by(4) {
+            let block_idx = first_block + (x / 4) as usize;
+            let above = select_row.then(|| {
+                let above = block_idx - blocks_per_row;
+                (min_stream[above], dist_stream[above])
+            });
+            let starts = [0, 1, 2, 3].map(|r| ((y + r) * bytes_per_line + x) as usize);
+            let (min_val, dist, written) = encode_single_tile(
+                src_data,
+                starts,
+                &bucket_lut,
+                above,
+                &mut pixel_stream[pixel_pos..],
+            );
+            min_stream[block_idx] = min_val;
+            dist_stream[block_idx] = dist;
+            pixel_pos += written;
         }
     }
 
@@ -1938,57 +1655,97 @@ fn decompress_tiles(
     is_lossless: bool,
     dst_graymap: &mut [u8],
 ) -> Result<()> {
+    let stride = bytes_per_line as usize;
+    if rows > 0 && dst_graymap.len() < (rows as usize - 1) * stride + width as usize {
+        return Err(LlicError::InvalidArgument);
+    }
+    let num_blocks = ((width / 4) * (rows / 4)) as usize;
+    if min_stream.len() < num_blocks || dist_stream.len() < num_blocks {
+        return Err(LlicError::InvalidData);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let sse_lut = tile_sse::available().then(|| tile_sse::packed_lut(bucket_lut));
     let mut pixel_pos = 0usize;
-    let mut pixels = [0u8; 16];
-
     for y in (0..rows).step_by(4) {
-        for x in (0..width).step_by(4) {
-            let block_idx = ((y * width) >> 4) + (x >> 2);
-            let block_idx = block_idx as usize;
-
-            let min_val = min_stream[block_idx];
-            let dist = dist_stream[block_idx];
-
-            // Look up bits and bucket_size from LUT
-            let (bits, bucket_size) = bucket_lut[dist as usize];
-
-            // Add back light lost during quantization (skip for lossless)
-            let midpoint = if is_lossless { 0 } else { bucket_size >> 1 };
-            let min_adjusted = min_val.saturating_add(midpoint);
-
-            if bits == 0 {
-                // All pixels in this block are the same value
-                for yy in 0..4 {
-                    let row_start = ((y + yy) * bytes_per_line + x) as usize;
-                    for xx in 0..4 {
-                        dst_graymap[row_start + xx] = min_adjusted;
-                    }
-                }
-            } else {
-                // Unpack pixel indices
-                let bytes_consumed =
-                    unpack_pixels_dispatch(&pixel_stream[pixel_pos..], bits, &mut pixels);
-                pixel_pos += bytes_consumed;
-
-                // Reconstruct pixel values
-                for yy in 0..4u32 {
-                    let row_start = ((y + yy) * bytes_per_line + x) as usize;
-                    for xx in 0..4u32 {
-                        let idx = (yy * 4 + xx) as usize;
-                        let pixel_val = if bucket_size == 1 {
-                            min_adjusted.saturating_add(pixels[idx])
-                        } else {
-                            let scaled = (pixels[idx] as u16) * (bucket_size as u16);
-                            (scaled as u8).saturating_add(min_adjusted)
-                        };
-                        dst_graymap[row_start + xx as usize] = pixel_val;
-                    }
-                }
+        let first_block = (y / 4 * (width / 4)) as usize;
+        let row_start = y as usize * stride;
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut x = 0u32;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(lut) = &sse_lut {
+            // SAFETY: the CPU supports SSSE3 and SSE4.1 (`tile_sse::available`).
+            let (end, read) = unsafe {
+                tile_sse::decode_row_groups(
+                    dst_graymap,
+                    row_start,
+                    stride,
+                    width as usize,
+                    first_block,
+                    min_stream,
+                    dist_stream,
+                    is_lossless,
+                    lut,
+                    &pixel_stream[pixel_pos..],
+                )
+            };
+            #[allow(clippy::cast_possible_truncation)] // at most the width
+            {
+                x = end as u32;
             }
+            pixel_pos += read;
+        }
+        for x in (x..width).step_by(4) {
+            let block = first_block + (x / 4) as usize;
+            pixel_pos += decode_single_tile(
+                min_stream[block],
+                bucket_lut[usize::from(dist_stream[block])],
+                is_lossless,
+                &pixel_stream[pixel_pos..],
+                &mut dst_graymap[row_start + x as usize..],
+                stride,
+            )?;
         }
     }
 
     Ok(())
+}
+
+/// Decodes one 4x4 block into `dst` (rows `stride` apart) and returns the bytes
+/// it read from `src`.
+///
+/// Arithmetic matches the C++ decoder and the SSE path: the base `min +
+/// bucket_size / 2` wraps, and `index * bucket_size + base` saturates. Both only
+/// matter for malformed streams.
+fn decode_single_tile(
+    min: u8,
+    (bits, bucket_size): BucketLutEntry,
+    is_lossless: bool,
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+) -> Result<usize> {
+    let midpoint = if is_lossless { 0 } else { bucket_size >> 1 };
+    let base = min.wrapping_add(midpoint);
+    let tile_bytes = 2 * usize::from(bits);
+    if tile_bytes > src.len() {
+        return Err(LlicError::InvalidData);
+    }
+    let mut indices = [0u8; 16];
+    if bits > 0 {
+        unpack_pixels_dispatch(src, bits, &mut indices);
+    }
+    for (row, row_indices) in indices.chunks_exact(4).enumerate() {
+        let out = &mut dst[row * stride..row * stride + 4];
+        for (pixel, &index) in out.iter_mut().zip(row_indices) {
+            let value = u16::from(index) * u16::from(bucket_size.max(1)) + u16::from(base);
+            #[allow(clippy::cast_possible_truncation)] // clamped to 255
+            {
+                *pixel = value.min(255) as u8;
+            }
+        }
+    }
+    Ok(tile_bytes)
 }
 
 #[cfg(test)]
@@ -2495,6 +2252,46 @@ mod tests {
                             assert_eq!(index, (pixel - min) / bucket_size, "q{error_limit}");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Truncated or corrupt tile streams must fail cleanly, never panic.
+    #[test]
+    fn truncated_tile_streams_fail_cleanly() {
+        let (width, height) = (136u32, 24u32);
+        let image = noisy_gradient(width, height);
+        for error_limit in [0u8, 8] {
+            for layout in [
+                TileHeaderLayout::BeforePixels,
+                TileHeaderLayout::AfterPixels,
+            ] {
+                let compressed = compress_tile_block(
+                    &image,
+                    width,
+                    height,
+                    width,
+                    error_limit,
+                    false,
+                    false,
+                    layout,
+                )
+                .expect("compress");
+                let mut decoded = vec![0u8; image.len()];
+                for len in 0..compressed.len() {
+                    let result = decompress_tile_block(
+                        &compressed[..len],
+                        width,
+                        height,
+                        width,
+                        layout,
+                        &mut decoded,
+                    );
+                    assert!(
+                        result.is_err(),
+                        "q{error_limit} {layout:?} truncated to {len}"
+                    );
                 }
             }
         }
