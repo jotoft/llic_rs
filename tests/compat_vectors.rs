@@ -230,3 +230,64 @@ fn encodes_formats_4_and_5_like_cpp() {
         failures.join("\n")
     );
 }
+
+/// Multi-chunk streams decode into a strided buffer (`bytes_per_line > width`)
+/// to the same rows as a packed one.
+#[test]
+fn decodes_vectors_into_strided_buffers() {
+    let mut checked = 0;
+    for vector in load_manifest().iter().filter(|v| v.format >= 3) {
+        let (width, height) = input_dimensions(&vector.input);
+        let stream = fs::read(vectors_dir().join(&vector.file)).expect("read stream");
+        let packed_ctx = LlicContext::new(width, height, width, Some(1)).expect("context");
+        let mut packed = vec![0u8; (width * height) as usize];
+        packed_ctx
+            .decompress_gray8(&stream, &mut packed)
+            .expect("packed decode");
+
+        let stride = width + 12;
+        let strided_ctx = LlicContext::new(width, height, stride, Some(1)).expect("context");
+        let mut strided = vec![0xEE; (stride * height) as usize];
+        strided_ctx
+            .decompress_gray8(&stream, &mut strided)
+            .unwrap_or_else(|e| panic!("{}: {e}", vector.file));
+        for (y, row) in packed.chunks_exact(width as usize).enumerate() {
+            let start = y * stride as usize;
+            assert_eq!(
+                &strided[start..start + width as usize],
+                row,
+                "{} row {y}",
+                vector.file
+            );
+            assert!(
+                strided[start + width as usize..start + stride as usize]
+                    .iter()
+                    .all(|&b| b == 0xEE),
+                "{} row {y}: wrote past the width",
+                vector.file
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 217);
+}
+
+/// Truncated streams, single- and multi-chunk, fail without panicking.
+#[test]
+fn truncated_vectors_fail_cleanly() {
+    for vector in load_manifest()
+        .iter()
+        .filter(|v| v.format == 5 && v.releases.iter().any(|r| r == "v4.1.1"))
+        .step_by(7)
+    {
+        let (width, height) = input_dimensions(&vector.input);
+        let stream = fs::read(vectors_dir().join(&vector.file)).expect("read stream");
+        let ctx = LlicContext::new(width, height, width, Some(1)).expect("context");
+        let mut image = vec![0u8; (width * height) as usize];
+        for len in (0..stream.len()).step_by(3) {
+            // Entropy streams may decode a short stream to garbage; they must
+            // not panic. Tile streams detect the truncation.
+            let _ = ctx.decompress_gray8(&stream[..len], &mut image);
+        }
+    }
+}

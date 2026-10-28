@@ -209,14 +209,6 @@ impl LlicContext {
             Quality::LosslessEntropy
         };
 
-        // For formats with multiple blocks, image is divided among threads
-        // First, check if we have many small blocks of similar size
-        let non_zero_blocks: Vec<_> = block_sizes
-            .iter()
-            .enumerate()
-            .filter(|(_, &size)| size > 0)
-            .collect();
-
         // Helper closure to decompress a block based on mode and tile_based flag
         let layout = lossy::TileHeaderLayout::for_format_version(version);
         let decompress_block =
@@ -238,81 +230,35 @@ impl LlicContext {
                 }
             };
 
-        if non_zero_blocks.len() > 1 {
-            // Multiple blocks with data - image is divided among threads
-            // Each thread handles a horizontal stripe of the image
-
-            // Calculate block positions
-            let mut block_positions = Vec::new();
-            let mut current_pos = pos;
-            for size in block_sizes.iter().take(num_blocks as usize) {
-                block_positions.push(current_pos);
-                current_pos += *size as usize;
+        // Each block (one per encoder thread) holds a horizontal strip of rows,
+        // split as `chunk_rows` says; strips with no rows have empty blocks.
+        // Blocks decode straight into their rows of the output.
+        let (width, height) = (self.width as usize, self.height as usize);
+        let stride = self.bytes_per_line as usize;
+        if dst_graymap.len() < (height - 1) * stride + width {
+            return Err(LlicError::InvalidArgument);
+        }
+        let mut row = 0usize;
+        for (index, &size) in block_sizes.iter().enumerate() {
+            let data_end = pos
+                .checked_add(size as usize)
+                .ok_or(LlicError::InvalidData)?;
+            let data = src_data.get(pos..data_end).ok_or(LlicError::InvalidData)?;
+            pos = data_end;
+            let rows = chunk_rows(version, height, block_sizes.len(), index);
+            if rows == 0 {
+                continue;
             }
-
-            // Decompress each block into its corresponding rows
-            let mut row_offset = 0;
-            for block_idx in 0..num_blocks as usize {
-                let block_size = block_sizes[block_idx];
-                if block_size == 0 {
-                    continue;
-                }
-
-                let block_rows = chunk_rows(
-                    version,
-                    self.height as usize,
-                    num_blocks as usize,
-                    block_idx,
-                );
-
-                if block_rows == 0 {
-                    continue;
-                }
-
-                let block_pos = block_positions[block_idx];
-                let block_data = &src_data[block_pos..block_pos + block_size as usize];
-
-                // Decompress this block into a temporary buffer
-                let mut block_output = vec![0u8; self.width as usize * block_rows];
-
-                match decompress_block(
-                    block_data,
-                    self.width,
-                    block_rows as u32,
-                    self.bytes_per_line,
-                    &mut block_output,
-                ) {
-                    Ok(_) => {
-                        // Copy the decompressed rows to the output buffer
-                        let src_start = 0;
-                        let dst_start = row_offset * self.bytes_per_line as usize;
-                        let copy_len = block_rows * self.bytes_per_line as usize;
-
-                        dst_graymap[dst_start..dst_start + copy_len]
-                            .copy_from_slice(&block_output[src_start..src_start + copy_len]);
-
-                        row_offset += block_rows;
-                    }
-                    Err(_e) => {
-                        return Err(LlicError::InvalidData);
-                    }
-                }
-            }
-
-            if row_offset != self.height as usize {
+            if data.is_empty() || row + rows > height {
                 return Err(LlicError::InvalidData);
             }
-        } else if let Some((_block_idx, &block_size)) = non_zero_blocks.first() {
-            // Single block with data - it should contain the entire image
-            let block_data = &src_data[pos..pos + block_size as usize];
-
-            decompress_block(
-                block_data,
-                self.width,
-                self.height,
-                self.bytes_per_line,
-                dst_graymap,
-            )?;
+            let strip = &mut dst_graymap[row * stride..(row + rows - 1) * stride + width];
+            #[allow(clippy::cast_possible_truncation)] // at most the height
+            decompress_block(data, self.width, rows as u32, self.bytes_per_line, strip)?;
+            row += rows;
+        }
+        if row != height {
+            return Err(LlicError::InvalidData);
         }
 
         Ok((quality, mode))

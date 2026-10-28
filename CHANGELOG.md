@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Multi-chunk streams (from the C++ encoder with several threads) failed to
+  decode with `InvalidData` when `bytes_per_line` exceeds the width, and a
+  truncated block-size table or block made `decompress_gray8` panic. Chunks now
+  decode straight into their rows of the output, without a temporary buffer
+  and copy, with bounds checked.
 - `compressed_buffer_size` was smaller than the worst case of lossless entropy
   coding (13 bits per pixel): on noisy images above about 44k pixels,
   `compress_gray8` with `Quality::LosslessEntropy` returned `InvalidArgument`.
