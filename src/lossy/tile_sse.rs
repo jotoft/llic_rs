@@ -25,16 +25,21 @@ pub(super) fn available() -> bool {
 /// Bucket LUT in the C++ layout, as the kernels read it: bits 0-7 hold the
 /// bucket size, bits 8-15 the bit count, bits 16-31 the Q15 reciprocal
 /// `ceil(32768 / bucket_size)` (0 for bucket size 1, which keeps residuals).
-pub(super) fn packed_lut(lut: &[BucketLutEntry; 256]) -> [u32; 256] {
-    lut.map(|(bits, bucket_size)| {
-        let bucket_size = u32::from(bucket_size);
+pub(super) const fn packed_lut(lut: &[BucketLutEntry; 256]) -> [u32; 256] {
+    let mut packed = [0u32; 256];
+    let mut dist = 0;
+    while dist < 256 {
+        let (bits, bucket_size) = lut[dist];
+        let bucket_size = bucket_size as u32;
         let reciprocal = if bucket_size > 1 {
             32768u32.div_ceil(bucket_size)
         } else {
             0
         };
-        (reciprocal << 16) | (u32::from(bits) << 8) | bucket_size
-    })
+        packed[dist] = (reciprocal << 16) | ((bits as u32) << 8) | bucket_size;
+        dist += 1;
+    }
+    packed
 }
 
 /// Per bit count: the pixel order of the LSB-first packed value sequence,

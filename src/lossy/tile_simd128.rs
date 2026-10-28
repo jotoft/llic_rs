@@ -26,17 +26,22 @@ pub(super) fn available() -> bool {
 /// Bucket LUT in the layout the SSE kernels use (see `tile_sse::packed_lut`):
 /// bucket size in bits 0-7, bit count in bits 8-15, and the Q16 reciprocal
 /// `ceil(65536 / bucket_size)` in bits 16-31 here (0 for bucket size 1).
-pub(super) fn packed_lut(lut: &[BucketLutEntry; 256]) -> [u32; 256] {
-    lut.map(|(bits, bucket_size)| {
-        let bucket_size = u32::from(bucket_size);
+pub(super) const fn packed_lut(lut: &[BucketLutEntry; 256]) -> [u32; 256] {
+    let mut packed = [0u32; 256];
+    let mut dist = 0;
+    while dist < 256 {
+        let (bits, bucket_size) = lut[dist];
+        let bucket_size = bucket_size as u32;
         let reciprocal = if bucket_size > 1 {
             // At most 32768, so it fits the 16 bits.
             65536u32.div_ceil(bucket_size)
         } else {
             0
         };
-        (reciprocal << 16) | (u32::from(bits) << 8) | bucket_size
-    })
+        packed[dist] = (reciprocal << 16) | ((bits as u32) << 8) | bucket_size;
+        dist += 1;
+    }
+    packed
 }
 
 /// Pixel order of the LSB-first packed value sequence per bit count, as in

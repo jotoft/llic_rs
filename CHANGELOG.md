@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.92x of C++ 4.1.1) and tile streams with compressed headers decode faster
   than C++; WebAssembly gains about 1.3x. A truncated entropy stream is now
   `InvalidData` instead of decoding zeros past its end.
+- The tile codec's bucket tables for the six quality levels (and their packed
+  SIMD forms) are built at compile time instead of on every call: 5-8% faster
+  coding of small images (256x256), up to 20% for fast low-quality encoding.
 - Near the end of a tile stream, groups of blocks without payload kept the
   SIMD tile decoder's 16-byte reads from going past the stream end by falling
   back to per-block code for the rest of the image; they read nothing, so they

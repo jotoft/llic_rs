@@ -48,16 +48,18 @@ static RECIPROCAL_TABLE: [u32; 257] = {
 ///
 /// For each possible dist value (0-255), determines the minimum number of
 /// buckets needed such that bucket_size <= error_limit + 1.
-fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
+const fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
     let mut lut = [(0u8, 0u8); 256];
     let error_limit_plus1 = (error_limit as u32) + 1;
 
-    for dist in 0..256u32 {
+    let mut dist = 0u32;
+    while dist < 256 {
         let dist_plus1 = dist + 1;
 
         // Try with 1 bucket (0 bits)
         if dist_plus1 <= error_limit_plus1 {
             lut[dist as usize] = (0, dist_plus1 as u8);
+            dist += 1;
             continue;
         }
 
@@ -65,6 +67,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(2);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (1, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
@@ -72,6 +75,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(4);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (2, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
@@ -79,6 +83,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(8);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (3, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
@@ -86,6 +91,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(16);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (4, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
@@ -93,6 +99,7 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(32);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (5, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
@@ -100,14 +107,71 @@ fn generate_bucket_lut(error_limit: u8) -> [BucketLutEntry; 256] {
         let bucket_size = dist_plus1.div_ceil(64);
         if bucket_size <= error_limit_plus1 {
             lut[dist as usize] = (6, bucket_size as u8);
+            dist += 1;
             continue;
         }
 
         // Fall back to 256 buckets (8 bits)
         lut[dist as usize] = (8, 1);
+        dist += 1;
     }
 
     lut
+}
+
+/// Error limits of the quality levels, whose tables are built at compile time.
+const QUALITY_ERROR_LIMITS: [u8; 6] = [0, 2, 4, 8, 16, 32];
+
+static BUCKET_LUTS: [[BucketLutEntry; 256]; 6] = {
+    let mut luts = [[(0u8, 0u8); 256]; 6];
+    let mut i = 0;
+    while i < 6 {
+        luts[i] = generate_bucket_lut(QUALITY_ERROR_LIMITS[i]);
+        i += 1;
+    }
+    luts
+};
+
+/// The bucket LUT for `error_limit`: precomputed for the quality levels, built
+/// for any other limit a stream carries.
+fn bucket_lut(error_limit: u8) -> Cow<'static, [BucketLutEntry; 256]> {
+    match QUALITY_ERROR_LIMITS
+        .iter()
+        .position(|&limit| limit == error_limit)
+    {
+        Some(i) => Cow::Borrowed(&BUCKET_LUTS[i]),
+        None => Cow::Owned(generate_bucket_lut(error_limit)),
+    }
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+static PACKED_LUTS: [[u32; 256]; 6] = {
+    let mut luts = [[0u32; 256]; 6];
+    let mut i = 0;
+    while i < 6 {
+        luts[i] = tile_simd::packed_lut(&BUCKET_LUTS[i]);
+        i += 1;
+    }
+    luts
+};
+
+/// The SIMD kernels' packed form of a LUT from [`bucket_lut`], precomputed
+/// for the static ones (recognised by address).
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+fn packed_lut(lut: &[BucketLutEntry; 256]) -> Cow<'static, [u32; 256]> {
+    match BUCKET_LUTS
+        .iter()
+        .position(|table| std::ptr::eq(table, lut))
+    {
+        Some(i) => Cow::Borrowed(&PACKED_LUTS[i]),
+        None => Cow::Owned(tile_simd::packed_lut(lut)),
+    }
 }
 
 /// SSE4.1-optimized processing of a 4x4 tile matching C++ approach:
@@ -1363,7 +1427,7 @@ pub fn compress_tile_block_into(
     // Header values are chosen for the header coder only when it runs.
     let select_header =
         layout == TileHeaderLayout::AfterPixels && compress_header && error_limit == 0;
-    let bucket_lut = generate_bucket_lut(error_limit);
+    let bucket_lut = bucket_lut(error_limit);
     let block = TileBlock {
         src_data,
         width,
@@ -1444,7 +1508,7 @@ impl TileBlock<'_> {
             target_arch = "x86_64",
             all(target_arch = "wasm32", target_feature = "simd128")
         ))]
-        let simd_lut = tile_simd::available().then(|| tile_simd::packed_lut(bucket_lut));
+        let simd_lut = tile_simd::available().then(|| packed_lut(bucket_lut));
         for y in (0..rows).step_by(4) {
             let first_block = (y / 4 * (width / 4)) as usize;
             let select_row = select_header && y > 0;
@@ -1594,7 +1658,7 @@ pub fn decompress_tile_block_dynamic(
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     let chunk = parse_tile_chunk(src_data, width, rows, use_dynamic_predictor, layout)?;
-    let bucket_lut = generate_bucket_lut(chunk.error_limit);
+    let bucket_lut = bucket_lut(chunk.error_limit);
     let (min_stream, dist_stream) = chunk.header.split_at(chunk.header.len() / 2);
     decompress_tiles(
         min_stream,
@@ -1750,7 +1814,7 @@ pub fn extract_tile_metadata(
     layout: TileHeaderLayout,
 ) -> Result<Vec<(u8, u8, u8)>> {
     let chunk = parse_tile_chunk(src_data, width, height, use_dynamic_predictor, layout)?;
-    let bucket_lut = generate_bucket_lut(chunk.error_limit);
+    let bucket_lut = bucket_lut(chunk.error_limit);
     let (min_stream, dist_stream) = chunk.header.split_at(chunk.header.len() / 2);
     Ok(min_stream
         .iter()
@@ -1785,7 +1849,7 @@ fn decompress_tiles(
         target_arch = "x86_64",
         all(target_arch = "wasm32", target_feature = "simd128")
     ))]
-    let simd_lut = tile_simd::available().then(|| tile_simd::packed_lut(bucket_lut));
+    let simd_lut = tile_simd::available().then(|| packed_lut(bucket_lut));
     let mut pixel_pos = 0usize;
     for y in (0..rows).step_by(4) {
         let first_block = (y / 4 * (width / 4)) as usize;
@@ -2516,6 +2580,34 @@ mod tests {
                         assert_eq!(decode(), without_simd(decode), "decode {case}");
                     }
                 }
+            }
+        }
+    }
+
+    /// Quality levels use the precomputed tables; other limits build their own.
+    #[test]
+    fn bucket_luts_are_precomputed_for_quality_levels() {
+        for limit in 0..=40u8 {
+            let lut = bucket_lut(limit);
+            assert_eq!(*lut, generate_bucket_lut(limit), "limit {limit}");
+            let precomputed = matches!(lut, Cow::Borrowed(_));
+            assert_eq!(
+                precomputed,
+                QUALITY_ERROR_LIMITS.contains(&limit),
+                "limit {limit}"
+            );
+            #[cfg(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", target_feature = "simd128")
+            ))]
+            {
+                let packed = packed_lut(&lut);
+                assert_eq!(*packed, tile_simd::packed_lut(&lut), "limit {limit}");
+                assert_eq!(
+                    matches!(packed, Cow::Borrowed(_)),
+                    precomputed,
+                    "limit {limit}"
+                );
             }
         }
     }
