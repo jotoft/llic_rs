@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-28
+
+### Fixed
+
+- The BMI2/SSE4.1 pixel-packing paths in tile-based (lossy) compression stored
+  u16/u32 values through unaligned pointers into the output stream. This was
+  undefined behaviour, and debug builds with those target features enabled
+  aborted with "misaligned pointer dereference". The stores now use
+  `write_unaligned`, which compiles to the same instructions on x86; output and
+  performance are unchanged.
+
 ## [0.4.0] - 2026-06-25
 
 ### Added
