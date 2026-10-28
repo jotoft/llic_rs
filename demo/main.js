@@ -53,9 +53,16 @@ async function initWasm() {
   document.getElementById('version').textContent = build_info();
 }
 
+// Some browsers (Safari) round performance.now() to whole milliseconds, so a
+// fast single run can measure 0 ms; the Benchmark button averages many runs.
 function formatThroughput(bytes, ms) {
+  if (ms <= 0) return '–';
   const mbps = (bytes / 1024 / 1024) / (ms / 1000);
   return `${mbps.toFixed(1)} MB/s`;
+}
+
+function formatTime(ms) {
+  return ms <= 0 ? '< 1 ms' : `${ms.toFixed(2)} ms`;
 }
 
 function updateStat(id, value) {
@@ -151,7 +158,7 @@ async function processImage(file, blur = currentBlur) {
 
     updateStat('compressedSize', `${compressed.length.toLocaleString()} bytes`);
     updateStat('ratio', `${(grayData.length / compressed.length).toFixed(2)}x (${(100 * compressed.length / grayData.length).toFixed(1)}%)`);
-    updateStat('compressTime', `${compressTime.toFixed(2)} ms`);
+    updateStat('compressTime', formatTime(compressTime));
 
     // Get tile metadata (only for tile-based compression)
     try {
@@ -172,7 +179,7 @@ async function processImage(file, blur = currentBlur) {
     }
     const decompressTime = performance.now() - decompressStart;
 
-    updateStat('decompressTime', `${decompressTime.toFixed(2)} ms`);
+    updateStat('decompressTime', formatTime(decompressTime));
     updateStat('throughput', `${formatThroughput(grayData.length, compressTime)} / ${formatThroughput(grayData.length, decompressTime)}`);
 
     // Store for benchmarking
