@@ -1850,6 +1850,14 @@ fn decompress_tiles(
         all(target_arch = "wasm32", target_feature = "simd128")
     ))]
     let simd_lut = tile_simd::available().then(|| packed_lut(bucket_lut));
+    #[cfg(target_arch = "x86_64")]
+    let decode_row_groups = if tile_sse::avx2::available() {
+        tile_sse::avx2::decode_row_groups_avx2
+    } else {
+        tile_simd::decode_row_groups
+    };
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    let decode_row_groups = tile_simd::decode_row_groups;
     let mut pixel_pos = 0usize;
     for y in (0..rows).step_by(4) {
         let first_block = (y / 4 * (width / 4)) as usize;
@@ -1867,9 +1875,10 @@ fn decompress_tiles(
             all(target_arch = "wasm32", target_feature = "simd128")
         ))]
         if let Some(lut) = &simd_lut {
-            // SAFETY: the CPU supports the kernels' instructions (`tile_simd::available`).
+            // SAFETY: the CPU supports the kernels' instructions (`tile_simd::available`,
+            // and `tile_sse::avx2::available` for the AVX2 decoder).
             let (end, read) = unsafe {
-                tile_simd::decode_row_groups(
+                decode_row_groups(
                     dst_graymap,
                     row_start,
                     stride,
@@ -2578,6 +2587,139 @@ mod tests {
                             out
                         };
                         assert_eq!(decode(), without_simd(decode), "decode {case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The AVX2 decoder gives the SSE decoder's pixels, also where a row ends
+    /// in SSE groups (208 = six 32-pixel groups plus 16) or per-block code.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_tiles_match_sse() {
+        if !tile_sse::avx2::available() {
+            return;
+        }
+        let without_avx2 = |f: &dyn Fn() -> Vec<u8>| {
+            tile_sse::avx2::tests::DISABLED.with(|d| d.set(true));
+            let result = f();
+            tile_sse::avx2::tests::DISABLED.with(|d| d.set(false));
+            result
+        };
+        for (width, height, stride) in [(208u32, 48u32, 208u32), (248, 20, 256), (32, 8, 32)] {
+            let image = test_image(stride, height, width);
+            for error_limit in [0u8, 2, 4, 8, 16, 32] {
+                for (compress_header, dynamic) in [(false, false), (true, false), (true, true)] {
+                    for layout in [
+                        TileHeaderLayout::BeforePixels,
+                        TileHeaderLayout::AfterPixels,
+                    ] {
+                        let compressed = compress_tile_block(
+                            &image,
+                            width,
+                            height,
+                            stride,
+                            error_limit,
+                            compress_header,
+                            dynamic,
+                            layout,
+                        )
+                        .expect("compress");
+                        let decode = || {
+                            let mut out = vec![0u8; image.len()];
+                            decompress_tile_block_dynamic(
+                                &compressed,
+                                width,
+                                height,
+                                stride,
+                                dynamic,
+                                layout,
+                                &mut out,
+                            )
+                            .expect("decompress");
+                            out
+                        };
+                        let case = format!(
+                            "{width}x{height} q{error_limit} header {compress_header} dynamic {dynamic} {layout:?}"
+                        );
+                        assert_eq!(decode(), without_avx2(&decode), "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every small size decodes alike with AVX2, SSE and per-block code, also
+    /// into padded rows, and every truncation of the streams fails alike.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn small_images_decode_alike_on_every_path() {
+        let with_paths = |avx2: bool, sse: bool, f: &dyn Fn() -> Result<Vec<u8>>| {
+            tile_sse::avx2::tests::DISABLED.with(|d| d.set(!avx2));
+            tile_simd::tests::DISABLED.with(|d| d.set(!sse));
+            let result = f();
+            tile_sse::avx2::tests::DISABLED.with(|d| d.set(false));
+            tile_simd::tests::DISABLED.with(|d| d.set(false));
+            result.map_err(|e| format!("{e:?}"))
+        };
+        for width in (4..=100u32).step_by(4) {
+            for height in [4u32, 8, 12] {
+                let stride = width + 4;
+                let image = test_image(stride, height, width + height);
+                for error_limit in [0u8, 4, 32] {
+                    for (compress_header, dynamic) in [(false, false), (true, true)] {
+                        let layout = TileHeaderLayout::BeforePixels;
+                        let compressed = compress_tile_block(
+                            &image,
+                            width,
+                            height,
+                            stride,
+                            error_limit,
+                            compress_header,
+                            dynamic,
+                            layout,
+                        )
+                        .expect("compress");
+                        let case =
+                            format!("{width}x{height} q{error_limit} header {compress_header}");
+                        for len in (0..=compressed.len()).rev() {
+                            let decode = || {
+                                let mut out = vec![0xEE; image.len()];
+                                decompress_tile_block_dynamic(
+                                    &compressed[..len],
+                                    width,
+                                    height,
+                                    stride,
+                                    dynamic,
+                                    layout,
+                                    &mut out,
+                                )
+                                .map(|()| out)
+                            };
+                            let avx2 = with_paths(true, true, &decode);
+                            assert_eq!(avx2, with_paths(false, true, &decode), "{case} len {len}");
+                            assert_eq!(avx2, with_paths(false, false, &decode), "{case} len {len}");
+                            if len == compressed.len() {
+                                let out = avx2.expect("decompress");
+                                for (row, src) in out
+                                    .chunks(stride as usize)
+                                    .zip(image.chunks(stride as usize))
+                                {
+                                    assert!(
+                                        row[width as usize..].iter().all(|&b| b == 0xEE),
+                                        "{case} padding"
+                                    );
+                                    if error_limit == 0 {
+                                        assert_eq!(
+                                            row[..width as usize],
+                                            src[..width as usize],
+                                            "{case}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

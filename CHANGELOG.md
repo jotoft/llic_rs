@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short a stride, and `helpers::DimensionsError`, for sizes that do not fit a
   layout. `LlicError` is unchanged.
 
+### Changed
+
+- Tile-based decoding unpacks eight blocks at once with AVX2 on x86-64 CPUs
+  that have it (detected at run time, so default builds get it): about 1.13x
+  for lossless and 1.07-1.28x for lossy fast-mode streams, and up to 1.12x in
+  the other modes. Single-threaded on the test photos, lossless fast-mode
+  decoding is now 1.6x the speed of C++ 4.1.1. Output is unchanged.
+
 ## [0.5.1] - 2026-10-28
 
 Performance release: the C++ reference's 3.4-4.1 x86 work is ported, with

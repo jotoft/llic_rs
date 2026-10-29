@@ -8,10 +8,14 @@
 //! per-block code where a group does not fit.
 //!
 //! The kernels need SSSE3 and SSE4.1, detected at run time by [`available`].
+//! On CPUs with AVX2, [`avx2`] decodes eight blocks at once and hands the end of
+//! each row to the SSE decoder.
 
 use std::arch::x86_64::*;
 
 use super::BucketLutEntry;
+
+pub(super) mod avx2;
 
 /// Whether the CPU supports the instructions these kernels use.
 pub(super) fn available() -> bool {
