@@ -69,6 +69,10 @@ pub type Result<T> = std::result::Result<T, LlicError>;
 /// Most chunks a stream can hold, as in the C++ reference (`LLIC_MAX_CHUNKS`).
 pub const MAX_CHUNKS: usize = 16;
 
+/// Most blocks (chunks) decoded at once, with their entropy decoders
+/// interleaved.
+const INTERLEAVED_BLOCKS: usize = 4;
+
 pub struct LlicContext {
     width: u32,
     height: u32,
@@ -229,8 +233,8 @@ impl LlicContext {
             Quality::LosslessEntropy
         };
 
-        // Decompress one block, or two at once (their entropy decoders
-        // interleave), based on mode and tile_based flag.
+        // Decompress one block, or up to INTERLEAVED_BLOCKS at once (their
+        // entropy decoders interleave), based on mode and tile_based flag.
         let layout = lossy::TileHeaderLayout::for_format_version(version);
         let (w, bpl, dynamic) = (self.width, self.bytes_per_line, mode == Mode::Dynamic);
         let decompress_block = |data: &[u8], rows: u32, dst: &mut [u8]| -> Result<()> {
@@ -242,13 +246,18 @@ impl LlicContext {
                 entropy_coder::decompress(data, w, rows, bpl, dst)
             }
         };
-        let decompress_pair = |data: [&[u8]; 2], rows: [u32; 2], dst: [&mut [u8]; 2]| {
-            if tile_based {
-                lossy::decompress_tile_block_pair(data, w, rows, bpl, dynamic, layout, dst)
-            } else {
-                entropy_coder::decompress_pair(data, dynamic, w, rows, bpl, dst)
-            }
-        };
+        macro_rules! decompress_many {
+            ($n:literal, $data:expr, $rows:expr, $dst:expr) => {{
+                let data: [&[u8]; $n] = $data.try_into().expect("block count");
+                let rows: [u32; $n] = $rows.try_into().expect("block count");
+                let dst: [&mut [u8]; $n] = $dst.try_into().expect("block count");
+                if tile_based {
+                    lossy::decompress_tile_blocks(data, w, rows, bpl, dynamic, layout, dst)
+                } else {
+                    entropy_coder::decompress_many(data, dynamic, w, rows, bpl, dst)
+                }
+            }};
+        }
 
         // Each block (one per encoder chunk) holds a horizontal strip of rows,
         // split as `chunk_rows` says; strips with no rows have empty blocks.
@@ -280,25 +289,28 @@ impl LlicContext {
         if row != height {
             return Err(LlicError::InvalidData);
         }
-        let strip_end = |row: usize, rows: usize| (row + rows - 1) * stride + width;
-        for pair in blocks.chunks(2) {
+        for group in blocks.chunks(INTERLEAVED_BLOCKS) {
+            // The group's strips, split off the output in row order.
+            let mut strips = Vec::with_capacity(group.len());
+            let mut rest = &mut dst_graymap[..];
+            let mut rest_start = 0;
+            for &(_, row, rows) in group {
+                let start = row * stride - rest_start;
+                let end = start + (rows - 1) * stride + width;
+                let (strip, tail) = std::mem::take(&mut rest)[start..].split_at_mut(end - start);
+                strips.push(strip);
+                rest = tail;
+                rest_start += end;
+            }
+            let data: Vec<&[u8]> = group.iter().map(|&(data, _, _)| data).collect();
             #[allow(clippy::cast_possible_truncation)] // at most the height
-            match *pair {
-                [(data_a, row_a, rows_a), (data_b, row_b, rows_b)] => {
-                    let (above, below) = dst_graymap.split_at_mut(row_b * stride);
-                    let strip_a = &mut above[row_a * stride..strip_end(row_a, rows_a)];
-                    let strip_b = &mut below[..strip_end(0, rows_b)];
-                    decompress_pair(
-                        [data_a, data_b],
-                        [rows_a as u32, rows_b as u32],
-                        [strip_a, strip_b],
-                    )?;
-                }
-                [(data, row, rows)] => {
-                    let strip = &mut dst_graymap[row * stride..strip_end(row, rows)];
-                    decompress_block(data, rows as u32, strip)?;
-                }
-                _ => unreachable!("chunks of at most two"),
+            let rows: Vec<u32> = group.iter().map(|&(_, _, rows)| rows as u32).collect();
+            match group.len() {
+                1 => decompress_block(data[0], rows[0], strips.pop().expect("one strip"))?,
+                2 => decompress_many!(2, data, rows, strips)?,
+                3 => decompress_many!(3, data, rows, strips)?,
+                4 => decompress_many!(4, data, rows, strips)?,
+                _ => unreachable!("groups of at most INTERLEAVED_BLOCKS"),
             }
         }
 

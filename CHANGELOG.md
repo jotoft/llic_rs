@@ -41,13 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   faster and default-mode ones 3-4%. Lossy streams keep the AVX2 decoder, and
   a 512-bit version (16 blocks per register) was 10-50% slower on Zen 4.
   The minimum Rust version is now 1.89, for the AVX-512 intrinsics.
-- Streams with two or more chunks decode two chunks at a time, with their
-  entropy decoders interleaved so that the table lookups of one overlap
-  those of the other (`entropy_coder::decompress_pair`,
-  `lossy::decompress_tile_block_pair`). Single-threaded on the 1920x1280 test
-  photos, lossless default streams in 2 chunks decode 16-18% faster than
-  chunk by chunk, 1.15-1.2x the speed of one chunk. Single-chunk decoding is
-  about 1.7% faster.
+- Streams with two or more chunks decode up to four chunks at a time, with
+  their entropy decoders interleaved so that the table lookups of one overlap
+  those of the others (`entropy_coder::decompress_many`,
+  `lossy::decompress_tile_blocks`). Single-threaded on the 1920x1280 test
+  photos, lossless default streams in 2 or 4 chunks decode 1.2-1.3x the speed
+  of one chunk (8 chunks, in two groups of four, a little less). Builds with
+  BMI2 shift with `SHLX`, so the shift count can sit in any register.
+  Single-chunk decoding is about 2% faster.
 - Tile-based decoding unpacks eight blocks at once with AVX2 on x86-64 CPUs
   that have it (detected at run time, so default builds get it): about 1.13x
   for lossless and 1.07-1.28x for lossy fast-mode streams, and up to 1.12x in

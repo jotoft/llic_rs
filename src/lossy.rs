@@ -1661,56 +1661,59 @@ pub fn decompress_tile_block_dynamic(
     decompress_parsed_chunk(&chunk, width, rows, bytes_per_line, dst_graymap)
 }
 
-/// Decompress two tile chunks of the same width, such as consecutive chunks
-/// of a stream, into `dst_graymaps`. When both headers are entropy coded they
-/// are decoded together ([`crate::entropy_coder::decompress_pair`]), so the
-/// two decoders' table lookups overlap.
-pub fn decompress_tile_block_pair(
-    src_data: [&[u8]; 2],
+/// Decompress `N` tile chunks of the same width, such as consecutive chunks
+/// of a stream, into `dst_graymaps`. When all headers are entropy coded they
+/// are decoded together ([`crate::entropy_coder::decompress_many`]), so the
+/// decoders' table lookups overlap.
+pub fn decompress_tile_blocks<const N: usize>(
+    src_data: [&[u8]; N],
     width: u32,
-    rows: [u32; 2],
+    rows: [u32; N],
     bytes_per_line: u32,
     use_dynamic_predictor: bool,
     layout: TileHeaderLayout,
-    dst_graymaps: [&mut [u8]; 2],
+    dst_graymaps: [&mut [u8]; N],
 ) -> Result<()> {
-    let a = locate_tile_chunk(src_data[0], width, rows[0], layout)?;
-    let b = locate_tile_chunk(src_data[1], width, rows[1], layout)?;
-    let headers = match (a.header, b.header) {
-        (ChunkHeader::Coded(coded_a), ChunkHeader::Coded(coded_b)) => {
-            let header_width = width / 4;
-            let heights = rows.map(|rows| (rows / 4) * 2);
-            let mut header_a = vec![0u8; (header_width * heights[0]) as usize];
-            let mut header_b = vec![0u8; (header_width * heights[1]) as usize];
-            crate::entropy_coder::decompress_pair(
-                [coded_a, coded_b],
-                use_dynamic_predictor,
-                header_width,
-                heights,
-                header_width,
-                [&mut header_a, &mut header_b],
-            )?;
-            [Cow::Owned(header_a), Cow::Owned(header_b)]
+    let mut chunks = Vec::with_capacity(N);
+    for (src, rows) in src_data.into_iter().zip(rows) {
+        chunks.push(locate_tile_chunk(src, width, rows, layout)?);
+    }
+    let coded: Vec<&[u8]> = chunks
+        .iter()
+        .filter_map(|chunk| match chunk.header {
+            ChunkHeader::Coded(coded) => Some(coded),
+            ChunkHeader::Raw(_) => None,
+        })
+        .collect();
+    let headers: Vec<Cow<'_, [u8]>> = if let Ok(coded) = <[&[u8]; N]>::try_from(coded) {
+        let header_width = width / 4;
+        let heights = rows.map(|rows| (rows / 4) * 2);
+        let mut headers = heights.map(|height| vec![0u8; (header_width * height) as usize]);
+        crate::entropy_coder::decompress_many(
+            coded,
+            use_dynamic_predictor,
+            header_width,
+            heights,
+            header_width,
+            headers.each_mut().map(|header| &mut header[..]),
+        )?;
+        headers.into_iter().map(Cow::Owned).collect()
+    } else {
+        let mut headers = Vec::with_capacity(N);
+        for (chunk, rows) in chunks.iter().zip(rows) {
+            headers.push(chunk.header.decode(width, rows, use_dynamic_predictor)?);
         }
-        _ => [
-            a.header.decode(width, rows[0], use_dynamic_predictor)?,
-            b.header.decode(width, rows[1], use_dynamic_predictor)?,
-        ],
+        headers
     };
-    let [header_a, header_b] = headers;
-    let [dst_a, dst_b] = dst_graymaps;
-    let chunk_a = TileChunk {
-        error_limit: a.error_limit,
-        header: header_a,
-        pixels: a.pixels,
-    };
-    decompress_parsed_chunk(&chunk_a, width, rows[0], bytes_per_line, dst_a)?;
-    let chunk_b = TileChunk {
-        error_limit: b.error_limit,
-        header: header_b,
-        pixels: b.pixels,
-    };
-    decompress_parsed_chunk(&chunk_b, width, rows[1], bytes_per_line, dst_b)
+    for (((chunk, header), rows), dst) in chunks.iter().zip(headers).zip(rows).zip(dst_graymaps) {
+        let chunk = TileChunk {
+            error_limit: chunk.error_limit,
+            header,
+            pixels: chunk.pixels,
+        };
+        decompress_parsed_chunk(&chunk, width, rows, bytes_per_line, dst)?;
+    }
+    Ok(())
 }
 
 /// Decompress the tiles of a chunk whose header is decoded.

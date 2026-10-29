@@ -71,20 +71,20 @@ pub fn decompress_dynamic(
     )
 }
 
-/// Decompresses two independent streams of the same width at once, one into
+/// Decompresses `N` independent streams of the same width at once, one into
 /// each of `dst_images`: [`decompress`] (or [`decompress_dynamic`]) of each,
-/// with the two symbol decoders interleaved so that their table lookups
-/// overlap instead of each waiting on the one before.
-pub fn decompress_pair(
-    src_data: [&[u8]; 2],
+/// with the symbol decoders interleaved so that their table lookups overlap
+/// instead of each waiting on the one before.
+pub fn decompress_many<const N: usize>(
+    src_data: [&[u8]; N],
     dynamic: bool,
     width: u32,
-    heights: [u32; 2],
+    heights: [u32; N],
     bytes_per_line: u32,
-    dst_images: [&mut [u8]; 2],
+    dst_images: [&mut [u8]; N],
 ) -> Result<()> {
-    let mut images = Vec::with_capacity(2);
-    for (src, height) in src_data.into_iter().zip(heights) {
+    let mut images = Vec::with_capacity(N);
+    for ((src, height), dst) in src_data.into_iter().zip(heights).zip(&dst_images) {
         let (predictor_bits, stream) = if dynamic {
             let predictor_storage_bytes = align_to_4((height as usize).div_ceil(8));
             if src.len() < predictor_storage_bytes {
@@ -95,19 +95,14 @@ pub fn decompress_pair(
         } else {
             (None, src)
         };
-        images.push(ImageDecoder::new(
-            stream,
-            predictor_bits,
-            width,
-            height,
-            bytes_per_line,
-        )?);
+        let image = ImageDecoder::new(stream, predictor_bits, width, height, bytes_per_line)?;
+        image.check_dst(dst)?;
+        images.push(image);
     }
-    let [a, b]: [ImageDecoder; 2] = images.try_into().ok().expect("two images");
-    let [dst_a, dst_b] = dst_images;
-    a.check_dst(dst_a)?;
-    b.check_dst(dst_b)?;
-    decode_image_pair([a, b], [dst_a, dst_b])
+    let Ok(images) = <[ImageDecoder; N]>::try_from(images) else {
+        unreachable!("one image per stream");
+    };
+    decode_images(images, dst_images)
 }
 
 /// Whether row `y` uses the MED predictor (dynamic mode) instead of the average.
@@ -202,32 +197,145 @@ fn decode_image(
     Ok(())
 }
 
-/// Decodes two images in lockstep, interleaving their symbol decoders, and
-/// finishes the taller one alone.
-fn decode_image_pair(images: [ImageDecoder<'_>; 2], dst_images: [&mut [u8]; 2]) -> Result<()> {
-    let [mut a, mut b] = images;
-    let [dst_a, dst_b] = dst_images;
-    while !a.done() && !b.done() {
-        let (count_a, count_b) = (a.next_count(), b.next_count());
-        let (elem_a, elem_b) = (a.carry_over(), b.carry_over());
-        let (elem_a, elem_b) = SymbolDecoder::decode_fast_pair(
-            [&mut a.decoder, &mut b.decoder],
-            [&mut a.residuals, &mut b.residuals],
-            [elem_a, elem_b],
-            [count_a, count_b],
-        );
-        a.filled = a.decoder.finish(&mut a.residuals, elem_a, count_a)?;
-        b.filled = b.decoder.finish(&mut b.residuals, elem_b, count_b)?;
-        a.reconstruct(dst_a, count_a);
-        b.reconstruct(dst_b, count_b);
+/// Decodes `N` images in lockstep, interleaving their symbol decoders, and
+/// finishes the taller ones alone.
+fn decode_images<const N: usize>(
+    mut images: [ImageDecoder<'_>; N],
+    mut dst_images: [&mut [u8]; N],
+) -> Result<()> {
+    while images.iter().all(|image| !image.done()) {
+        let counts = images.each_ref().map(ImageDecoder::next_count);
+        let elems = images.each_mut().map(ImageDecoder::carry_over);
+        let elems = decode_fast_many(&mut images, elems, counts);
+        for ((image, dst), (elem, count)) in images
+            .iter_mut()
+            .zip(dst_images.iter_mut())
+            .zip(elems.into_iter().zip(counts))
+        {
+            image.filled = image.decoder.finish(&mut image.residuals, elem, count)?;
+            image.reconstruct(dst, count);
+        }
     }
-    while !a.done() {
-        a.step(dst_a)?;
-    }
-    while !b.done() {
-        b.step(dst_b)?;
+    for (image, dst) in images.iter_mut().zip(dst_images.iter_mut()) {
+        while !image.done() {
+            image.step(dst)?;
+        }
     }
     Ok(())
+}
+
+/// [`SymbolDecoder::decode_fast`] for `N` images at once: each round refills
+/// every decoder and alternates their lookups, so the `N` dependency chains
+/// overlap. Stops when any one would stop. Returns the new `elems`.
+///
+/// Each stream keeps only four values ([`LeanState`]) and the rounds that
+/// are safe for all streams are counted in advance, so that four streams
+/// nearly fit in the general-purpose registers.
+#[inline(always)]
+fn decode_fast_many<const N: usize>(
+    images: &mut [ImageDecoder<'_>; N],
+    elems: [usize; N],
+    counts: [usize; N],
+) -> [usize; N] {
+    for (image, count) in images.iter().zip(counts) {
+        assert!(image.residuals.len() >= count + 16);
+    }
+    let srcs = images.each_ref().map(|image| image.decoder.src);
+    let bufs = images.each_mut().map(|image| image.residuals.as_mut_ptr());
+    let mut states: [LeanState; N] = std::array::from_fn(|k| {
+        let decoder = &images[k].decoder;
+        LeanState {
+            // SAFETY: `pos` and `elems[k]` are inside their buffers.
+            src: unsafe { srcs[k].as_ptr().add(decoder.pos) },
+            out: unsafe { bufs[k].add(elems[k]) },
+            container: decoder.container,
+            shift: decoder.num_bits,
+        }
+    });
+    loop {
+        // Rounds every stream can take unchecked: one writes at most nine
+        // symbols and reads at most six bytes, and needs eight to read.
+        let mut rounds = usize::MAX;
+        for k in 0..N {
+            // SAFETY: both pointers stay inside their buffers.
+            let elem = unsafe { states[k].out.offset_from(bufs[k]) } as usize;
+            let left =
+                srcs[k].len() - unsafe { states[k].src.offset_from(srcs[k].as_ptr()) } as usize;
+            let stream_rounds = if elem + 9 <= counts[k] && left >= 8 {
+                ((counts[k] - elem - 9) / 9).min((left - 8) / 6) + 1
+            } else {
+                0
+            };
+            rounds = rounds.min(stream_rounds);
+        }
+        if rounds == 0 {
+            break;
+        }
+        for _ in 0..rounds {
+            for state in &mut states {
+                // SAFETY: eight stream bytes remain (`rounds`).
+                unsafe { state.refill() };
+            }
+            for _ in 0..3 {
+                for state in &mut states {
+                    // SAFETY: nine symbols fit before `count`, and the buffer
+                    // holds `count + 16` bytes (`rounds`).
+                    unsafe { state.lookup() };
+                }
+            }
+        }
+    }
+    std::array::from_fn(|k| {
+        let state = states[k];
+        let decoder = &mut images[k].decoder;
+        // SAFETY: both pointers stay inside their buffers.
+        unsafe {
+            decoder.pos = state.src.offset_from(srcs[k].as_ptr()) as usize;
+            (decoder.container, decoder.num_bits) = (state.container, state.shift & 63);
+            state.out.offset_from(bufs[k]) as usize
+        }
+    })
+}
+
+/// [`FastState`] with pointers for the positions and no separate bit count
+/// (the shift's low six bits are the count).
+#[derive(Clone, Copy)]
+struct LeanState {
+    src: *const u8,
+    out: *mut u8,
+    container: u64,
+    shift: u32,
+}
+
+impl LeanState {
+    /// [`FastState::refill`].
+    ///
+    /// # Safety
+    /// Eight bytes must be readable at `src`.
+    #[inline(always)]
+    unsafe fn refill(&mut self) {
+        let bytes = self.src.cast::<[u8; 8]>().read_unaligned();
+        let num_bits = self.shift & 63;
+        self.container |= stream_bits(bytes) >> num_bits;
+        let words = (63 - num_bits) >> 4;
+        self.src = self.src.add((words * 2) as usize);
+        self.shift = num_bits + words * 16;
+    }
+
+    /// [`FastState::lookup`].
+    ///
+    /// # Safety
+    /// Four bytes must be writable at `out`.
+    #[inline(always)]
+    unsafe fn lookup(&mut self) {
+        let entry = DECODE_TABLE_13.0[(self.container >> 51) as usize];
+        self.container = shift_by_entry(self.container, entry);
+        self.shift = self.shift.wrapping_sub(entry);
+        self.out
+            .cast::<[u8; 4]>()
+            .write_unaligned((entry >> 8).to_le_bytes());
+        self.out = self.out.add(((entry >> 6) & 3) as usize);
+    }
 }
 
 /// One image being decoded: its symbol decoder, the residuals of the rows in
@@ -387,13 +495,29 @@ fn stream_bits(bytes: [u8; 8]) -> u64 {
     ((words << 16) & 0xFFFF_0000_FFFF_0000) | ((words >> 16) & 0x0000_FFFF_0000_FFFF)
 }
 
-/// `container << (entry & 63)`. On x86-64 a bare `SHL`, which masks the count
-/// itself: LLVM shares the `entry & 63` with the bit count update and puts the
-/// AND on the dependency chain from one table lookup to the next (about 7% of
-/// entropy decoding).
+/// `container << (entry & 63)`. On x86-64 a bare `SHL` (`SHLX` with BMI2),
+/// which masks the count itself: LLVM shares the `entry & 63` with the bit
+/// count update and puts the AND on the dependency chain from one table lookup
+/// to the next (about 7% of entropy decoding). `SHLX` takes the count in any
+/// register, which interleaved decoders need.
 #[inline(always)]
 fn shift_by_entry(container: u64, entry: u32) -> u64 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let shifted;
+        // SAFETY: only shifts a register.
+        unsafe {
+            std::arch::asm!(
+                "shlx {shifted}, {container}, {count}",
+                shifted = lateout(reg) shifted,
+                container = in(reg) container,
+                count = in(reg) u64::from(entry),
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        shifted
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
     {
         let mut container = container;
         // SAFETY: only shifts a register.
@@ -452,41 +576,6 @@ impl<'a> SymbolDecoder<'a> {
         }
         state.store(self);
         elem
-    }
-
-    /// [`decode_fast`](Self::decode_fast) for two decoders at once: each
-    /// iteration refills both and alternates their lookups, so the two
-    /// dependency chains overlap. Stops when either one would stop.
-    #[inline(always)]
-    fn decode_fast_pair(
-        decoders: [&mut Self; 2],
-        bufs: [&mut [u8]; 2],
-        elems: [usize; 2],
-        counts: [usize; 2],
-    ) -> (usize, usize) {
-        let [a, b] = decoders;
-        let [buf_a, buf_b] = bufs;
-        let ([mut elem_a, mut elem_b], [count_a, count_b]) = (elems, counts);
-        assert!(buf_a.len() >= count_a + 16 && buf_b.len() >= count_b + 16);
-        let (mut state_a, mut state_b) = (FastState::load(a), FastState::load(b));
-        while elem_a + 9 <= count_a
-            && elem_b + 9 <= count_b
-            && state_a.has_word(a.src)
-            && state_b.has_word(b.src)
-        {
-            state_a.refill(a.src);
-            state_b.refill(b.src);
-            for _ in 0..3 {
-                // SAFETY: as in `decode_fast`, for each buffer.
-                unsafe {
-                    elem_a = state_a.lookup(buf_a, elem_a);
-                    elem_b = state_b.lookup(buf_b, elem_b);
-                }
-            }
-        }
-        state_a.store(a);
-        state_b.store(b);
-        (elem_a, elem_b)
     }
 
     /// Finishes decoding into `buf` until it holds at least `count` symbols,
@@ -1244,78 +1333,75 @@ mod tests {
         }
     }
 
-    /// Decoding two streams together gives each one's own decode, for images
-    /// of different heights (one finishes alone) and both predictors, with and
-    /// without the wavefront; a truncated stream on either side is an error.
-    #[test]
-    fn pair_decode_matches_single_decodes() {
+    /// Decoding `N` streams together gives each one's own decode, for images
+    /// of different heights (some finish alone) and both predictors, with and
+    /// without the wavefront; a truncated stream anywhere is an error.
+    fn check_many<const N: usize>(heights: [u32; N]) {
         for (width, stride) in [(8u32, 8u32), (64, 72)] {
-            for heights in [[24u32, 24], [40, 56], [20, 4]] {
-                for dynamic in [false, true] {
-                    let case = format!("{width}x{heights:?} stride {stride} dynamic {dynamic}");
-                    let images = heights.map(|height| test_image(width, height + 1, stride));
-                    let streams: Vec<Vec<u8>> = images
-                        .iter()
-                        .zip(heights)
-                        .map(|(image, height)| {
-                            let compress = if dynamic {
-                                crate::entropy_coder::compress_dynamic
-                            } else {
-                                crate::entropy_coder::compress
-                            };
-                            compress(image, width, height, stride).expect("compress")
-                        })
-                        .collect();
-                    let decode_one = |k: usize, stream: &[u8], out: &mut [u8]| {
-                        let (h, w, s) = (heights[k], width, stride);
-                        if dynamic {
-                            decompress_dynamic(stream, w, h, s, out)
-                        } else {
-                            decompress(stream, w, h, s, out)
-                        }
-                    };
-                    let sizes = heights.map(|height| (stride * height) as usize);
-                    let expected: Vec<Vec<u8>> = (0..2)
-                        .map(|k| {
-                            let mut out = vec![0u8; sizes[k]];
-                            decode_one(k, &streams[k], &mut out).expect("single decode");
-                            out
-                        })
-                        .collect();
-                    let (mut out_a, mut out_b) = (vec![0u8; sizes[0]], vec![0u8; sizes[1]]);
-                    decompress_pair(
-                        [&streams[0], &streams[1]],
-                        dynamic,
-                        width,
-                        heights,
-                        stride,
-                        [&mut out_a, &mut out_b],
-                    )
-                    .unwrap_or_else(|e| panic!("{case}: {e}"));
-                    assert_eq!(out_a, expected[0], "{case}");
-                    assert_eq!(out_b, expected[1], "{case}");
+            for dynamic in [false, true] {
+                let case = format!("{width}x{heights:?} stride {stride} dynamic {dynamic}");
+                let images = heights.map(|height| test_image(width, height + 1, stride));
+                let compress = if dynamic {
+                    crate::entropy_coder::compress_dynamic
+                } else {
+                    crate::entropy_coder::compress
+                };
+                let streams: [Vec<u8>; N] = std::array::from_fn(|k| {
+                    compress(&images[k], width, heights[k], stride).expect("compress")
+                });
+                let sizes = heights.map(|height| (stride * height) as usize);
+                let expected: [Vec<u8>; N] = std::array::from_fn(|k| {
+                    let mut out = vec![0u8; sizes[k]];
+                    if dynamic {
+                        decompress_dynamic(&streams[k], width, heights[k], stride, &mut out)
+                    } else {
+                        decompress(&streams[k], width, heights[k], stride, &mut out)
+                    }
+                    .expect("single decode");
+                    out
+                });
+                let mut outs = sizes.map(|size| vec![0u8; size]);
+                decompress_many(
+                    std::array::from_fn(|k| &streams[k][..]),
+                    dynamic,
+                    width,
+                    heights,
+                    stride,
+                    outs.each_mut().map(|out| &mut out[..]),
+                )
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+                assert_eq!(outs, expected, "{case}");
 
-                    for k in 0..2 {
-                        let len = streams[k].len();
-                        for cut in [0, 4, len / 2, len.saturating_sub(8)] {
-                            let mut cut_streams = [&streams[0][..], &streams[1][..]];
-                            cut_streams[k] = &streams[k][..cut];
-                            assert!(
-                                decompress_pair(
-                                    cut_streams,
-                                    dynamic,
-                                    width,
-                                    heights,
-                                    stride,
-                                    [&mut out_a, &mut out_b],
-                                )
-                                .is_err(),
-                                "{case}: stream {k} cut to {cut} of {len}"
-                            );
-                        }
+                for k in 0..N {
+                    let len = streams[k].len();
+                    for cut in [0, 4, len / 2, len.saturating_sub(8)] {
+                        let mut cut_streams: [&[u8]; N] = std::array::from_fn(|j| &streams[j][..]);
+                        cut_streams[k] = &streams[k][..cut];
+                        assert!(
+                            decompress_many(
+                                cut_streams,
+                                dynamic,
+                                width,
+                                heights,
+                                stride,
+                                outs.each_mut().map(|out| &mut out[..]),
+                            )
+                            .is_err(),
+                            "{case}: stream {k} cut to {cut} of {len}"
+                        );
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn interleaved_decode_matches_single_decodes() {
+        check_many([24, 24]);
+        check_many([40, 56]);
+        check_many([20, 4]);
+        check_many([16, 16, 20]);
+        check_many([24, 24, 24, 28]);
+        check_many([4, 40, 8, 64]);
     }
 }
