@@ -18,12 +18,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the C++ helpers byte for byte, checked on every 24-bit color. SSSE3 kernels
   are selected at run time and SIMD128 kernels serve WebAssembly; single-threaded,
   they split RGB 1.15-1.9x faster than C++ 4.1.1 and merge at the same speed.
+- The encoder can split an image into up to 16 chunks: horizontal strips coded
+  independently, each with its own tile header, as the C++ reference writes
+  one chunk per thread. `LlicContext::num_chunks` and `MAX_CHUNKS`, and
+  `llic_compress compress --chunks N`. Each chunk is byte-identical to coding
+  its strip alone, and the C++ decoder reads the streams.
 - `helpers::BufferError`, naming the buffer that is too small or has too
   short a stride, and `helpers::DimensionsError`, for sizes that do not fit a
   layout. `LlicError` is unchanged.
 
 ### Changed
 
+- `LlicContext::new`'s last argument is now the encoder's chunk count
+  (`num_chunks`, default 1) instead of an unused thread count that defaulted
+  to the number of CPUs. Streams from a context made with `None` or `Some(1)`
+  are unchanged. Counts above 16 or above one chunk per four rows are
+  `InvalidArgument`. The `num_cpus` dependency is gone.
 - Tile-based decoding unpacks eight blocks at once with AVX2 on x86-64 CPUs
   that have it (detected at run time, so default builds get it): about 1.13x
   for lossless and 1.07-1.28x for lossy fast-mode streams, and up to 1.12x in

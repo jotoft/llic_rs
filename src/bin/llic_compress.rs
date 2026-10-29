@@ -30,6 +30,9 @@ enum Commands {
         input: String,
         /// Output LLIC file
         output: String,
+        /// Horizontal strips coded independently, each with its own tile header (1-16)
+        #[arg(long, default_value_t = 1)]
+        chunks: usize,
     },
     /// Decompress an LLIC file to an image (PNG/PGM based on extension)
     #[command(visible_alias = "d")]
@@ -79,7 +82,7 @@ fn save_grayscale_image(
     Ok(())
 }
 
-fn compress(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn compress(input: &str, output: &str, chunks: usize) -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new(input).exists() {
         return Err(format!("Input file not found: {}", input).into());
     }
@@ -94,7 +97,7 @@ fn compress(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>>
     );
 
     // Create compression context
-    let context = LlicContext::new(width, height, width, None)?;
+    let context = LlicContext::new(width, height, width, Some(chunks))?;
 
     // Allocate output buffer
     let max_size = context.compressed_buffer_size();
@@ -180,7 +183,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Compress { input, output } => compress(&input, &output)?,
+        Commands::Compress {
+            input,
+            output,
+            chunks,
+        } => compress(&input, &output, chunks)?,
         Commands::Decompress { input, output } => decompress(&input, &output)?,
     }
 

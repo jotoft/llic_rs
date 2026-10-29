@@ -66,20 +66,29 @@ pub enum LlicError {
 
 pub type Result<T> = std::result::Result<T, LlicError>;
 
+/// Most chunks a stream can hold, as in the C++ reference (`LLIC_MAX_CHUNKS`).
+pub const MAX_CHUNKS: usize = 16;
+
 pub struct LlicContext {
     width: u32,
     height: u32,
     bytes_per_line: u32,
-    #[allow(dead_code)] // Will be used for multi-threaded compression
-    num_threads: usize,
+    num_chunks: usize,
 }
 
 impl LlicContext {
+    /// Creates a context for `width` x `height` images, `bytes_per_line` apart.
+    ///
+    /// `num_chunks` is how many horizontal strips the encoder splits each
+    /// image into (default 1). Every chunk is coded on its own, with its own
+    /// tile header, as the C++ reference writes one chunk per thread. Up to
+    /// [`MAX_CHUNKS`], and at most one per four rows. Decoding takes the
+    /// count from the stream, so it accepts any count.
     pub fn new(
         width: u32,
         height: u32,
         bytes_per_line: u32,
-        num_threads: Option<usize>,
+        num_chunks: Option<usize>,
     ) -> Result<Self> {
         if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
             return Err(LlicError::ImageDimensions);
@@ -89,29 +98,40 @@ impl LlicContext {
             return Err(LlicError::InvalidArgument);
         }
 
-        #[cfg(feature = "std")]
-        let num_threads = num_threads.unwrap_or_else(num_cpus::get);
-        #[cfg(not(feature = "std"))]
-        let num_threads = num_threads.unwrap_or(1);
+        let num_chunks = num_chunks.unwrap_or(1);
+        if !(1..=MAX_CHUNKS).contains(&num_chunks) || num_chunks > height as usize / 4 {
+            return Err(LlicError::InvalidArgument);
+        }
 
         Ok(Self {
             width,
             height,
             bytes_per_line,
-            num_threads,
+            num_chunks,
         })
+    }
+
+    /// The number of chunks the encoder splits each image into.
+    pub fn num_chunks(&self) -> usize {
+        self.num_chunks
     }
 
     /// Size of an output buffer that holds any stream `compress_gray8` and
     /// `compress_gray8_versioned` can write for this context, as the C++
-    /// `llic_compressedBufferSize` computes it for one chunk: the container
-    /// header and the larger of the entropy-coded worst case (13 bits per
-    /// pixel plus the dynamic predictor bitmap, and 4 bytes the in-place
-    /// encoder may write past it) and the tile-based one.
+    /// `llic_compressedBufferSize` computes it: the container header and, per
+    /// chunk, its size entry and the larger of the entropy-coded worst case
+    /// (13 bits per pixel plus the dynamic predictor bitmap, and 4 bytes the
+    /// in-place encoder may write past it) and the tile-based one.
     pub fn compressed_buffer_size(&self) -> usize {
-        let entropy = entropy_coder::max_compressed_size(self.width, self.height, true);
-        let tile = lossy::tile_block_scratch_size(self.width, self.height);
-        V4_HEADER_LEN + entropy.max(tile)
+        let chunks = (0..self.num_chunks).map(|chunk| {
+            #[allow(clippy::cast_possible_truncation)] // at most the height
+            let rows =
+                chunk_rows(FORMAT_VERSION, self.height as usize, self.num_chunks, chunk) as u32;
+            let entropy = entropy_coder::max_compressed_size(self.width, rows, true);
+            let tile = lossy::tile_block_scratch_size(self.width, rows);
+            4 + entropy.max(tile)
+        });
+        V4_FIELDS_LEN + chunks.sum::<usize>()
     }
 
     pub fn decompress_gray8(
@@ -292,16 +312,18 @@ impl LlicContext {
     /// Number of bytes written to dst_data, or error.
     ///
     /// # Format
+    /// The container header, one `u32 LE` size per chunk, then the chunks in
+    /// row order (see [`LlicContext::new`] for the chunk count):
     /// - v5: as v4 with `version=5`; tile chunks with a compressed header put it
     ///   after the pixel stream (see [`lossy::TileHeaderLayout`])
-    /// - v4: `[version=4][num_blocks=1][tile_based][mode][block_size:u32 LE][data]`
-    /// - v3 entropy-coded: `[version=3][num_blocks=1][0x00][block_size:u32 LE][data]`
-    /// - v3 tile-based: `[version=3][num_blocks=1][block_size:u32 LE][data]`
+    /// - v4: `[version=4][num_chunks][tile_based][mode][chunk_sizes][chunks]`
+    /// - v3 entropy-coded: `[version=3][num_chunks][0x00][chunk_sizes][chunks]`
+    /// - v3 tile-based: `[version=3][num_chunks][chunk_sizes][chunks]`
     ///
     /// In v3 the entropy-vs-tile discriminator is "byte 2 == 0", so for v3
-    /// tile-based the least-significant byte of `block_size` must be non-zero.
-    /// When the payload length lands on a multiple of 256, one pad byte is
-    /// appended (and counted in `block_size`) to keep the LSB non-zero;
+    /// tile-based the least-significant byte of the first chunk size must be
+    /// non-zero. When that chunk's length lands on a multiple of 256, one pad
+    /// byte is appended (and counted in its size) to keep the LSB non-zero;
     /// decoders never read it.
     ///
     /// v3 has no mode byte. For tile-based streams the mode is carried in
@@ -335,98 +357,84 @@ impl LlicContext {
             Quality::Low => 16,
             Quality::VeryLow => 32,
         };
-
-        // Block payloads are identical across versions, apart from where a tile
-        // block keeps a compressed header (see `TileHeaderLayout`).
-        if use_entropy {
-            let dynamic = mode == Mode::Dynamic;
-            let offset = match format_version {
-                FormatVersion::V3 => V3_ENTROPY_HEADER_LEN,
-                FormatVersion::V4 | FormatVersion::V5 => V4_HEADER_LEN,
-            };
-            // Encode in place behind the container header when the buffer has
-            // room for the worst case (compressed_buffer_size always does).
-            let max_size = entropy_coder::max_compressed_size(self.width, self.height, dynamic);
-            if dst_data.len() >= offset + max_size {
-                let (w, h, bpl) = (self.width, self.height, self.bytes_per_line);
-                let out = &mut dst_data[offset..];
-                let size = if dynamic {
-                    entropy_coder::compress_dynamic_into(src_graymap, w, h, bpl, out)?
-                } else {
-                    entropy_coder::compress_into(src_graymap, w, h, bpl, out)?
-                };
-                match format_version {
-                    FormatVersion::V4 | FormatVersion::V5 => {
-                        write_v4_header(dst_data, format_version, false, mode, size);
-                    }
-                    FormatVersion::V3 => write_v3_entropy_header(dst_data, size),
-                }
-                return Ok(offset + size);
-            }
-            let compressed = if dynamic {
-                entropy_coder::compress_dynamic(
-                    src_graymap,
-                    self.width,
-                    self.height,
-                    self.bytes_per_line,
-                )?
-            } else {
-                entropy_coder::compress(src_graymap, self.width, self.height, self.bytes_per_line)?
-            };
-            return match format_version {
-                FormatVersion::V4 | FormatVersion::V5 => {
-                    write_v4_block(&compressed, format_version, false, mode, dst_data)
-                }
-                FormatVersion::V3 => write_v3_block(&compressed, true, dst_data),
-            };
-        }
-
+        let dynamic = mode == Mode::Dynamic;
         let compress_header = mode != Mode::Fast;
-        let use_dynamic_predictor = mode == Mode::Dynamic;
         let layout = lossy::TileHeaderLayout::for_format_version(format_version as u8);
-        let offset = match format_version {
-            FormatVersion::V3 => V3_TILE_HEADER_LEN,
-            FormatVersion::V4 | FormatVersion::V5 => V4_HEADER_LEN,
-        };
-        // Encode in place behind the container header when the buffer has room
-        // for the worst case (compressed_buffer_size always does).
-        if dst_data.len() >= offset + lossy::tile_block_scratch_size(self.width, self.height) {
-            let size = lossy::compress_tile_block_into(
-                src_graymap,
-                self.width,
-                self.height,
-                self.bytes_per_line,
-                error_limit,
-                compress_header,
-                use_dynamic_predictor,
-                layout,
-                &mut dst_data[offset..],
-            )?;
-            return Ok(match format_version {
-                FormatVersion::V4 | FormatVersion::V5 => {
-                    write_v4_header(dst_data, format_version, true, mode, size);
-                    offset + size
-                }
-                FormatVersion::V3 => write_v3_tile_header(dst_data, size),
-            });
-        }
+        let (width, bpl) = (self.width, self.bytes_per_line);
 
-        let compressed = lossy::compress_tile_block(
-            src_graymap,
-            self.width,
-            self.height,
-            self.bytes_per_line,
-            error_limit,
-            compress_header,
-            use_dynamic_predictor,
-            layout,
-        )?;
-        match format_version {
-            FormatVersion::V4 | FormatVersion::V5 => {
-                write_v4_block(&compressed, format_version, true, mode, dst_data)
+        // Chunk payloads are identical across versions, apart from where a tile
+        // chunk keeps a compressed header (see `TileHeaderLayout`).
+        let scratch_size = |rows: u32| {
+            if use_entropy {
+                entropy_coder::max_compressed_size(width, rows, dynamic)
+            } else {
+                lossy::tile_block_scratch_size(width, rows)
             }
-            FormatVersion::V3 => write_v3_block(&compressed, false, dst_data),
+        };
+        let encode_chunk = |src: &[u8], rows: u32, out: &mut [u8]| {
+            if !use_entropy {
+                lossy::compress_tile_block_into(
+                    src,
+                    width,
+                    rows,
+                    bpl,
+                    error_limit,
+                    compress_header,
+                    dynamic,
+                    layout,
+                    out,
+                )
+            } else if dynamic {
+                entropy_coder::compress_dynamic_into(src, width, rows, bpl, out)
+            } else {
+                entropy_coder::compress_into(src, width, rows, bpl, out)
+            }
+        };
+
+        let num_chunks = self.num_chunks;
+        let fields_len =
+            write_container_fields(dst_data, format_version, !use_entropy, mode, num_chunks)?;
+        let mut pos = fields_len + 4 * num_chunks;
+        if dst_data.len() < pos {
+            return Err(LlicError::InvalidArgument);
         }
+        let mut row = 0usize;
+        for chunk in 0..num_chunks {
+            let rows = chunk_rows(
+                format_version as u8,
+                self.height as usize,
+                num_chunks,
+                chunk,
+            );
+            let src = &src_graymap[row * bpl as usize..];
+            #[allow(clippy::cast_possible_truncation)] // at most the height
+            let rows32 = rows as u32;
+            // Encode in place when the rest of the buffer has room for the
+            // chunk's worst case (compressed_buffer_size always does), else
+            // through a scratch buffer.
+            let scratch = scratch_size(rows32);
+            let mut size = if dst_data.len() - pos >= scratch {
+                encode_chunk(src, rows32, &mut dst_data[pos..])?
+            } else {
+                let mut tmp = vec![0u8; scratch];
+                let size = encode_chunk(src, rows32, &mut tmp)?;
+                dst_data
+                    .get_mut(pos..pos + size)
+                    .ok_or(LlicError::InvalidArgument)?
+                    .copy_from_slice(&tmp[..size]);
+                size
+            };
+            if chunk == 0 && format_version == FormatVersion::V3 && !use_entropy {
+                size = pad_v3_tile_chunk(dst_data, pos, size)?;
+            }
+            #[allow(clippy::cast_possible_truncation)] // chunks are far below 4 GiB
+            let size_field = (size as u32).to_le_bytes();
+            dst_data[fields_len + 4 * chunk..fields_len + 4 * chunk + 4]
+                .copy_from_slice(&size_field);
+            pos += size;
+            row += rows;
+        }
+        Ok(pos)
     }
 }
 
@@ -451,103 +459,56 @@ fn chunk_rows(version: u8, height: usize, num_chunks: usize, index: usize) -> us
     }
 }
 
-/// Container header length before a single block's payload in v4/v5.
-const V4_HEADER_LEN: usize = 8;
-/// Container header length before a single tile-based block's payload in v3.
-const V3_TILE_HEADER_LEN: usize = 6;
-/// Container header length before a single entropy-coded block's payload in v3.
-const V3_ENTROPY_HEADER_LEN: usize = 7;
+/// Container header fields before the chunk size table in v4/v5:
+/// `[version][num_chunks][tile_based][mode]`.
+const V4_FIELDS_LEN: usize = 4;
 
-/// Write the v3 header of a single entropy-coded block whose payload of
-/// `payload_len` bytes is already in place: `[3][1][0x00][block_size:u32 LE]`.
-fn write_v3_entropy_header(dst_data: &mut [u8], payload_len: usize) {
-    dst_data[0] = FormatVersion::V3 as u8;
-    dst_data[1] = 1;
-    dst_data[2] = 0;
-    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
-    dst_data[3..7].copy_from_slice(&(payload_len as u32).to_le_bytes());
-}
-
-/// Write the v4/v5 header of a single-block container whose payload of
-/// `payload_len` bytes is already in place:
-/// `[version][1][tile_based][mode][block_size:u32 LE]`.
-fn write_v4_header(
+/// Write the container header fields that precede the chunk size table and
+/// return their length:
+/// - v4/v5: `[version][num_chunks][tile_based][mode]`
+/// - v3 entropy-coded: `[3][num_chunks][0x00]`
+/// - v3 tile-based: `[3][num_chunks]`
+fn write_container_fields(
     dst_data: &mut [u8],
     version: FormatVersion,
     tile_based: bool,
     mode: Mode,
-    payload_len: usize,
-) {
-    dst_data[0] = version as u8;
-    dst_data[1] = 1;
-    dst_data[2] = tile_based as u8;
-    dst_data[3] = mode as u8;
-    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
-    dst_data[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
-}
-
-/// Write the v3 header of a single tile-based block whose payload is already
-/// in place, padding it as [`write_v3_block`] describes; needs one byte of
-/// room after the payload. Returns the container size.
-fn write_v3_tile_header(dst_data: &mut [u8], payload_len: usize) -> usize {
-    let padding = usize::from(payload_len.is_multiple_of(256));
-    let total = V3_TILE_HEADER_LEN + payload_len + padding;
-    if padding == 1 {
-        dst_data[total - 1] = 0;
-    }
-    dst_data[0] = FormatVersion::V3 as u8;
-    dst_data[1] = 1;
-    #[allow(clippy::cast_possible_truncation)] // payloads are far below 4 GiB
-    dst_data[2..6].copy_from_slice(&((payload_len + padding) as u32).to_le_bytes());
-    total
-}
-
-/// Write a single-block container with the v4 header, also used by v5:
-/// `[version][1][tile_based][mode][block_size:u32 LE][payload]`.
-fn write_v4_block(
-    payload: &[u8],
-    version: FormatVersion,
-    tile_based: bool,
-    mode: Mode,
-    dst_data: &mut [u8],
+    num_chunks: usize,
 ) -> Result<usize> {
-    let total = V4_HEADER_LEN + payload.len();
-    if dst_data.len() < total {
-        return Err(LlicError::InvalidArgument);
-    }
-    dst_data[V4_HEADER_LEN..total].copy_from_slice(payload);
-    write_v4_header(dst_data, version, tile_based, mode, payload.len());
-    Ok(total)
+    #[allow(clippy::cast_possible_truncation)] // at most MAX_CHUNKS
+    let count = num_chunks as u8;
+    let fields: &[u8] = match version {
+        FormatVersion::V4 | FormatVersion::V5 => {
+            &[version as u8, count, tile_based as u8, mode as u8]
+        }
+        FormatVersion::V3 if tile_based => &[3, count],
+        FormatVersion::V3 => &[3, count, 0],
+    };
+    dst_data
+        .get_mut(..fields.len())
+        .ok_or(LlicError::InvalidArgument)?
+        .copy_from_slice(fields);
+    Ok(fields.len())
 }
 
-/// Write a single-block legacy v3 container.
+/// Pad the first chunk of a v3 tile-based stream, `size` bytes at `pos`.
 ///
-/// Entropy-coded: `[3][1][0x00][block_size:u32 LE][payload]`.
-/// Tile-based: `[3][1][block_size:u32 LE][payload]`. The decoder treats
-/// byte 2 == 0 as entropy-coded, so the LSB of block_size must be non-zero:
-/// when the payload length is a multiple of 256, one zero pad byte is appended
-/// and counted in block_size. Decoders use block sizes only to locate the next
-/// block and read tile streams by need, so the pad byte is never read (both in
-/// this crate and the C++ reference). The current tile encoder always produces
-/// odd payload lengths (the bit writer flushes 16-bit words and pixel data is
-/// an even byte count per tile), so the padding is defensive.
-fn write_v3_block(payload: &[u8], entropy: bool, dst_data: &mut [u8]) -> Result<usize> {
-    if entropy {
-        let total = V3_ENTROPY_HEADER_LEN + payload.len();
-        if dst_data.len() < total {
-            return Err(LlicError::InvalidArgument);
-        }
-        dst_data[V3_ENTROPY_HEADER_LEN..total].copy_from_slice(payload);
-        write_v3_entropy_header(dst_data, payload.len());
-        Ok(total)
-    } else {
-        let padding = usize::from(payload.len().is_multiple_of(256));
-        if dst_data.len() < V3_TILE_HEADER_LEN + payload.len() + padding {
-            return Err(LlicError::InvalidArgument);
-        }
-        dst_data[V3_TILE_HEADER_LEN..V3_TILE_HEADER_LEN + payload.len()].copy_from_slice(payload);
-        Ok(write_v3_tile_header(dst_data, payload.len()))
+/// The v3 decoder treats byte 2 == 0 as entropy-coded, and byte 2 is the LSB
+/// of the first chunk's size, so it must be non-zero: when the size is a
+/// multiple of 256, one zero pad byte is appended and counted in it. Returns
+/// the size to record. Decoders use chunk sizes only to locate the next chunk
+/// and read tile streams by need, so the pad byte is never read (both in this
+/// crate and the C++ reference). The current tile encoder always produces odd
+/// payload lengths (the bit writer flushes 16-bit words and pixel data is an
+/// even byte count per tile), so the padding is defensive.
+fn pad_v3_tile_chunk(dst_data: &mut [u8], pos: usize, size: usize) -> Result<usize> {
+    if !size.is_multiple_of(256) {
+        return Ok(size);
     }
+    *dst_data
+        .get_mut(pos + size)
+        .ok_or(LlicError::InvalidArgument)? = 0;
+    Ok(size + 1)
 }
 
 pub mod entropy_coder;
@@ -1209,28 +1170,25 @@ mod tests {
     }
 
     #[test]
-    fn write_v3_block_pads_when_payload_length_lsb_is_zero() {
+    fn v3_first_tile_chunk_is_padded_when_its_length_lsb_is_zero() {
         // The tile encoder currently always produces odd payload lengths, so
-        // exercise the defensive pad path at the block-writer level.
+        // exercise the defensive pad path directly.
         let mut buf = vec![0xAAu8; 600];
 
-        // 256-byte payload: LSB of block_size would be 0, so one pad byte is
-        // appended and counted.
-        let payload = vec![7u8; 256];
-        let n = write_v3_block(&payload, false, &mut buf).unwrap();
-        assert_eq!(n, 6 + 257);
-        let block_size = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        assert_eq!(block_size, 257, "block size counts the pad byte");
-        assert_ne!(buf[2], 0, "byte 2 must be non-zero (LSB of block_size)");
-        assert_eq!(buf[n - 1], 0, "pad byte");
-        assert_eq!(&buf[6..6 + 256], &payload[..], "payload unchanged");
+        // 256 bytes: the size's LSB would be 0, so one pad byte is appended
+        // and counted.
+        assert_eq!(pad_v3_tile_chunk(&mut buf, 6, 256).unwrap(), 257);
+        assert_eq!(buf[6 + 256], 0, "pad byte");
+        assert_eq!(buf[6 + 255], 0xAA, "payload unchanged");
 
-        // 255-byte payload: no padding needed.
-        let payload = vec![7u8; 255];
-        let n = write_v3_block(&payload, false, &mut buf).unwrap();
-        assert_eq!(n, 6 + 255);
-        let block_size = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        assert_eq!(block_size, 255);
+        // 255 bytes: no padding needed.
+        let mut buf = vec![0xAAu8; 600];
+        assert_eq!(pad_v3_tile_chunk(&mut buf, 6, 255).unwrap(), 255);
+        assert!(buf.iter().all(|&b| b == 0xAA));
+
+        // No room for the pad byte.
+        let mut buf = vec![0xAAu8; 6 + 256];
+        assert!(pad_v3_tile_chunk(&mut buf, 6, 256).is_err());
     }
 
     #[test]
@@ -1319,8 +1277,11 @@ mod tests {
         let src: Vec<u8> = (0..width * height)
             .map(|i| ((i * 7919) % 251 + (i % width)) as u8)
             .collect();
-        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
-        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+        for (version, chunks) in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5]
+            .into_iter()
+            .flat_map(|version| [1, 3].map(|chunks| (version, chunks)))
+        {
+            let ctx = LlicContext::new(width, height, width, Some(chunks)).unwrap();
             for quality in [Quality::Lossless, Quality::Medium, Quality::LosslessEntropy] {
                 for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
                     if version == FormatVersion::V3 && mode == Mode::Dynamic {
@@ -1334,7 +1295,7 @@ mod tests {
                     let tight_size = ctx
                         .compress_gray8_versioned(&src, quality, mode, version, &mut tight)
                         .unwrap();
-                    let case = format!("{version:?} {quality:?} {mode:?}");
+                    let case = format!("{version:?} {quality:?} {mode:?} {chunks} chunks");
                     assert_eq!(tight_size, size, "{case}");
                     assert_eq!(tight, roomy[..size], "{case}");
                     let mut too_small = vec![0u8; size - 1];
@@ -1363,9 +1324,12 @@ mod tests {
                 (state >> 24) as u8
             })
             .collect();
-        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
-        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
-        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+        for (version, chunks) in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5]
+            .into_iter()
+            .flat_map(|version| [1, 3, MAX_CHUNKS].map(|chunks| (version, chunks)))
+        {
+            let ctx = LlicContext::new(width, height, width, Some(chunks)).unwrap();
+            let mut buf = vec![0u8; ctx.compressed_buffer_size()];
             for quality in [
                 Quality::Lossless,
                 Quality::VeryLow,
@@ -1376,7 +1340,125 @@ mod tests {
                         continue;
                     }
                     ctx.compress_gray8_versioned(&noise, quality, mode, version, &mut buf)
-                        .unwrap_or_else(|e| panic!("{version:?} {quality:?} {mode:?}: {e}"));
+                        .unwrap_or_else(|e| {
+                            panic!("{version:?} {quality:?} {mode:?} {chunks} chunks: {e}")
+                        });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_checks_the_chunk_count() {
+        assert_eq!(LlicContext::new(64, 64, 64, None).unwrap().num_chunks(), 1);
+        assert_eq!(
+            LlicContext::new(64, 64, 64, Some(16)).unwrap().num_chunks(),
+            16
+        );
+        // At most one chunk per four rows.
+        assert_eq!(
+            LlicContext::new(64, 8, 64, Some(2)).unwrap().num_chunks(),
+            2
+        );
+        for (height, chunks) in [(64, 0), (128, MAX_CHUNKS + 1), (8, 3)] {
+            assert!(
+                matches!(
+                    LlicContext::new(64, height, 64, Some(chunks)),
+                    Err(LlicError::InvalidArgument)
+                ),
+                "{chunks} chunks of {height} rows"
+            );
+        }
+    }
+
+    /// Each chunk is coded as its strip of rows would be on its own (the C++
+    /// layout: one encoder per chunk, rows split by `chunk_rows`), and the
+    /// stream decodes to the strips' decoded rows.
+    #[test]
+    fn chunks_are_coded_independently() {
+        // 76 rows split 24, 24, 28 in three chunks; stride wider than a row.
+        let (width, height, stride) = (72u32, 76u32, 80u32);
+        let src: Vec<u8> = (0..stride * height)
+            .map(|i| ((i * 7919) % 251 + (i % stride) * 2) as u8)
+            .collect();
+        let stride_len = stride as usize;
+        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+            let fields = |quality| match version {
+                FormatVersion::V4 | FormatVersion::V5 => 4,
+                FormatVersion::V3 if quality == Quality::LosslessEntropy => 3,
+                FormatVersion::V3 => 2,
+            };
+            for quality in [Quality::Lossless, Quality::High, Quality::LosslessEntropy] {
+                for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
+                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                        continue;
+                    }
+                    for chunks in [2usize, 3, 5, 19] {
+                        let case = format!("{version:?} {quality:?} {mode:?} {chunks} chunks");
+                        let ctx =
+                            LlicContext::new(width, height, stride, Some(chunks.min(16))).unwrap();
+                        let chunks = ctx.num_chunks();
+                        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+                        let size = ctx
+                            .compress_gray8_versioned(&src, quality, mode, version, &mut buf)
+                            .unwrap();
+                        let stream = &buf[..size];
+                        assert_eq!(stream[1] as usize, chunks, "{case}");
+
+                        let table = fields(quality);
+                        let mut pos = table + 4 * chunks;
+                        let mut row = 0usize;
+                        let mut expected = vec![0u8; src.len()];
+                        for chunk in 0..chunks {
+                            let rows = chunk_rows(version as u8, height as usize, chunks, chunk);
+                            let at = table + 4 * chunk;
+                            let chunk_size =
+                                u32::from_le_bytes(stream[at..at + 4].try_into().unwrap()) as usize;
+
+                            let strip = &src[row * stride_len..];
+                            let alone =
+                                LlicContext::new(width, rows as u32, stride, Some(1)).unwrap();
+                            let mut alone_buf = vec![0u8; alone.compressed_buffer_size()];
+                            let alone_size = alone
+                                .compress_gray8_versioned(
+                                    strip,
+                                    quality,
+                                    mode,
+                                    version,
+                                    &mut alone_buf,
+                                )
+                                .unwrap();
+                            let alone_stream = &alone_buf[..alone_size];
+                            assert_eq!(
+                                stream[pos..pos + chunk_size],
+                                alone_stream[table + 4..],
+                                "{case}: chunk {chunk}"
+                            );
+                            alone
+                                .decompress_gray8(alone_stream, &mut expected[row * stride_len..])
+                                .unwrap();
+                            pos += chunk_size;
+                            row += rows;
+                        }
+                        assert_eq!(pos, size, "{case}");
+                        assert_eq!(row, height as usize, "{case}");
+
+                        let mut decoded = vec![0u8; src.len()];
+                        let (decoded_quality, _) =
+                            ctx.decompress_gray8(stream, &mut decoded).unwrap();
+                        assert_eq!(decoded_quality, quality, "{case}");
+                        for y in 0..height as usize {
+                            let row = y * stride_len..y * stride_len + width as usize;
+                            assert_eq!(
+                                decoded[row.clone()],
+                                expected[row.clone()],
+                                "{case}: row {y}"
+                            );
+                            if quality != Quality::High {
+                                assert_eq!(decoded[row.clone()], src[row], "{case}: row {y}");
+                            }
+                        }
+                    }
                 }
             }
         }

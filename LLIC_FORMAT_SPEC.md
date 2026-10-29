@@ -44,7 +44,7 @@ Splitting](#task-splitting)).
 | Offset | Size | Description                                          |
 |--------|------|------------------------------------------------------|
 | 0      | 1    | Format version = 4 or 5                              |
-| 1      | 1    | Number of compressed blocks/threads                  |
+| 1      | 1    | Number of compressed blocks (chunks), 1-16           |
 | 2      | 1    | Stream type: 0 = entropy-coded lossless, 1 = tile-based |
 | 3      | 1    | Mode: 0 = Default, 1 = Fast, 2 = Dynamic             |
 
@@ -60,7 +60,7 @@ v3 has no stream-type or mode byte. The decoder discriminates on byte 2:
   | Offset | Size | Description                         |
   |--------|------|-------------------------------------|
   | 0      | 1    | Format version = 3                  |
-  | 1      | 1    | Number of compressed blocks/threads |
+  | 1      | 1    | Number of compressed blocks (chunks) |
   | 2      | 1    | 0x00 (entropy-coded marker)         |
 
 - **Tile-based**: the block-size table starts directly at offset 2, so byte 2
@@ -73,7 +73,7 @@ v3 has no stream-type or mode byte. The decoder discriminates on byte 2:
   | Offset | Size | Description                         |
   |--------|------|-------------------------------------|
   | 0      | 1    | Format version = 3                  |
-  | 1      | 1    | Number of compressed blocks/threads |
+  | 1      | 1    | Number of compressed blocks (chunks) |
   | 2      | ...  | Block-size table (LSB must be ≠ 0)  |
 
   **Writer rule (padding)**: if a tile-based payload length is a multiple of
@@ -232,15 +232,17 @@ The algorithm determines quantization buckets dynamically:
 
 ### Task Splitting
 
-For multi-threaded processing the image is split into horizontal strips, one
-per block. Format v3 and later:
+The image is split into horizontal strips, one per block (chunk), each coded
+on its own. The C++ reference writes one block per encoder thread; llic_rs
+takes the count as a context setting (`LlicContext::new`'s `num_chunks`).
+Format v3 and later:
 
-- Base block size = (height / num_threads) / 4 * 4
+- Base block size = (height / num_blocks) / 4 * 4
 - Last block gets remainder pixels
 
 Format v2 (C++ 2.0.x; otherwise identical to v3) rounds up instead:
 
-- Block size = height / num_threads, rounded up to a multiple of 4
+- Block size = height / num_blocks, rounded up to a multiple of 4
 - Later blocks shrink (to zero if needed) so the total does not exceed the
   height. This can leave rows unassigned (24 rows in 5 blocks covers 20), which
   is why v3 changed the split; such streams are invalid.

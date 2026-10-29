@@ -122,7 +122,7 @@ Header byte structure of the compressed stream varies by format version (3, 4 or
 ### Core API
 
 ```rust
-let ctx = LlicContext::new(width, height, bytes_per_line, num_threads)?;
+let ctx = LlicContext::new(width, height, bytes_per_line, num_chunks)?; // chunks: None = 1
 let size = ctx.compress_gray8(&pixels, Quality::Lossless, Mode::Default, &mut output)?;
 let (quality, mode) = ctx.decompress_gray8(&compressed, &mut output)?;
 ```

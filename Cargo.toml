@@ -37,7 +37,7 @@ default-members = ["."]
 
 [features]
 default = ["std"]
-std = ["dep:num_cpus"]
+std = []
 # The llic_compress command-line tool (PNG/PGM I/O and argument parsing)
 cli = ["std", "dep:image", "dep:clap"]
 wasm = ["dep:wasm-bindgen"]
@@ -45,8 +45,6 @@ wasm = ["dep:wasm-bindgen"]
 [dependencies]
 thiserror = "1.0"
 
-# Optional: only for native builds
-num_cpus = { version = "1.16", optional = true }
 # Optional: only for the llic_compress CLI (feature "cli")
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
