@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the number of CPUs. Streams from a context made with `None` or `Some(1)`
   are unchanged. Counts above 16 or above one chunk per four rows are
   `InvalidArgument`. The `num_cpus` dependency is gone.
+- Streams with two or more chunks decode two chunks at a time, with their
+  entropy decoders interleaved so that the table lookups of one overlap
+  those of the other (`entropy_coder::decompress_pair`,
+  `lossy::decompress_tile_block_pair`). Single-threaded on the 1920x1280 test
+  photos, lossless default streams in 2 chunks decode 16-18% faster than
+  chunk by chunk, 1.15-1.2x the speed of one chunk. Single-chunk decoding is
+  about 1.7% faster.
 - Tile-based decoding unpacks eight blocks at once with AVX2 on x86-64 CPUs
   that have it (detected at run time, so default builds get it): about 1.13x
   for lossless and 1.07-1.28x for lossy fast-mode streams, and up to 1.12x in

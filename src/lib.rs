@@ -229,28 +229,28 @@ impl LlicContext {
             Quality::LosslessEntropy
         };
 
-        // Helper closure to decompress a block based on mode and tile_based flag
+        // Decompress one block, or two at once (their entropy decoders
+        // interleave), based on mode and tile_based flag.
         let layout = lossy::TileHeaderLayout::for_format_version(version);
-        let decompress_block =
-            |data: &[u8], w: u32, h: u32, bpl: u32, dst: &mut [u8]| -> Result<()> {
-                if tile_based {
-                    lossy::decompress_tile_block_dynamic(
-                        data,
-                        w,
-                        h,
-                        bpl,
-                        mode == Mode::Dynamic,
-                        layout,
-                        dst,
-                    )
-                } else if mode == Mode::Dynamic {
-                    entropy_coder::decompress_dynamic(data, w, h, bpl, dst)
-                } else {
-                    entropy_coder::decompress(data, w, h, bpl, dst)
-                }
-            };
+        let (w, bpl, dynamic) = (self.width, self.bytes_per_line, mode == Mode::Dynamic);
+        let decompress_block = |data: &[u8], rows: u32, dst: &mut [u8]| -> Result<()> {
+            if tile_based {
+                lossy::decompress_tile_block_dynamic(data, w, rows, bpl, dynamic, layout, dst)
+            } else if dynamic {
+                entropy_coder::decompress_dynamic(data, w, rows, bpl, dst)
+            } else {
+                entropy_coder::decompress(data, w, rows, bpl, dst)
+            }
+        };
+        let decompress_pair = |data: [&[u8]; 2], rows: [u32; 2], dst: [&mut [u8]; 2]| {
+            if tile_based {
+                lossy::decompress_tile_block_pair(data, w, rows, bpl, dynamic, layout, dst)
+            } else {
+                entropy_coder::decompress_pair(data, dynamic, w, rows, bpl, dst)
+            }
+        };
 
-        // Each block (one per encoder thread) holds a horizontal strip of rows,
+        // Each block (one per encoder chunk) holds a horizontal strip of rows,
         // split as `chunk_rows` says; strips with no rows have empty blocks.
         // Blocks decode straight into their rows of the output.
         let (width, height) = (self.width as usize, self.height as usize);
@@ -258,6 +258,8 @@ impl LlicContext {
         if dst_graymap.len() < (height - 1) * stride + width {
             return Err(LlicError::InvalidArgument);
         }
+        // (data, first row, rows) of each block with rows.
+        let mut blocks = Vec::with_capacity(block_sizes.len());
         let mut row = 0usize;
         for (index, &size) in block_sizes.iter().enumerate() {
             let data_end = pos
@@ -272,13 +274,32 @@ impl LlicContext {
             if data.is_empty() || row + rows > height {
                 return Err(LlicError::InvalidData);
             }
-            let strip = &mut dst_graymap[row * stride..(row + rows - 1) * stride + width];
-            #[allow(clippy::cast_possible_truncation)] // at most the height
-            decompress_block(data, self.width, rows as u32, self.bytes_per_line, strip)?;
+            blocks.push((data, row, rows));
             row += rows;
         }
         if row != height {
             return Err(LlicError::InvalidData);
+        }
+        let strip_end = |row: usize, rows: usize| (row + rows - 1) * stride + width;
+        for pair in blocks.chunks(2) {
+            #[allow(clippy::cast_possible_truncation)] // at most the height
+            match *pair {
+                [(data_a, row_a, rows_a), (data_b, row_b, rows_b)] => {
+                    let (above, below) = dst_graymap.split_at_mut(row_b * stride);
+                    let strip_a = &mut above[row_a * stride..strip_end(row_a, rows_a)];
+                    let strip_b = &mut below[..strip_end(0, rows_b)];
+                    decompress_pair(
+                        [data_a, data_b],
+                        [rows_a as u32, rows_b as u32],
+                        [strip_a, strip_b],
+                    )?;
+                }
+                [(data, row, rows)] => {
+                    let strip = &mut dst_graymap[row * stride..strip_end(row, rows)];
+                    decompress_block(data, rows as u32, strip)?;
+                }
+                _ => unreachable!("chunks of at most two"),
+            }
         }
 
         Ok((quality, mode))

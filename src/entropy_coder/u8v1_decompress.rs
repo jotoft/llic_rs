@@ -71,6 +71,39 @@ pub fn decompress_dynamic(
     )
 }
 
+/// Decompresses two independent streams of the same width at once, one into
+/// each of `dst_images`: [`decompress`] (or [`decompress_dynamic`]) of each,
+/// with the two symbol decoders interleaved so that their table lookups
+/// overlap instead of each waiting on the one before.
+pub fn decompress_pair(
+    src_data: [&[u8]; 2],
+    dynamic: bool,
+    width: u32,
+    heights: [u32; 2],
+    bytes_per_line: u32,
+    dst_images: [&mut [u8]; 2],
+) -> Result<()> {
+    let mut images = Vec::with_capacity(2);
+    for (src, height) in src_data.into_iter().zip(heights) {
+        let (predictor_bits, stream) = if dynamic {
+            let predictor_storage_bytes = align_to_4((height as usize).div_ceil(8));
+            if src.len() < predictor_storage_bytes {
+                return Err(LlicError::InvalidData);
+            }
+            let (bits, stream) = src.split_at(predictor_storage_bytes);
+            (Some(bits), stream)
+        } else {
+            (None, src)
+        };
+        images.push(ImageDecoder::new(stream, predictor_bits, width, height, bytes_per_line)?);
+    }
+    let [a, b]: [ImageDecoder; 2] = images.try_into().ok().expect("two images");
+    let [dst_a, dst_b] = dst_images;
+    a.check_dst(dst_a)?;
+    b.check_dst(dst_b)?;
+    decode_image_pair([a, b], [dst_a, dst_b])
+}
+
 /// Whether row `y` uses the MED predictor (dynamic mode) instead of the average.
 #[inline]
 fn row_uses_med(predictor_bits: Option<&[u8]>, y: usize) -> bool {
@@ -155,82 +188,180 @@ fn decode_image(
     bytes_per_line: u32,
     dst_image: &mut [u8],
 ) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(LlicError::InvalidArgument);
+    let mut image = ImageDecoder::new(stream, predictor_bits, width, height, bytes_per_line)?;
+    image.check_dst(dst_image)?;
+    while !image.done() {
+        image.step(dst_image)?;
     }
-    let (width, height, stride) = (width as usize, height as usize, bytes_per_line as usize);
-    if stride < width || dst_image.len() < (height - 1) * stride + width {
-        return Err(LlicError::InvalidArgument);
+    Ok(())
+}
+
+/// Decodes two images in lockstep, interleaving their symbol decoders, and
+/// finishes the taller one alone.
+fn decode_image_pair(images: [ImageDecoder<'_>; 2], dst_images: [&mut [u8]; 2]) -> Result<()> {
+    let [mut a, mut b] = images;
+    let [dst_a, dst_b] = dst_images;
+    while !a.done() && !b.done() {
+        let (count_a, count_b) = (a.next_count(), b.next_count());
+        let (elem_a, elem_b) = (a.carry_over(), b.carry_over());
+        let (elem_a, elem_b) = SymbolDecoder::decode_fast_pair(
+            [&mut a.decoder, &mut b.decoder],
+            [&mut a.residuals, &mut b.residuals],
+            [elem_a, elem_b],
+            [count_a, count_b],
+        );
+        a.filled = a.decoder.finish(&mut a.residuals, elem_a, count_a)?;
+        b.filled = b.decoder.finish(&mut b.residuals, elem_b, count_b)?;
+        a.reconstruct(dst_a, count_a);
+        b.reconstruct(dst_b, count_b);
     }
-
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))]
-    let wave = width >= 2 * WAVE_ROWS && wavefront::available();
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    )))]
-    let wave = false;
-    let mut decoder = SymbolDecoder::new(stream);
-    // Residuals for a wavefront of rows, plus room for a symbol pair beyond.
-    let mut residuals = vec![0u8; if wave { WAVE_ROWS } else { 1 } * width + 256];
-
-    let mut num_filled = decoder.decompress_row(&mut residuals, 0, 0, width)?;
-    let mut prev_count = width;
-    dst_image[0] = residuals[0];
-    for x in 1..width {
-        dst_image[x] = residuals[x].wrapping_add(dst_image[x - 1]);
+    while !a.done() {
+        a.step(dst_a)?;
     }
+    while !b.done() {
+        b.step(dst_b)?;
+    }
+    Ok(())
+}
 
-    #[cfg_attr(
-        not(any(
+/// One image being decoded: its symbol decoder, the residuals of the rows in
+/// flight, and the next row to reconstruct. Each step decodes the first row,
+/// a wavefront of [`WAVE_ROWS`] rows, or (after the last wavefront) one row.
+struct ImageDecoder<'a> {
+    decoder: SymbolDecoder<'a>,
+    predictor_bits: Option<&'a [u8]>,
+    width: usize,
+    height: usize,
+    stride: usize,
+    wave: bool,
+    /// Residuals for a wavefront of rows, plus room for a symbol pair beyond.
+    residuals: Vec<u8>,
+    /// Symbols in `residuals`, and how many of them the last step used.
+    filled: usize,
+    used: usize,
+    /// The next row to reconstruct.
+    y: usize,
+}
+
+impl<'a> ImageDecoder<'a> {
+    fn new(
+        stream: &'a [u8],
+        predictor_bits: Option<&'a [u8]>,
+        width: u32,
+        height: u32,
+        bytes_per_line: u32,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 {
+            return Err(LlicError::InvalidArgument);
+        }
+        let (width, height, stride) = (width as usize, height as usize, bytes_per_line as usize);
+        if stride < width {
+            return Err(LlicError::InvalidArgument);
+        }
+
+        #[cfg(any(
             target_arch = "x86_64",
             all(target_arch = "wasm32", target_feature = "simd128")
-        )),
-        allow(unused_mut)
-    )]
-    let mut y = 1;
-    #[cfg(any(
-        target_arch = "x86_64",
-        all(target_arch = "wasm32", target_feature = "simd128")
-    ))]
-    if wave {
-        let count = WAVE_ROWS * width;
-        while y + WAVE_ROWS <= height {
-            num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, count)?;
-            prev_count = count;
-            let med_rows = (0..WAVE_ROWS)
-                .filter(|&k| row_uses_med(predictor_bits, y + k))
-                .fold(0u32, |rows, k| rows | (1 << k));
-            let (done, rest) = dst_image.split_at_mut(y * stride);
-            let prev = &done[(y - 1) * stride..(y - 1) * stride + width];
-            // SAFETY: the CPU supports the wavefront's instructions (`available`).
-            unsafe { wavefront::reconstruct(prev, &mut residuals[..count], width, med_rows) };
-            // Sixteen interleaved row streams write back slowly, so the rows are
-            // reconstructed in the buffer and copied one after another.
-            for (k, row) in residuals[..count].chunks_exact(width).enumerate() {
-                rest[k * stride..k * stride + width].copy_from_slice(row);
-            }
-            y += WAVE_ROWS;
-        }
-    }
-    for y in y..height {
-        num_filled = decoder.decompress_row(&mut residuals, num_filled, prev_count, width)?;
-        prev_count = width;
-        let (done, rest) = dst_image.split_at_mut(y * stride);
-        let top = &done[(y - 1) * stride..];
-        reconstruct_row(
-            top,
-            &residuals,
-            rest,
+        ))]
+        let wave = width >= 2 * WAVE_ROWS && wavefront::available();
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )))]
+        let wave = false;
+        Ok(Self {
+            decoder: SymbolDecoder::new(stream),
+            predictor_bits,
             width,
-            row_uses_med(predictor_bits, y),
-        );
+            height,
+            stride,
+            wave,
+            residuals: vec![0u8; if wave { WAVE_ROWS } else { 1 } * width + 256],
+            filled: 0,
+            used: 0,
+            y: 0,
+        })
     }
 
-    Ok(())
+    fn check_dst(&self, dst_image: &[u8]) -> Result<()> {
+        if dst_image.len() < (self.height - 1) * self.stride + self.width {
+            return Err(LlicError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn done(&self) -> bool {
+        self.y >= self.height
+    }
+
+    /// Residuals the next step needs.
+    #[inline(always)]
+    fn next_count(&self) -> usize {
+        if self.y > 0 && self.wave && self.y + WAVE_ROWS <= self.height {
+            WAVE_ROWS * self.width
+        } else {
+            self.width
+        }
+    }
+
+    /// Moves the symbols decoded past the last step's residuals to the front
+    /// and returns how many there are.
+    #[inline(always)]
+    fn carry_over(&mut self) -> usize {
+        if self.filled > self.used {
+            self.residuals.copy_within(self.used..self.filled, 0);
+        }
+        self.filled - self.used
+    }
+
+    /// Decodes and reconstructs the next step's rows.
+    #[inline(always)]
+    fn step(&mut self, dst_image: &mut [u8]) -> Result<()> {
+        let count = self.next_count();
+        let elem = self.carry_over();
+        self.filled = self.decoder.finish(&mut self.residuals, elem, count)?;
+        self.reconstruct(dst_image, count);
+        Ok(())
+    }
+
+    /// Reconstructs the step's rows from the first `count` residuals.
+    #[inline(always)]
+    fn reconstruct(&mut self, dst_image: &mut [u8], count: usize) {
+        let (width, stride, y) = (self.width, self.stride, self.y);
+        let residuals = &mut self.residuals;
+        if y == 0 {
+            dst_image[0] = residuals[0];
+            for x in 1..width {
+                dst_image[x] = residuals[x].wrapping_add(dst_image[x - 1]);
+            }
+        } else if count > width {
+            #[cfg(any(
+                target_arch = "x86_64",
+                all(target_arch = "wasm32", target_feature = "simd128")
+            ))]
+            {
+                let med_rows = (0..WAVE_ROWS)
+                    .filter(|&k| row_uses_med(self.predictor_bits, y + k))
+                    .fold(0u32, |rows, k| rows | (1 << k));
+                let (done, rest) = dst_image.split_at_mut(y * stride);
+                let prev = &done[(y - 1) * stride..(y - 1) * stride + width];
+                // SAFETY: the CPU supports the wavefront's instructions (`available`).
+                unsafe { wavefront::reconstruct(prev, &mut residuals[..count], width, med_rows) };
+                // Sixteen interleaved row streams write back slowly, so the rows are
+                // reconstructed in the buffer and copied one after another.
+                for (k, row) in residuals[..count].chunks_exact(width).enumerate() {
+                    rest[k * stride..k * stride + width].copy_from_slice(row);
+                }
+            }
+        } else {
+            let (done, rest) = dst_image.split_at_mut(y * stride);
+            let top = &done[(y - 1) * stride..];
+            reconstruct_row(top, residuals, rest, width, row_uses_med(self.predictor_bits, y));
+        }
+        self.used = count;
+        self.y += count / width;
+    }
 }
 
 /// Rows reconstructed together by the wavefront; lane k holds row k.
@@ -298,37 +429,64 @@ impl<'a> SymbolDecoder<'a> {
     #[inline(always)]
     fn decode_fast(&mut self, buf: &mut [u8], mut elem: usize, count: usize) -> usize {
         assert!(buf.len() >= count + 16);
-        let (src, mut pos) = (self.src, self.pos);
-        let (mut container, mut num_bits) = (self.container, self.num_bits);
-        // Only the low six bits of `shift` count: whole entries are subtracted.
-        let mut shift = num_bits;
-        while elem + 9 <= count && src.len() - pos >= 8 {
-            let bytes: [u8; 8] = src[pos..pos + 8].try_into().expect("8 bytes");
-            container |= stream_bits(bytes) >> (shift & 63);
-            // Whole words that fit: at least 48 bits are loaded afterwards,
-            // enough for three 13-bit lookups.
-            let words = (63 - num_bits) >> 4;
-            pos += (words * 2) as usize;
-            num_bits += words * 16;
-            shift = num_bits;
+        let mut state = FastState::load(self);
+        while elem + 9 <= count && state.has_word(self.src) {
+            state.refill(self.src);
             for _ in 0..3 {
-                let entry = DECODE_TABLE_13.0[(container >> 51) as usize];
-                container = shift_by_entry(container, entry);
-                shift = shift.wrapping_sub(entry);
-                num_bits -= entry & 63;
                 // SAFETY: elem + 9 <= count before the three lookups, each
                 // adds at most 3, and buf holds count + 16 bytes.
-                unsafe {
-                    buf.as_mut_ptr()
-                        .add(elem)
-                        .cast::<[u8; 4]>()
-                        .write_unaligned((entry >> 8).to_le_bytes());
-                }
-                elem += ((entry >> 6) & 3) as usize;
+                elem = unsafe { state.lookup(buf, elem) };
             }
         }
-        (self.pos, self.container, self.num_bits) = (pos, container, num_bits);
+        state.store(self);
         elem
+    }
+
+    /// [`decode_fast`](Self::decode_fast) for two decoders at once: each
+    /// iteration refills both and alternates their lookups, so the two
+    /// dependency chains overlap. Stops when either one would stop.
+    #[inline(always)]
+    fn decode_fast_pair(
+        decoders: [&mut Self; 2],
+        bufs: [&mut [u8]; 2],
+        elems: [usize; 2],
+        counts: [usize; 2],
+    ) -> (usize, usize) {
+        let [a, b] = decoders;
+        let [buf_a, buf_b] = bufs;
+        let ([mut elem_a, mut elem_b], [count_a, count_b]) = (elems, counts);
+        assert!(buf_a.len() >= count_a + 16 && buf_b.len() >= count_b + 16);
+        let (mut state_a, mut state_b) = (FastState::load(a), FastState::load(b));
+        while elem_a + 9 <= count_a
+            && elem_b + 9 <= count_b
+            && state_a.has_word(a.src)
+            && state_b.has_word(b.src)
+        {
+            state_a.refill(a.src);
+            state_b.refill(b.src);
+            for _ in 0..3 {
+                // SAFETY: as in `decode_fast`, for each buffer.
+                unsafe {
+                    elem_a = state_a.lookup(buf_a, elem_a);
+                    elem_b = state_b.lookup(buf_b, elem_b);
+                }
+            }
+        }
+        state_a.store(a);
+        state_b.store(b);
+        (elem_a, elem_b)
+    }
+
+    /// Finishes decoding into `buf` until it holds at least `count` symbols,
+    /// from `elem`, and returns how many it holds (an entry can end up to two
+    /// past `count`).
+    #[inline(always)]
+    fn finish(&mut self, buf: &mut [u8], mut elem: usize, count: usize) -> Result<usize> {
+        elem = self.decode_fast(buf, elem, count);
+        while elem < count {
+            elem += self.decode_checked(buf, elem)?;
+        }
+        Ok(elem)
     }
 
     /// Decodes one table entry near the end of the stream, checking that its
@@ -376,28 +534,70 @@ impl<'a> SymbolDecoder<'a> {
         buf[elem] = symbol;
         Ok(1)
     }
+}
 
-    /// Decodes symbols into `buf` until it holds at least `count`, and returns
-    /// how many it holds (an entry can end up to two past `count`).
-    /// `filled` and `prev_count` are the previous call's return value and
-    /// `count`: symbols it decoded past its `count` move to the front first.
+/// The fast loop's decoder state, kept in registers: the stream position,
+/// the 64-bit container and its bit count.
+#[derive(Clone, Copy)]
+struct FastState {
+    pos: usize,
+    container: u64,
+    num_bits: u32,
+    /// Only the low six bits count: whole entries are subtracted.
+    shift: u32,
+}
+
+impl FastState {
     #[inline(always)]
-    fn decompress_row(
-        &mut self,
-        buf: &mut [u8],
-        filled: usize,
-        prev_count: usize,
-        count: usize,
-    ) -> Result<usize> {
-        assert!(buf.len() >= count + 16 && filled >= prev_count);
-        if filled > prev_count {
-            buf.copy_within(prev_count..filled, 0);
+    fn load(decoder: &SymbolDecoder) -> Self {
+        Self {
+            pos: decoder.pos,
+            container: decoder.container,
+            num_bits: decoder.num_bits,
+            shift: decoder.num_bits,
         }
-        let mut elem = self.decode_fast(buf, filled - prev_count, count);
-        while elem < count {
-            elem += self.decode_checked(buf, elem)?;
-        }
-        Ok(elem)
+    }
+
+    #[inline(always)]
+    fn store(self, decoder: &mut SymbolDecoder) {
+        (decoder.pos, decoder.container, decoder.num_bits) =
+            (self.pos, self.container, self.num_bits);
+    }
+
+    /// Whether eight stream bytes remain for [`refill`](Self::refill).
+    #[inline(always)]
+    fn has_word(&self, src: &[u8]) -> bool {
+        src.len() - self.pos >= 8
+    }
+
+    /// Loads the whole words that fit: at least 48 bits are loaded
+    /// afterwards, enough for three 13-bit lookups.
+    #[inline(always)]
+    fn refill(&mut self, src: &[u8]) {
+        let bytes: [u8; 8] = src[self.pos..self.pos + 8].try_into().expect("8 bytes");
+        self.container |= stream_bits(bytes) >> (self.shift & 63);
+        let words = (63 - self.num_bits) >> 4;
+        self.pos += (words * 2) as usize;
+        self.num_bits += words * 16;
+        self.shift = self.num_bits;
+    }
+
+    /// Decodes one table entry (up to three symbols) into `buf` at `elem` and
+    /// returns the new `elem`.
+    ///
+    /// # Safety
+    /// `buf` must hold `elem + 4` bytes.
+    #[inline(always)]
+    unsafe fn lookup(&mut self, buf: &mut [u8], elem: usize) -> usize {
+        let entry = DECODE_TABLE_13.0[(self.container >> 51) as usize];
+        self.container = shift_by_entry(self.container, entry);
+        self.shift = self.shift.wrapping_sub(entry);
+        self.num_bits -= entry & 63;
+        buf.as_mut_ptr()
+            .add(elem)
+            .cast::<[u8; 4]>()
+            .write_unaligned((entry >> 8).to_le_bytes());
+        elem + ((entry >> 6) & 3) as usize
     }
 }
 
@@ -1029,6 +1229,81 @@ mod tests {
                 "truncated to {len} of {}",
                 compressed.len()
             );
+        }
+    }
+
+    /// Decoding two streams together gives each one's own decode, for images
+    /// of different heights (one finishes alone) and both predictors, with and
+    /// without the wavefront; a truncated stream on either side is an error.
+    #[test]
+    fn pair_decode_matches_single_decodes() {
+        for (width, stride) in [(8u32, 8u32), (64, 72)] {
+            for heights in [[24u32, 24], [40, 56], [20, 4]] {
+                for dynamic in [false, true] {
+                    let case = format!("{width}x{heights:?} stride {stride} dynamic {dynamic}");
+                    let images = heights.map(|height| test_image(width, height + 1, stride));
+                    let streams: Vec<Vec<u8>> = images
+                        .iter()
+                        .zip(heights)
+                        .map(|(image, height)| {
+                            let compress = if dynamic {
+                                crate::entropy_coder::compress_dynamic
+                            } else {
+                                crate::entropy_coder::compress
+                            };
+                            compress(image, width, height, stride).expect("compress")
+                        })
+                        .collect();
+                    let decode_one = |k: usize, stream: &[u8], out: &mut [u8]| {
+                        let (h, w, s) = (heights[k], width, stride);
+                        if dynamic {
+                            decompress_dynamic(stream, w, h, s, out)
+                        } else {
+                            decompress(stream, w, h, s, out)
+                        }
+                    };
+                    let sizes = heights.map(|height| (stride * height) as usize);
+                    let expected: Vec<Vec<u8>> = (0..2)
+                        .map(|k| {
+                            let mut out = vec![0u8; sizes[k]];
+                            decode_one(k, &streams[k], &mut out).expect("single decode");
+                            out
+                        })
+                        .collect();
+                    let (mut out_a, mut out_b) = (vec![0u8; sizes[0]], vec![0u8; sizes[1]]);
+                    decompress_pair(
+                        [&streams[0], &streams[1]],
+                        dynamic,
+                        width,
+                        heights,
+                        stride,
+                        [&mut out_a, &mut out_b],
+                    )
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert_eq!(out_a, expected[0], "{case}");
+                    assert_eq!(out_b, expected[1], "{case}");
+
+                    for k in 0..2 {
+                        let len = streams[k].len();
+                        for cut in [0, 4, len / 2, len.saturating_sub(8)] {
+                            let mut cut_streams = [&streams[0][..], &streams[1][..]];
+                            cut_streams[k] = &streams[k][..cut];
+                            assert!(
+                                decompress_pair(
+                                    cut_streams,
+                                    dynamic,
+                                    width,
+                                    heights,
+                                    stride,
+                                    [&mut out_a, &mut out_b],
+                                )
+                                .is_err(),
+                                "{case}: stream {k} cut to {cut} of {len}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

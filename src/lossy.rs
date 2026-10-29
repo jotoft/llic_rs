@@ -1658,6 +1658,69 @@ pub fn decompress_tile_block_dynamic(
     dst_graymap: &mut [u8],
 ) -> Result<()> {
     let chunk = parse_tile_chunk(src_data, width, rows, use_dynamic_predictor, layout)?;
+    decompress_parsed_chunk(&chunk, width, rows, bytes_per_line, dst_graymap)
+}
+
+/// Decompress two tile chunks of the same width, such as consecutive chunks
+/// of a stream, into `dst_graymaps`. When both headers are entropy coded they
+/// are decoded together ([`crate::entropy_coder::decompress_pair`]), so the
+/// two decoders' table lookups overlap.
+pub fn decompress_tile_block_pair(
+    src_data: [&[u8]; 2],
+    width: u32,
+    rows: [u32; 2],
+    bytes_per_line: u32,
+    use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
+    dst_graymaps: [&mut [u8]; 2],
+) -> Result<()> {
+    let a = locate_tile_chunk(src_data[0], width, rows[0], layout)?;
+    let b = locate_tile_chunk(src_data[1], width, rows[1], layout)?;
+    let headers = match (a.header, b.header) {
+        (ChunkHeader::Coded(coded_a), ChunkHeader::Coded(coded_b)) => {
+            let header_width = width / 4;
+            let heights = rows.map(|rows| (rows / 4) * 2);
+            let mut header_a = vec![0u8; (header_width * heights[0]) as usize];
+            let mut header_b = vec![0u8; (header_width * heights[1]) as usize];
+            crate::entropy_coder::decompress_pair(
+                [coded_a, coded_b],
+                use_dynamic_predictor,
+                header_width,
+                heights,
+                header_width,
+                [&mut header_a, &mut header_b],
+            )?;
+            [Cow::Owned(header_a), Cow::Owned(header_b)]
+        }
+        _ => [
+            a.header.decode(width, rows[0], use_dynamic_predictor)?,
+            b.header.decode(width, rows[1], use_dynamic_predictor)?,
+        ],
+    };
+    let [header_a, header_b] = headers;
+    let [dst_a, dst_b] = dst_graymaps;
+    let chunk_a = TileChunk {
+        error_limit: a.error_limit,
+        header: header_a,
+        pixels: a.pixels,
+    };
+    decompress_parsed_chunk(&chunk_a, width, rows[0], bytes_per_line, dst_a)?;
+    let chunk_b = TileChunk {
+        error_limit: b.error_limit,
+        header: header_b,
+        pixels: b.pixels,
+    };
+    decompress_parsed_chunk(&chunk_b, width, rows[1], bytes_per_line, dst_b)
+}
+
+/// Decompress the tiles of a chunk whose header is decoded.
+fn decompress_parsed_chunk(
+    chunk: &TileChunk<'_>,
+    width: u32,
+    rows: u32,
+    bytes_per_line: u32,
+    dst_graymap: &mut [u8],
+) -> Result<()> {
     let bucket_lut = bucket_lut(chunk.error_limit);
     let (min_stream, dist_stream) = chunk.header.split_at(chunk.header.len() / 2);
     decompress_tiles(
@@ -1683,19 +1746,65 @@ struct TileChunk<'a> {
     pixels: &'a [u8],
 }
 
+/// A tile chunk's header as stored.
+#[derive(Clone, Copy)]
+enum ChunkHeader<'a> {
+    /// `min[num_tiles]` followed by `dist[num_tiles]`.
+    Raw(&'a [u8]),
+    /// The same, entropy coded as a `(width/4) x (rows/4 * 2)` image.
+    Coded(&'a [u8]),
+}
+
+impl<'a> ChunkHeader<'a> {
+    /// The header's `min` and `dist` values.
+    fn decode(self, width: u32, rows: u32, use_dynamic_predictor: bool) -> Result<Cow<'a, [u8]>> {
+        let coded = match self {
+            ChunkHeader::Raw(header) => return Ok(Cow::Borrowed(header)),
+            ChunkHeader::Coded(coded) => coded,
+        };
+        let header_width = width / 4;
+        let header_height = (rows / 4) * 2;
+        let mut header = vec![0u8; (header_width * header_height) as usize];
+        if use_dynamic_predictor {
+            crate::entropy_coder::decompress_dynamic(
+                coded,
+                header_width,
+                header_height,
+                header_width,
+                &mut header,
+            )?;
+        } else {
+            crate::entropy_coder::decompress(
+                coded,
+                header_width,
+                header_height,
+                header_width,
+                &mut header,
+            )?;
+        }
+        Ok(Cow::Owned(header))
+    }
+}
+
+/// A tile chunk split into its parts, its header not yet decoded.
+struct LocatedChunk<'a> {
+    error_limit: u8,
+    header: ChunkHeader<'a>,
+    pixels: &'a [u8],
+}
+
 /// Split a tile chunk into its header and pixel stream.
 ///
 /// Byte 0 holds the flags (bit 7 = compressed header) and the error limit.
 /// - Raw header: `[flags][min[num_tiles]][dist[num_tiles]][pixels]`
 /// - Compressed header: see [`TileHeaderLayout`]. The header is entropy coded
 ///   as a `(width/4) x (rows/4 * 2)` image, mins above dists.
-fn parse_tile_chunk(
+fn locate_tile_chunk(
     src_data: &[u8],
     width: u32,
     rows: u32,
-    use_dynamic_predictor: bool,
     layout: TileHeaderLayout,
-) -> Result<TileChunk<'_>> {
+) -> Result<LocatedChunk<'_>> {
     let Some(&flags) = src_data.first() else {
         return Err(LlicError::InvalidData);
     };
@@ -1707,9 +1816,9 @@ fn parse_tile_chunk(
         if src_data.len() < header_end {
             return Err(LlicError::InvalidData);
         }
-        return Ok(TileChunk {
+        return Ok(LocatedChunk {
             error_limit,
-            header: Cow::Borrowed(&src_data[1..header_end]),
+            header: ChunkHeader::Raw(&src_data[1..header_end]),
             pixels: &src_data[header_end..],
         });
     }
@@ -1718,7 +1827,7 @@ fn parse_tile_chunk(
         return Err(LlicError::InvalidData);
     }
     let field = u32::from_le_bytes([src_data[1], src_data[2], src_data[3], src_data[4]]) as usize;
-    let (compressed_header, pixels) = match layout {
+    let (coded, pixels) = match layout {
         TileHeaderLayout::BeforePixels => {
             let header_end = 5usize.checked_add(field).ok_or(LlicError::InvalidData)?;
             if header_end > src_data.len() {
@@ -1733,31 +1842,27 @@ fn parse_tile_chunk(
             (&src_data[field..], &src_data[5..field])
         }
     };
-
-    let header_width = width / 4;
-    let header_height = (rows / 4) * 2;
-    let mut header = vec![0u8; num_tiles * 2];
-    if use_dynamic_predictor {
-        crate::entropy_coder::decompress_dynamic(
-            compressed_header,
-            header_width,
-            header_height,
-            header_width,
-            &mut header,
-        )?;
-    } else {
-        crate::entropy_coder::decompress(
-            compressed_header,
-            header_width,
-            header_height,
-            header_width,
-            &mut header,
-        )?;
-    }
-    Ok(TileChunk {
+    Ok(LocatedChunk {
         error_limit,
-        header: Cow::Owned(header),
+        header: ChunkHeader::Coded(coded),
         pixels,
+    })
+}
+
+/// Split a tile chunk into its header, decoded if it was entropy coded, and
+/// its pixel stream (see [`locate_tile_chunk`]).
+fn parse_tile_chunk(
+    src_data: &[u8],
+    width: u32,
+    rows: u32,
+    use_dynamic_predictor: bool,
+    layout: TileHeaderLayout,
+) -> Result<TileChunk<'_>> {
+    let chunk = locate_tile_chunk(src_data, width, rows, layout)?;
+    Ok(TileChunk {
+        error_limit: chunk.error_limit,
+        header: chunk.header.decode(width, rows, use_dynamic_predictor)?,
+        pixels: chunk.pixels,
     })
 }
 
