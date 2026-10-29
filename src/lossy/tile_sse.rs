@@ -567,10 +567,33 @@ pub(super) unsafe fn decode_row_groups(
     let mins = &min_stream[first_block..first_block + groups * 4];
     let dists = &dist_stream[first_block..first_block + groups * 4];
     let out: [*mut u8; 4] = std::array::from_fn(|r| dst.as_mut_ptr().add(row_start + r * stride));
-    let midpoint_mask: u32 = if lossless { 0 } else { 0xFF };
+    if lossless {
+        decode_groups::<true>(out, mins, dists, lut, pixel_stream)
+    } else {
+        decode_groups::<false>(out, mins, dists, lut, pixel_stream)
+    }
+}
+
+/// Decodes the groups of `mins.len() / 4` blocks into the four rows at `out`
+/// while their reads stay inside `pixel_stream`. Returns the pixels decoded
+/// and the bytes read.
+///
+/// The four blocks of a group are written out rather than looped over: fat
+/// LTO kept such a loop, with the lossless branch inside, and decoded lossless
+/// streams up to 8% slower.
+#[inline]
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn decode_groups<const LOSSLESS: bool>(
+    out: [*mut u8; 4],
+    mins: &[u8],
+    dists: &[u8],
+    lut: &[u32; 256],
+    pixel_stream: &[u8],
+) -> (usize, usize) {
+    let midpoint_mask: u32 = if LOSSLESS { 0 } else { 0xFF };
     let mut read = 0usize;
     let mut group = 0usize;
-    while group < groups {
+    while group < mins.len() / 4 {
         let block_mins = &mins[group * 4..group * 4 + 4];
         let entries: [u32; 4] = std::array::from_fn(|i| lut[usize::from(dists[group * 4 + i])]);
         let no_payload = entries.iter().fold(0, |acc, e| acc | e) & 0xFF00 == 0;
@@ -594,16 +617,15 @@ pub(super) unsafe fn decode_row_groups(
         } else {
             let src = pixel_stream.as_ptr().add(read);
             let mut offset = 0usize;
-            let mut blocks = [_mm_setzero_si128(); 4];
-            for (i, block) in blocks.iter_mut().enumerate() {
-                let (pixels, size) = if lossless {
-                    decode_tile::<true>(src.add(offset), entries[i], block_mins[i])
-                } else {
-                    decode_tile::<false>(src.add(offset), entries[i], block_mins[i])
-                };
-                *block = pixels;
-                offset += size;
+            macro_rules! tile {
+                ($i:literal) => {{
+                    let (pixels, size) =
+                        decode_tile::<LOSSLESS>(src.add(offset), entries[$i], block_mins[$i]);
+                    offset += size;
+                    pixels
+                }};
             }
+            let mut blocks = [tile!(0), tile!(1), tile!(2), tile!(3)];
             read += offset;
             transpose4x32(&mut blocks);
             blocks

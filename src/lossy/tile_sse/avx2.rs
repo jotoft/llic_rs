@@ -163,10 +163,46 @@ pub(in crate::lossy) unsafe fn decode_row_groups_avx2(
     let mins = &min_stream[first_block..first_block + groups * 8];
     let dists = &dist_stream[first_block..first_block + groups * 8];
     let out: [*mut u8; 4] = std::array::from_fn(|r| dst.as_mut_ptr().add(row_start + r * stride));
-    let midpoint_mask: u32 = if lossless { 0 } else { 0xFF };
+    let (done, read) = if lossless {
+        decode_groups::<true>(out, mins, dists, lut, pixel_stream)
+    } else {
+        decode_groups::<false>(out, mins, dists, lut, pixel_stream)
+    };
+    let (end, rest) = decode_row_groups(
+        dst,
+        row_start + done,
+        stride,
+        width - done,
+        first_block + done / 4,
+        min_stream,
+        dist_stream,
+        lossless,
+        lut,
+        &pixel_stream[read..],
+    );
+    (done + end, read + rest)
+}
+
+/// Decodes the groups of `mins.len() / 8` blocks into the four rows at `out`
+/// while their reads stay inside `pixel_stream`. Returns the pixels decoded
+/// and the bytes read.
+///
+/// The four block pairs of a group are written out rather than looped over:
+/// fat LTO kept such a loop, with the lossless branch inside, and decoded
+/// about 25% slower.
+#[inline]
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn decode_groups<const LOSSLESS: bool>(
+    out: [*mut u8; 4],
+    mins: &[u8],
+    dists: &[u8],
+    lut: &[u32; 256],
+    pixel_stream: &[u8],
+) -> (usize, usize) {
+    let midpoint_mask: u32 = if LOSSLESS { 0 } else { 0xFF };
     let mut read = 0usize;
     let mut group = 0usize;
-    while group < groups {
+    while group < mins.len() / 8 {
         let block_mins = &mins[group * 8..group * 8 + 8];
         let entries: [u32; 8] = std::array::from_fn(|i| lut[usize::from(dists[group * 8 + i])]);
         let no_payload = entries.iter().fold(0, |acc, e| acc | e) & 0xFF00 == 0;
@@ -195,17 +231,16 @@ pub(in crate::lossy) unsafe fn decode_row_groups_avx2(
             for i in 0..8 {
                 offsets[i + 1] = offsets[i] + 2 * ((entries[i] >> 8) & 0xFF) as usize;
             }
-            let mut blocks = [_mm256_setzero_si256(); 4];
-            for (i, block) in blocks.iter_mut().enumerate() {
-                let srcs = [src.add(offsets[i]), src.add(offsets[i + 4])];
-                let pair = [entries[i], entries[i + 4]];
-                let pair_mins = [block_mins[i], block_mins[i + 4]];
-                *block = if lossless {
-                    decode_tile_pair::<true>(srcs, pair, pair_mins)
-                } else {
-                    decode_tile_pair::<false>(srcs, pair, pair_mins)
+            macro_rules! pair {
+                ($i:literal) => {
+                    decode_tile_pair::<LOSSLESS>(
+                        [src.add(offsets[$i]), src.add(offsets[$i + 4])],
+                        [entries[$i], entries[$i + 4]],
+                        [block_mins[$i], block_mins[$i + 4]],
+                    )
                 };
             }
+            let mut blocks = [pair!(0), pair!(1), pair!(2), pair!(3)];
             read += offsets[8];
             transpose4x32(&mut blocks);
             blocks
@@ -215,20 +250,7 @@ pub(in crate::lossy) unsafe fn decode_row_groups_avx2(
         }
         group += 1;
     }
-    let done = group * 32;
-    let (end, rest) = decode_row_groups(
-        dst,
-        row_start + done,
-        stride,
-        width - done,
-        first_block + done / 4,
-        min_stream,
-        dist_stream,
-        lossless,
-        lut,
-        &pixel_stream[read..],
-    );
-    (done + end, read + rest)
+    (group * 32, read)
 }
 
 #[cfg(test)]
