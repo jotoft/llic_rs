@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the number of CPUs. Streams from a context made with `None` or `Some(1)`
   are unchanged. Counts above 16 or above one chunk per four rows are
   `InvalidArgument`. The `num_cpus` dependency is gone.
+- Lossless tile decoding uses AVX-512 VBMI at 256-bit width on x86-64 CPUs
+  that have it (detected at run time): per pair of blocks, a byte permute,
+  `VPMULTISHIFTQB`, a mask and a second permute replace the AVX2 unpacking.
+  Single-threaded on the test photos, lossless fast-mode streams decode 9-11%
+  faster and default-mode ones 3-4%. Lossy streams keep the AVX2 decoder, and
+  a 512-bit version (16 blocks per register) was 10-50% slower on Zen 4.
+  The minimum Rust version is now 1.89, for the AVX-512 intrinsics.
 - Streams with two or more chunks decode two chunks at a time, with their
   entropy decoders interleaved so that the table lookups of one overlap
   those of the other (`entropy_coder::decompress_pair`,

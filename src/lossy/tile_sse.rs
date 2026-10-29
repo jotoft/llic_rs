@@ -9,13 +9,15 @@
 //!
 //! The kernels need SSSE3 and SSE4.1, detected at run time by [`available`].
 //! On CPUs with AVX2, [`avx2`] decodes eight blocks at once and hands the end of
-//! each row to the SSE decoder.
+//! each row to the SSE decoder; with AVX-512 VBMI, [`avx512`] decodes sixteen
+//! and hands the end of each row to the AVX2 decoder.
 
 use std::arch::x86_64::*;
 
 use super::BucketLutEntry;
 
 pub(super) mod avx2;
+pub(super) mod avx512;
 
 /// Whether the CPU supports the instructions these kernels use.
 pub(super) fn available() -> bool {

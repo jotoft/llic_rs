@@ -95,7 +95,13 @@ pub fn decompress_pair(
         } else {
             (None, src)
         };
-        images.push(ImageDecoder::new(stream, predictor_bits, width, height, bytes_per_line)?);
+        images.push(ImageDecoder::new(
+            stream,
+            predictor_bits,
+            width,
+            height,
+            bytes_per_line,
+        )?);
     }
     let [a, b]: [ImageDecoder; 2] = images.try_into().ok().expect("two images");
     let [dst_a, dst_b] = dst_images;
@@ -357,7 +363,13 @@ impl<'a> ImageDecoder<'a> {
         } else {
             let (done, rest) = dst_image.split_at_mut(y * stride);
             let top = &done[(y - 1) * stride..];
-            reconstruct_row(top, residuals, rest, width, row_uses_med(self.predictor_bits, y));
+            reconstruct_row(
+                top,
+                residuals,
+                rest,
+                width,
+                row_uses_med(self.predictor_bits, y),
+            );
         }
         self.used = count;
         self.y += count / width;
