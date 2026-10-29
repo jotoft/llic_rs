@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for lossless and 1.07-1.28x for lossy fast-mode streams, and up to 1.12x in
   the other modes. Single-threaded on the test photos, lossless fast-mode
   decoding is now 1.6x the speed of C++ 4.1.1. Output is unchanged.
+- Entropy decoding is about 7% faster on x86-64: the symbol decoder's shift is
+  pinned to a bare `SHL`, keeping an AND off the dependency chain between table
+  lookups. Lossless entropy streams decode at 0.97-0.98x of C++ 4.1.1 (was
+  0.91x), and lossy streams with compressed headers at 0.97x or better.
 
 ## [0.5.1] - 2026-10-28
 

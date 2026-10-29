@@ -244,6 +244,32 @@ fn stream_bits(bytes: [u8; 8]) -> u64 {
     ((words << 16) & 0xFFFF_0000_FFFF_0000) | ((words >> 16) & 0x0000_FFFF_0000_FFFF)
 }
 
+/// `container << (entry & 63)`. On x86-64 a bare `SHL`, which masks the count
+/// itself: LLVM shares the `entry & 63` with the bit count update and puts the
+/// AND on the dependency chain from one table lookup to the next (about 7% of
+/// entropy decoding).
+#[inline(always)]
+fn shift_by_entry(container: u64, entry: u32) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut container = container;
+        // SAFETY: only shifts a register.
+        unsafe {
+            std::arch::asm!(
+                "shl {container}, cl",
+                container = inout(reg) container,
+                in("ecx") entry,
+                options(pure, nomem, nostack),
+            );
+        }
+        container
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        container << (entry & 63)
+    }
+}
+
 /// Symbol decoder after the C++ 4.1 `decompressFast`: a 64-bit container
 /// refilled with whole 16-bit words, and three lookups per refill in
 /// [`DECODE_TABLE_13`], each decoding up to three symbols.
@@ -287,7 +313,7 @@ impl<'a> SymbolDecoder<'a> {
             shift = num_bits;
             for _ in 0..3 {
                 let entry = DECODE_TABLE_13.0[(container >> 51) as usize];
-                container <<= entry & 63;
+                container = shift_by_entry(container, entry);
                 shift = shift.wrapping_sub(entry);
                 num_bits -= entry & 63;
                 // SAFETY: elem + 9 <= count before the three lookups, each
