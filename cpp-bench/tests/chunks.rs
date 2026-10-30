@@ -23,8 +23,8 @@ fn cpp_decodes_rust_chunks() {
                 Quality::LosslessEntropy,
             ] {
                 for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
-                    // C++ rejects lossless entropy in fast mode (Rust writes it
-                    // with mode byte 1); v3 has no dynamic mode.
+                    // Lossless entropy has no fast mode (both codecs reject it);
+                    // v3 has no dynamic mode.
                     let entropy_fast = quality == Quality::LosslessEntropy && mode == Mode::Fast;
                     if entropy_fast || (version == FormatVersion::V3 && mode == Mode::Dynamic) {
                         continue;

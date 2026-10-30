@@ -360,10 +360,13 @@ impl LlicContext {
     /// decoders never read it.
     ///
     /// v3 has no mode byte. For tile-based streams the mode is carried in
-    /// bit 7 of the first payload byte, so `Default` and `Fast` round-trip;
-    /// for entropy-coded streams `Fast` is identical to `Default` and decodes
-    /// as `Default`. `Dynamic` is not representable in v3 and returns
-    /// `UnsupportedFormat`.
+    /// bit 7 of the first payload byte, so `Default` and `Fast` round-trip.
+    /// `Dynamic` is not representable in v3 and returns `UnsupportedFormat`.
+    ///
+    /// `LosslessEntropy` with `Mode::Fast` returns `InvalidArgument`, as in
+    /// the C++ reference: fast mode only skips entropy coding the tile
+    /// header, which entropy-coded streams do not have, and C++ decoders
+    /// reject a v4/v5 entropy-coded stream marked fast.
     pub fn compress_gray8_versioned(
         &self,
         src_graymap: &[u8],
@@ -374,6 +377,9 @@ impl LlicContext {
     ) -> Result<usize> {
         if format_version == FormatVersion::V3 && mode == Mode::Dynamic {
             return Err(LlicError::UnsupportedFormat);
+        }
+        if quality == Quality::LosslessEntropy && mode == Mode::Fast {
+            return Err(LlicError::InvalidArgument);
         }
 
         let expected_size = self.height as usize * self.bytes_per_line as usize;
@@ -1173,6 +1179,31 @@ mod tests {
         assert_eq!(decoded, src);
     }
 
+    /// Fast mode has nothing to skip in an entropy-coded stream; C++ rejects
+    /// the pair when encoding, and v4/v5 streams marked so when decoding.
+    #[test]
+    fn lossless_entropy_rejects_fast_mode() {
+        let (width, height) = (16, 16);
+        let src = gradient_image(width, height);
+        let ctx = LlicContext::new(width, height, width, Some(1)).unwrap();
+        let mut buf = vec![0u8; ctx.compressed_buffer_size()];
+        for version in [FormatVersion::V3, FormatVersion::V4, FormatVersion::V5] {
+            assert!(
+                matches!(
+                    ctx.compress_gray8_versioned(
+                        &src,
+                        Quality::LosslessEntropy,
+                        Mode::Fast,
+                        version,
+                        &mut buf
+                    ),
+                    Err(LlicError::InvalidArgument)
+                ),
+                "{version:?}"
+            );
+        }
+    }
+
     #[test]
     fn v3_rejects_dynamic() {
         let width = 16;
@@ -1317,7 +1348,9 @@ mod tests {
             let ctx = LlicContext::new(width, height, width, Some(chunks)).unwrap();
             for quality in [Quality::Lossless, Quality::Medium, Quality::LosslessEntropy] {
                 for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
-                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                    if (version == FormatVersion::V3 && mode == Mode::Dynamic)
+                        || (quality == Quality::LosslessEntropy && mode == Mode::Fast)
+                    {
                         continue;
                     }
                     let mut roomy = vec![0u8; ctx.compressed_buffer_size()];
@@ -1369,7 +1402,9 @@ mod tests {
                 Quality::LosslessEntropy,
             ] {
                 for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
-                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                    if (version == FormatVersion::V3 && mode == Mode::Dynamic)
+                        || (quality == Quality::LosslessEntropy && mode == Mode::Fast)
+                    {
                         continue;
                     }
                     ctx.compress_gray8_versioned(&noise, quality, mode, version, &mut buf)
@@ -1423,7 +1458,9 @@ mod tests {
             };
             for quality in [Quality::Lossless, Quality::High, Quality::LosslessEntropy] {
                 for mode in [Mode::Default, Mode::Fast, Mode::Dynamic] {
-                    if version == FormatVersion::V3 && mode == Mode::Dynamic {
+                    if (version == FormatVersion::V3 && mode == Mode::Dynamic)
+                        || (quality == Quality::LosslessEntropy && mode == Mode::Fast)
+                    {
                         continue;
                     }
                     for chunks in [2usize, 3, 5, 19] {

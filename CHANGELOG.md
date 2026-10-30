@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Quality::LosslessEntropy` with `Mode::Fast` now returns
+  `InvalidArgument`, as in the C++ reference. Fast mode only skips entropy
+  coding the tile header, which entropy-coded streams do not have: the
+  stream was the default one, but v4/v5 streams were marked fast, which C++
+  decoders reject. The WebAssembly `compress` with `lossless_entropy` and
+  `fast` reports the error too.
 - `LlicContext::new`'s last argument is now the encoder's chunk count
   (`num_chunks`, default 1) instead of an unused thread count that defaulted
   to the number of CPUs. Streams from a context made with `None` or `Some(1)`
